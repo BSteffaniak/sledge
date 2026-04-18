@@ -6,7 +6,9 @@
 # Override with --config <path> on the command line.
 
 [daemon]
-# Log level: "trace" | "debug" | "info" | "warn" | "error"
+# Log level: "trace" | "debug" | "info" | "warn" | "error".
+# Hot-reloadable: editing this value triggers a config reload and the new
+# filter is applied within ~250ms without restarting the daemon.
 log_level = "info"
 
 # -----------------------------------------------------------------------------

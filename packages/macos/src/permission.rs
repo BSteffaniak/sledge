@@ -63,3 +63,20 @@ pub fn input_monitoring_granted() -> bool {
     // pointer arguments.
     unsafe { IOHIDCheckAccess(LISTEN_EVENT) == GRANTED }
 }
+
+/// Request Input Monitoring access
+/// (`IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)`).
+///
+/// On first call for a given bundle path, macOS presents the system
+/// Input-Monitoring prompt. Returns `true` if access is currently granted.
+/// Subsequent calls are cheap no-ops once a decision has been recorded.
+pub fn input_monitoring_request() -> bool {
+    const LISTEN_EVENT: u32 = 1;
+    unsafe extern "C" {
+        fn IOHIDRequestAccess(request_type: u32) -> bool;
+    }
+    // SAFETY: IOHIDRequestAccess is an FFI call with integer in, bool out,
+    // and no pointer arguments. Documented by Apple as safe to call from
+    // any thread and safe to call repeatedly.
+    unsafe { IOHIDRequestAccess(LISTEN_EVENT) }
+}

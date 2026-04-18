@@ -25,5 +25,8 @@ pub mod tis;
 pub use bundle::SLEDGE_BUNDLE_ID;
 pub use focus::FocusTracker;
 pub use inject::SLEDGE_EVENT_SOURCE_TAG;
-pub use permission::{PermissionStatus, check_permissions};
+pub use permission::{
+    PermissionStatus, accessibility_trusted, check_permissions, input_monitoring_granted,
+    input_monitoring_request,
+};
 pub use tap::MacOsBackend;

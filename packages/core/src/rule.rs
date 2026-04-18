@@ -278,4 +278,67 @@ mod tests {
         );
         assert!(matches!(v_right_app, Verdict::Replace(_)));
     }
+
+    #[test]
+    fn triple_tap_right_alt_fires_with_production_mods_shape() {
+        // Regression test for a bug where `flags_to_mods` on macOS did not
+        // set side-specific modifier bits, causing the tap FSM to see
+        // `is_down=false` for every RightAlt transition and never register
+        // a tap. This test exercises the matcher with the exact `Modifiers`
+        // shape the production backend now emits (generic + side bits).
+        let rule = Rule {
+            trigger: Trigger::Tap(TapTrigger {
+                tap: KeyCode::RightAlt,
+                count: 3,
+                within_ms: 600,
+            }),
+            action: Action::SendKey {
+                key: KeyCode::Return,
+                mods: Modifiers::CTRL,
+            },
+            when_app_in: None,
+        };
+        let rules = RuleSet::new(vec![rule]);
+        let mut m = Matcher::new(rules);
+
+        let base = Instant::now();
+        let down = Modifiers::ALT | Modifiers::RIGHT_ALT;
+        let up = Modifiers::empty();
+
+        let mk = |mods: Modifiers| KeyEvent {
+            code: KeyCode::RightAlt,
+            kind: EventKind::ModifiersChanged,
+            mods,
+        };
+
+        // Tap 1: down, up (0-100ms)
+        assert!(matches!(m.dispatch(mk(down), None, base), Verdict::Pass));
+        assert!(matches!(
+            m.dispatch(mk(up), None, base + std::time::Duration::from_millis(100)),
+            Verdict::Pass
+        ));
+
+        // Tap 2: down, up (150-250ms)
+        assert!(matches!(
+            m.dispatch(mk(down), None, base + std::time::Duration::from_millis(150)),
+            Verdict::Pass
+        ));
+        assert!(matches!(
+            m.dispatch(mk(up), None, base + std::time::Duration::from_millis(250)),
+            Verdict::Pass
+        ));
+
+        // Tap 3: down, up (300-400ms) \u2014 the third up must fire the rule.
+        assert!(matches!(
+            m.dispatch(mk(down), None, base + std::time::Duration::from_millis(300)),
+            Verdict::Pass
+        ));
+        match m.dispatch(mk(up), None, base + std::time::Duration::from_millis(400)) {
+            Verdict::Replace(Action::SendKey { key, mods }) => {
+                assert_eq!(key, KeyCode::Return);
+                assert_eq!(mods, Modifiers::CTRL);
+            }
+            other => panic!("expected Replace(Ctrl+Return), got {other:?}"),
+        }
+    }
 }

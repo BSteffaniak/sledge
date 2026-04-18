@@ -1,21 +1,77 @@
 //! Tracing subscriber setup.
+//!
+//! The subscriber is installed once at daemon startup but uses a
+//! [`tracing_subscriber::reload::Layer`] so the `EnvFilter` (log-level
+//! filter) can be swapped at runtime without reinstalling the global
+//! subscriber. The reload handle is exposed via [`LogGuard::reload_handle`]
+//! so the config-reload path can re-apply the `log_level` from the TOML
+//! file whenever the config changes.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::reload;
+
+/// Handle used to hot-swap the `EnvFilter` at runtime.
+///
+/// Cloneable and `Send + Sync` so it can be captured by the config-reload
+/// closure and the IPC server without extra synchronisation.
+pub type FilterReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
 /// Guard returned by [`init`]. Keep it alive for the daemon's lifetime to
 /// flush log writes on shutdown.
 #[must_use]
 pub struct LogGuard {
     _file: Option<tracing_appender::non_blocking::WorkerGuard>,
+    reload_handle: FilterReloadHandle,
+}
+
+impl LogGuard {
+    /// A clone of the `EnvFilter` reload handle.
+    #[must_use]
+    pub fn reload_handle(&self) -> FilterReloadHandle {
+        self.reload_handle.clone()
+    }
+}
+
+/// Attempt to swap the active `EnvFilter` to the directive `level`. If the
+/// directive is invalid, falls back to `info` and returns an error string
+/// describing the parse failure.
+///
+/// Logs the level change at INFO on success. Safe to call repeatedly.
+///
+/// # Errors
+///
+/// Returns an error string if the reload handle has been dropped or if the
+/// new filter cannot be installed.
+pub fn apply_level(handle: &FilterReloadHandle, level: &str) -> Result<(), String> {
+    let filter = match EnvFilter::try_new(level) {
+        Ok(f) => f,
+        Err(e) => {
+            // Fall back to info so the daemon keeps producing logs.
+            let fallback = EnvFilter::new("info");
+            handle
+                .reload(fallback)
+                .map_err(|re| format!("reload handle error: {re}"))?;
+            return Err(format!("invalid log_level {level:?}: {e}"));
+        }
+    };
+    handle
+        .reload(filter)
+        .map_err(|e| format!("reload handle error: {e}"))?;
+    info!(level = %level, "log level applied");
+    Ok(())
 }
 
 /// Initialise tracing. Logs are written to a rotating file under
 /// `~/Library/Logs/sledge/` on macOS and `$XDG_STATE_HOME/sledge/` elsewhere.
 /// If `also_stdout` is true, logs are also mirrored to stderr.
+///
+/// The returned [`LogGuard`] exposes a [`FilterReloadHandle`] via
+/// [`LogGuard::reload_handle`] for runtime log-level changes.
 ///
 /// # Errors
 ///
@@ -33,9 +89,12 @@ pub fn init(level: &str, also_stdout: bool) -> Result<LogGuard> {
         .with_target(true)
         .with_level(true);
 
-    let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
+    let initial_filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
+    let (filter_layer, reload_handle) = reload::Layer::new(initial_filter);
 
-    let registry = tracing_subscriber::registry().with(filter).with(file_layer);
+    let registry = tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(file_layer);
 
     if also_stdout {
         let stderr_layer = tracing_subscriber::fmt::layer()
@@ -49,6 +108,7 @@ pub fn init(level: &str, also_stdout: bool) -> Result<LogGuard> {
 
     Ok(LogGuard {
         _file: Some(worker),
+        reload_handle,
     })
 }
 

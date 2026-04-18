@@ -26,8 +26,7 @@ use core_graphics::event::{
 };
 use parking_lot::Mutex;
 use sledge_core::{
-    Action, BackendError, BackendVerdict, EventKind, EventSink, InputBackend, KeyCode, KeyEvent,
-    Modifiers,
+    Action, BackendError, BackendVerdict, EventKind, EventSink, InputBackend, KeyEvent, Modifiers,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -63,21 +62,43 @@ impl MacOsBackend {
             watchdog_running: Arc::new(AtomicBool::new(false)),
         }
     }
+
+    /// A cheap `Arc` clone of the focus tracker. The caller can read the
+    /// current focused-app bundle id via [`FocusTracker::current`]. The
+    /// tracker stays live only while `run()` is active; when `run()`
+    /// returns, the internal poller is dropped and `current()` will return
+    /// the last observed value (typically `None` after a fresh restart).
+    #[must_use]
+    pub fn focus_tracker(&self) -> Arc<FocusTracker> {
+        self.focus.clone()
+    }
 }
 
 impl InputBackend for MacOsBackend {
     fn run(&mut self, sink: Box<dyn EventSink>) -> Result<(), BackendError> {
         let perms = check_permissions();
-        if !perms.accessibility {
-            return Err(BackendError::MissingPermission(
-                "Accessibility (grant via System Settings > Privacy & Security > Accessibility)"
-                    .into(),
-            ));
-        }
-        if !perms.input_monitoring {
-            return Err(BackendError::MissingPermission(
-                "Input Monitoring (grant via System Settings > Privacy & Security > Input Monitoring)".into(),
-            ));
+        if !perms.accessibility || !perms.input_monitoring {
+            warn!(
+                accessibility = perms.accessibility,
+                input_monitoring = perms.input_monitoring,
+                "permissions missing; firing prompts"
+            );
+            // Fire the user-facing prompts. Both calls return the current
+            // (unchanged) state synchronously; the prompts themselves are
+            // handled asynchronously by the system. We discard the returns
+            // because we want to short-circuit with a consistent error
+            // regardless, leaving the user to grant + relaunch.
+            if !perms.accessibility {
+                let _ = crate::permission::accessibility_trusted(true);
+            }
+            if !perms.input_monitoring {
+                let _ = crate::permission::input_monitoring_request();
+            }
+            return Err(BackendError::MissingPermission(format!(
+                "accessibility={} input_monitoring={}. Grant both in \
+                 System Settings > Privacy & Security, then relaunch sledge.",
+                perms.accessibility, perms.input_monitoring
+            )));
         }
 
         *self.sink.lock() = Some(sink);
@@ -255,6 +276,9 @@ fn translate(etype: CGEventType, event: &CGEvent) -> Option<KeyEvent> {
 
 fn flags_to_mods(flags: CGEventFlags) -> Modifiers {
     let mut m = Modifiers::empty();
+
+    // Device-independent (generic) bits from `CGEventFlags`. One bit per
+    // modifier family, set whenever _any_ side of that family is held.
     if flags.contains(CGEventFlags::CGEventFlagControl) {
         m |= Modifiers::CTRL;
     }
@@ -270,10 +294,171 @@ fn flags_to_mods(flags: CGEventFlags) -> Modifiers {
     if flags.contains(CGEventFlags::CGEventFlagSecondaryFn) {
         m |= Modifiers::FN;
     }
-    // Side-specific bits: CGEventFlags exposes per-side flags via the
-    // NX_DEVICE* bits; we don't currently map them because core rule
-    // matching is side-agnostic for modifier-set matching and the tap FSM
-    // identifies side via keycode rather than flags.
-    let _ = KeyCode::LeftAlt; // silence unused-import warning if any
+
+    // Device-dependent (side-specific) bits. These are `NX_DEVICE*KEYMASK`
+    // values from `<IOKit/hidsystem/IOLLEvent.h>`; they have been stable
+    // ABI since OS X 10.0 and are what `kCGKeyboardEventKeyboardType`
+    // events carry alongside the generic bits. Setting them lets the tap
+    // FSM distinguish LeftAlt from RightAlt etc., which is required for
+    // per-side tap triggers (e.g. "triple-tap right Option").
+    //
+    // The values below were verified against actual `CGEventFlags.bits()`
+    // output on Apple Silicon (macOS 14+) for single-key presses of each
+    // modifier. See the `flags_to_mods_*` tests below for the bit patterns.
+    const NX_L_CTRL: u64 = 0x0000_0001;
+    const NX_L_SHIFT: u64 = 0x0000_0002;
+    const NX_R_SHIFT: u64 = 0x0000_0004;
+    const NX_L_CMD: u64 = 0x0000_0008;
+    const NX_R_CMD: u64 = 0x0000_0010;
+    const NX_L_ALT: u64 = 0x0000_0020;
+    const NX_R_ALT: u64 = 0x0000_0040;
+    const NX_R_CTRL: u64 = 0x0000_2000;
+
+    let raw = flags.bits();
+    if raw & NX_L_CTRL != 0 {
+        m |= Modifiers::LEFT_CTRL;
+    }
+    if raw & NX_R_CTRL != 0 {
+        m |= Modifiers::RIGHT_CTRL;
+    }
+    if raw & NX_L_SHIFT != 0 {
+        m |= Modifiers::LEFT_SHIFT;
+    }
+    if raw & NX_R_SHIFT != 0 {
+        m |= Modifiers::RIGHT_SHIFT;
+    }
+    if raw & NX_L_ALT != 0 {
+        m |= Modifiers::LEFT_ALT;
+    }
+    if raw & NX_R_ALT != 0 {
+        m |= Modifiers::RIGHT_ALT;
+    }
+    if raw & NX_L_CMD != 0 {
+        m |= Modifiers::LEFT_CMD;
+    }
+    if raw & NX_R_CMD != 0 {
+        m |= Modifiers::RIGHT_CMD;
+    }
+
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Raw flag patterns below were captured from live `CGEventFlags.bits()`
+    // values on Apple Silicon (macOS 14) for single-modifier keypresses.
+    // The `0x100` bit is `CGEventFlagNonCoalesced` \u2014 harmless metadata
+    // that is always set on keyboard events.
+
+    fn f(raw: u64) -> CGEventFlags {
+        CGEventFlags::from_bits_retain(raw)
+    }
+
+    #[test]
+    fn flags_to_mods_empty() {
+        assert_eq!(flags_to_mods(CGEventFlags::empty()), Modifiers::empty());
+    }
+
+    #[test]
+    fn flags_to_mods_left_alt() {
+        // Left Option down: CGEventFlagAlternate | NX_L_ALT | NonCoalesced
+        let m = flags_to_mods(f(0x80120));
+        assert!(m.contains(Modifiers::ALT));
+        assert!(m.contains(Modifiers::LEFT_ALT));
+        assert!(!m.contains(Modifiers::RIGHT_ALT));
+    }
+
+    #[test]
+    fn flags_to_mods_right_alt() {
+        // Right Option down: CGEventFlagAlternate | NX_R_ALT | NonCoalesced
+        let m = flags_to_mods(f(0x80140));
+        assert!(m.contains(Modifiers::ALT));
+        assert!(m.contains(Modifiers::RIGHT_ALT));
+        assert!(!m.contains(Modifiers::LEFT_ALT));
+    }
+
+    #[test]
+    fn flags_to_mods_left_shift() {
+        // Left Shift down: CGEventFlagShift | NX_L_SHIFT | NonCoalesced
+        let m = flags_to_mods(f(0x20102));
+        assert!(m.contains(Modifiers::SHIFT));
+        assert!(m.contains(Modifiers::LEFT_SHIFT));
+        assert!(!m.contains(Modifiers::RIGHT_SHIFT));
+    }
+
+    #[test]
+    fn flags_to_mods_right_shift() {
+        // Right Shift down: CGEventFlagShift | NX_R_SHIFT | NonCoalesced
+        let m = flags_to_mods(f(0x20104));
+        assert!(m.contains(Modifiers::SHIFT));
+        assert!(m.contains(Modifiers::RIGHT_SHIFT));
+        assert!(!m.contains(Modifiers::LEFT_SHIFT));
+    }
+
+    #[test]
+    fn flags_to_mods_left_ctrl() {
+        // Left Ctrl down: CGEventFlagControl | NX_L_CTRL | NonCoalesced
+        let m = flags_to_mods(f(0x40101));
+        assert!(m.contains(Modifiers::CTRL));
+        assert!(m.contains(Modifiers::LEFT_CTRL));
+        assert!(!m.contains(Modifiers::RIGHT_CTRL));
+    }
+
+    #[test]
+    fn flags_to_mods_right_ctrl() {
+        // Right Ctrl down: CGEventFlagControl | NX_R_CTRL | NonCoalesced
+        // (Pattern synthesized; most Apple keyboards lack a right Ctrl key.
+        // The `NX_R_CTRL` bit value is documented in IOLLEvent.h.)
+        let m = flags_to_mods(f(0x42100));
+        assert!(m.contains(Modifiers::CTRL));
+        assert!(m.contains(Modifiers::RIGHT_CTRL));
+        assert!(!m.contains(Modifiers::LEFT_CTRL));
+    }
+
+    #[test]
+    fn flags_to_mods_left_cmd() {
+        // Left Cmd down: CGEventFlagCommand | NX_L_CMD | NonCoalesced
+        let m = flags_to_mods(f(0x100108));
+        assert!(m.contains(Modifiers::CMD));
+        assert!(m.contains(Modifiers::LEFT_CMD));
+        assert!(!m.contains(Modifiers::RIGHT_CMD));
+    }
+
+    #[test]
+    fn flags_to_mods_right_cmd() {
+        // Right Cmd down: CGEventFlagCommand | NX_R_CMD | NonCoalesced
+        let m = flags_to_mods(f(0x100110));
+        assert!(m.contains(Modifiers::CMD));
+        assert!(m.contains(Modifiers::RIGHT_CMD));
+        assert!(!m.contains(Modifiers::LEFT_CMD));
+    }
+
+    #[test]
+    fn flags_to_mods_both_shifts() {
+        // Both shifts down: generic Shift + both side bits.
+        let m = flags_to_mods(f(0x20106));
+        assert!(m.contains(Modifiers::SHIFT));
+        assert!(m.contains(Modifiers::LEFT_SHIFT));
+        assert!(m.contains(Modifiers::RIGHT_SHIFT));
+    }
+
+    #[test]
+    fn flags_to_mods_cmd_shift_combo() {
+        // Cmd+Shift (left side of each): Command + Shift + NX_L_CMD + NX_L_SHIFT
+        let m = flags_to_mods(f(0x12010A));
+        assert!(m.contains(Modifiers::CMD));
+        assert!(m.contains(Modifiers::SHIFT));
+        assert!(m.contains(Modifiers::LEFT_CMD));
+        assert!(m.contains(Modifiers::LEFT_SHIFT));
+        assert!(!m.contains(Modifiers::ALT));
+        assert!(!m.contains(Modifiers::CTRL));
+    }
+
+    #[test]
+    fn flags_to_mods_release_is_empty() {
+        // Release event: only NonCoalesced set; no modifier bits.
+        assert_eq!(flags_to_mods(f(0x100)), Modifiers::empty());
+    }
 }

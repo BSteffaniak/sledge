@@ -26,8 +26,9 @@ pub fn run(cli: &Cli, args: RunArgs) -> Result<()> {
     let initial = sledge_config::load_from_file(&config_path)
         .with_context(|| format!("loading {}", config_path.display()))?;
 
-    let _guard =
+    let guard =
         logging::init(&initial.daemon.log_level, args.stdout_logs).context("tracing init")?;
+    let reload_handle = guard.reload_handle();
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -42,11 +43,22 @@ pub fn run(cli: &Cli, args: RunArgs) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        run_macos(cli, matcher, rules_loaded, config_path, aliases)
+        // Keep `guard` alive for the lifetime of the daemon so file-log
+        // flushing works on shutdown.
+        let _guard = guard;
+        run_macos(
+            cli,
+            matcher,
+            rules_loaded,
+            config_path,
+            aliases,
+            reload_handle,
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (matcher, rules_loaded, config_path, aliases);
+        let _ = (matcher, rules_loaded, config_path, aliases, reload_handle);
+        drop(guard);
         anyhow::bail!("only the macOS backend is implemented")
     }
 }
@@ -58,6 +70,7 @@ fn run_macos(
     rules_loaded: Arc<Mutex<usize>>,
     config_path: Arc<PathBuf>,
     aliases: Arc<HashMap<String, AppAlias>>,
+    reload_handle: logging::FilterReloadHandle,
 ) -> Result<()> {
     use sledge_macos::MacOsBackend;
 
@@ -67,6 +80,10 @@ fn run_macos(
     // go through stateless FFI calls, so this is safe.
     let sink_backend = Arc::new(MacOsBackend::new());
     let mut run_backend = MacOsBackend::new();
+    // Share the focus tracker with the IPC server so `sledge status` can
+    // report the currently-focused application. The tracker is populated
+    // by the polling thread owned by `run_backend.run(...)`.
+    let focus_tracker = run_backend.focus_tracker();
 
     let sink: Box<dyn EventSink> = Box::new(MatcherSink {
         matcher: matcher.clone(),
@@ -85,6 +102,7 @@ fn run_macos(
     let rules_for_reload = rules_loaded.clone();
     let config_path_for_reload = config_path.clone();
     let last_reload_for_reload = last_reload_at.clone();
+    let reload_handle_for_reload = reload_handle.clone();
 
     let reload_fn: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
         let cfg =
@@ -93,13 +111,21 @@ fn run_macos(
         *rules_for_reload.lock() = cfg.rules.len();
         *last_reload_for_reload.lock() = Some(Instant::now());
         info!("config reloaded");
+        // Re-apply the log level from the reloaded config. Invalid
+        // directives fall back to `info` and are surfaced as a reload
+        // warning but do not cause the reload itself to fail \u2014 the
+        // rule swap already succeeded and the daemon should stay usable.
+        if let Err(e) = logging::apply_level(&reload_handle_for_reload, &cfg.daemon.log_level) {
+            warn!(error = %e, "log level change failed");
+        }
         Ok(())
     });
 
+    let focus_for_ipc = focus_tracker.clone();
     let ipc_state = Arc::new(ServerState {
         started_at,
         rules_loaded: rules_loaded.clone(),
-        focused_app: Arc::new(|| None),
+        focused_app: Arc::new(move || focus_for_ipc.current()),
         reload: reload_fn.clone(),
         check_permissions: Arc::new(|| {
             let p = sledge_macos::check_permissions();
