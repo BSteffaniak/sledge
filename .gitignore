@@ -1,0 +1,30 @@
+# Build artifacts
+/target
+**/target
+*.rs.bk
+Cargo.lock.bak
+
+# nix / direnv
+result
+result-*
+.direnv/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs / runtime
+*.log
+/tmp/
+/.sledge/
+
+# Bundled app output
+/dist/
+/packaging/macos/build/
+/Sledge.app/

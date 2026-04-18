@@ -1,0 +1,19 @@
+[package]
+authors.workspace    = true
+description          = "Platform-agnostic core engine for sledge: key events, rule matching, modifier-tap FSM"
+edition.workspace    = true
+license.workspace    = true
+name                 = "sledge_core"
+repository.workspace = true
+version.workspace    = true
+
+[dependencies]
+bitflags  = { workspace = true }
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

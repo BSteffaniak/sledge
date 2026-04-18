@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>sledge</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.braden.sledge</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Sledge</string>
+    <key>CFBundleDisplayName</key>
+    <string>Sledge</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Sledge synthesizes keystrokes to implement user-defined keyboard bindings.</string>
+    <key>NSInputMonitoringUsageDescription</key>
+    <string>Sledge reads keyboard events system-wide to implement user-defined bindings. Keystroke contents are never logged or transmitted.</string>
+    <key>NSAccessibilityUsageDescription</key>
+    <string>Sledge needs Accessibility access to synthesize keystrokes and observe the focused application.</string>
+</dict>
+</plist>

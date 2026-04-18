@@ -1,0 +1,15 @@
+[package]
+authors.workspace    = true
+description          = "Linux backend stub for sledge (not yet implemented)"
+edition.workspace    = true
+license.workspace    = true
+name                 = "sledge_linux"
+repository.workspace = true
+version.workspace    = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sledge_core = { workspace = true }
+thiserror   = { workspace = true }
+
+[lints]
+workspace = true

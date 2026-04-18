@@ -1,0 +1,14 @@
+[package]
+authors.workspace    = true
+description          = "Serde-serializable types for the sledge TOML configuration"
+edition.workspace    = true
+license.workspace    = true
+name                 = "sledge_config_models"
+repository.workspace = true
+version.workspace    = true
+
+[dependencies]
+serde = { workspace = true }
+
+[lints]
+workspace = true

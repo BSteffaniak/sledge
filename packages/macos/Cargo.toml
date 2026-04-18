@@ -1,0 +1,29 @@
+[package]
+authors.workspace    = true
+description          = "macOS CGEventTap backend for sledge"
+edition.workspace    = true
+license.workspace    = true
+name                 = "sledge_macos"
+repository.workspace = true
+version.workspace    = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sledge_core = { workspace = true }
+
+anyhow            = { workspace = true }
+crossbeam-channel = { workspace = true }
+libc              = { workspace = true }
+once_cell         = { workspace = true }
+parking_lot       = { workspace = true }
+thiserror         = { workspace = true }
+tracing           = { workspace = true }
+
+core-foundation     = { workspace = true }
+core-foundation-sys = { workspace = true }
+core-graphics       = { workspace = true }
+objc2               = { workspace = true }
+objc2-app-kit       = { workspace = true }
+objc2-foundation    = { workspace = true }
+
+[lints]
+workspace = true
