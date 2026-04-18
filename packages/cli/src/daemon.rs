@@ -80,15 +80,18 @@ fn run_macos(
         .clone()
         .unwrap_or_else(logging::default_socket_path);
     let started_at = Instant::now();
+    let last_reload_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     let matcher_for_reload = matcher.clone();
     let rules_for_reload = rules_loaded.clone();
     let config_path_for_reload = config_path.clone();
+    let last_reload_for_reload = last_reload_at.clone();
 
     let reload_fn: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
         let cfg =
             sledge_config::load_from_file(&config_path_for_reload).map_err(|e| e.to_string())?;
         matcher_for_reload.lock().swap_rules(cfg.rules.clone());
         *rules_for_reload.lock() = cfg.rules.len();
+        *last_reload_for_reload.lock() = Some(Instant::now());
         info!("config reloaded");
         Ok(())
     });
@@ -105,17 +108,27 @@ fn run_macos(
                 input_monitoring: p.input_monitoring,
             }
         }),
+        last_reload_at: last_reload_at.clone(),
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(2)
         .build()?;
-    let listener = ipc::bind(&socket_path).context("binding IPC socket")?;
+    // `UnixListener::bind` registers the FD with the current Tokio
+    // reactor; enter the runtime briefly so it has one to register with.
+    let listener = {
+        let _guard = rt.enter();
+        ipc::bind(&socket_path).context("binding IPC socket")?
+    };
     let ipc_state_clone = ipc_state.clone();
     rt.spawn(async move { ipc::serve(listener, ipc_state_clone).await });
 
-    install_signal_handler(reload_fn);
+    install_signal_handler(reload_fn.clone());
+
+    // Spawn the config-file watcher. Held for the lifetime of the daemon;
+    // drop stops the watcher thread.
+    let _config_watcher = crate::config_watcher::spawn((*config_path).clone(), reload_fn);
 
     run_backend.run(sink).map_err(anyhow::Error::from)?;
     Ok(())

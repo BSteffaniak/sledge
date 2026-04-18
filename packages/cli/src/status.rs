@@ -30,6 +30,10 @@ pub fn print_status(cli: &Cli) -> Result<()> {
             );
             println!("  accessibility  : {}", yn(s.permissions.accessibility));
             println!("  input monitor  : {}", yn(s.permissions.input_monitoring));
+            match s.last_reload_secs_ago {
+                Some(secs) => println!("  last reload    : {secs}s ago"),
+                None => println!("  last reload    : never"),
+            }
             Ok(())
         }
         Response::Error { message } => anyhow::bail!("daemon error: {message}"),

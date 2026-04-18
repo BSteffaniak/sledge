@@ -3,7 +3,7 @@
 //! Protocol: a client connects, sends a single JSON line (`{"op": "status"}`
 //! or `{"op": "reload"}`), and the daemon replies with one JSON line.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -38,6 +38,9 @@ pub struct StatusPayload {
     pub uptime_secs: u64,
     pub focused_app: Option<String>,
     pub permissions: StatusPermissions,
+    /// Seconds since the last successful config reload, or `None` if no
+    /// reload has happened since daemon start.
+    pub last_reload_secs_ago: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +56,8 @@ pub struct ServerState {
     pub focused_app: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     pub reload: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
     pub check_permissions: Arc<dyn Fn() -> StatusPermissions + Send + Sync>,
+    /// Timestamp of the most recent successful reload, if any.
+    pub last_reload_at: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 /// Bind the socket. Removes any stale socket file first.
@@ -106,12 +111,14 @@ async fn handle(stream: UnixStream, state: Arc<ServerState>) -> Result<()> {
             let rules = *state.rules_loaded.lock();
             let focused = (state.focused_app)();
             let uptime = state.started_at.elapsed().as_secs();
+            let last_reload_secs_ago = state.last_reload_at.lock().map(|t| t.elapsed().as_secs());
             Response::Status(StatusPayload {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 rules_loaded: rules,
                 uptime_secs: uptime,
                 focused_app: focused,
                 permissions: perms,
+                last_reload_secs_ago,
             })
         }
         Request::Reload => match (state.reload)() {
@@ -160,9 +167,4 @@ pub fn send_request_blocking(path: &Path, req: &Request) -> Result<Response> {
         .enable_all()
         .build()?;
     rt.block_on(send_request(path, req))
-}
-
-#[doc(hidden)]
-pub fn _unused_pathbuf() -> PathBuf {
-    PathBuf::new()
 }

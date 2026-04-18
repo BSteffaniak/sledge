@@ -40,12 +40,19 @@ sed "s/__VERSION__/$VERSION/g" "$TEMPLATE" > "$APP/Contents/Info.plist"
 echo "==> Ad-hoc codesigning with stable identifier"
 # Remove any extended attributes that would invalidate the signature.
 xattr -cr "$APP" || true
+# NOTE: We deliberately do NOT pass `--options runtime`. Hardened runtime
+# enables library validation, which refuses to load dylibs whose Team ID
+# differs from the main binary. Our main binary is ad-hoc signed (no Team
+# ID) but depends on nix-store dylibs (e.g. libiconv) that carry nix's
+# signature \u2014 under hardened runtime dyld aborts the process. Ad-hoc
+# signature without hardened runtime is sufficient for TCC (Input
+# Monitoring / Accessibility) stability across rebuilds because those
+# grants are keyed off the stable `--identifier` + bundle path.
 codesign \
   --sign - \
   --identifier com.braden.sledge \
   --force \
   --deep \
-  --options runtime \
   --timestamp=none \
   "$APP"
 

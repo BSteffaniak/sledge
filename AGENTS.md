@@ -76,3 +76,10 @@ and exits non-zero. It does NOT prompt the user silently or fall back to
 validated first; only if validation succeeds is the old `RuleSet` swapped
 out. If validation fails the daemon keeps the old rules live and logs the
 error.
+
+In addition to SIGHUP, the daemon runs a background file watcher on the
+config file's parent directory (see `packages/cli/src/config_watcher.rs`).
+Events are debounced (~250 ms) to coalesce multi-write saves by editors
+that rename-over-target. The watcher invokes the same `reload_fn` as
+SIGHUP and the IPC `reload` request, so all three triggers share identical
+behaviour.

@@ -1,6 +1,7 @@
 //! sledge daemon library entry point.
 
 pub mod cli;
+pub mod config_watcher;
 pub mod daemon;
 pub mod ipc;
 pub mod logging;

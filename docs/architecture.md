@@ -75,3 +75,9 @@ stream.
 before the old `RuleSet` is swapped. If validation fails, the old rules stay
 live and the failure is logged. This makes `kill -HUP <pid>` safe to run
 during experimentation.
+
+The daemon also runs a background file watcher on the config file's parent
+directory. Events are debounced ~250 ms to coalesce the multi-write saves
+most editors perform. The watcher invokes the same reload closure SIGHUP
+uses, so all triggers behave identically: atomic swap on success, no
+change on failure.

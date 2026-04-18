@@ -68,10 +68,48 @@ fn log_dir() -> Result<PathBuf> {
 }
 
 /// Default system-wide config path.
+///
+/// Resolution order:
+///   1. `$XDG_CONFIG_HOME/sledge/config.toml` if `XDG_CONFIG_HOME` is set.
+///   2. `~/.config/sledge/config.toml` if that file exists (preferred and
+///      what the project's nix home-manager integration writes to).
+///   3. `~/Library/Application Support/sledge/config.toml` on macOS,
+///      platform-native fallback, if that file exists.
+///   4. If none of the above exist, return `~/.config/sledge/config.toml`
+///      (the canonical path) so error messages point at the preferred
+///      location.
 #[must_use]
 pub fn default_config_path() -> Option<PathBuf> {
-    let base = dirs::config_dir()?;
-    Some(base.join("sledge").join("config.toml"))
+    // 1. Explicit XDG_CONFIG_HOME override.
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg).join("sledge").join("config.toml"));
+        }
+    }
+
+    let home = dirs::home_dir()?;
+    let xdg_path = home.join(".config").join("sledge").join("config.toml");
+
+    // 2. Preferred location, if it exists.
+    if xdg_path.exists() {
+        return Some(xdg_path);
+    }
+
+    // 3. macOS platform-native fallback, if it exists.
+    #[cfg(target_os = "macos")]
+    {
+        let app_support = home
+            .join("Library")
+            .join("Application Support")
+            .join("sledge")
+            .join("config.toml");
+        if app_support.exists() {
+            return Some(app_support);
+        }
+    }
+
+    // 4. Nothing exists yet; report the canonical path.
+    Some(xdg_path)
 }
 
 /// Default IPC socket path.

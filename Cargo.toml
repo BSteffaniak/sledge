@@ -89,6 +89,11 @@ signal-hook = { version = "0.3", default-features = false, features = [
     "iterator",
 ] }
 
+# File watching (for config auto-reload)
+notify = { version = "6", default-features = false, features = [
+    "macos_fsevent",
+] }
+
 # macOS FFI
 core-foundation = { version = "0.10", default-features = false }
 core-foundation-sys = { version = "0.8", default-features = false }
