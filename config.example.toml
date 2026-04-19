@@ -53,16 +53,6 @@ macos = "com.apple.Terminal"
 #   { app_in = ["ghostty", "kitty"] }
 # -----------------------------------------------------------------------------
 
-# Cmd+Alt+1 -> US keyboard layout
-[[binding]]
-action  = { type = "set_input_source", id = "com.apple.keylayout.US" }
-trigger = { key = "Digit1", mods = ["cmd", "alt"] }
-
-# Cmd+Alt+2 -> Dvorak
-[[binding]]
-action  = { type = "set_input_source", id = "com.apple.keylayout.Dvorak" }
-trigger = { key = "Digit2", mods = ["cmd", "alt"] }
-
 # Triple-tap right Option -> Ctrl+Enter  (OpenCode submit)
 [[binding]]
 action  = { type = "send_key", key = "Return", mods = ["ctrl"] }

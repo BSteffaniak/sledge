@@ -1,6 +1,7 @@
 //! Text Input Source switching.
 
 use core_foundation::base::{CFRelease, TCFType};
+use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 use core_foundation::string::CFString;
 use sledge_core::BackendError;
@@ -10,7 +11,9 @@ use sledge_core::BackendError;
 ///
 /// # Errors
 ///
-/// Returns `BackendError::UnknownInputSource` if no input source matches.
+/// - `BackendError::UnknownInputSource` if no input source matches the id.
+/// - `BackendError::Inject` if the source exists but is not enabled, or
+///   if `TISSelectInputSource` returns a non-zero OSStatus.
 pub fn set_input_source(id: &str) -> Result<(), BackendError> {
     // SAFETY: All FFI calls below obey Core Foundation's Create/Get
     // conventions. We release anything we create.
@@ -36,6 +39,36 @@ pub fn set_input_source(id: &str) -> Result<(), BackendError> {
             return Err(BackendError::UnknownInputSource(id.to_string()));
         }
 
+        // Check `kTISPropertyInputSourceIsEnabled` before attempting to
+        // select. Apple's docs require the source to be enabled for
+        // `TISSelectInputSource` to succeed; otherwise it returns
+        // paramErr (-50), which is uninformative. Detecting the
+        // not-enabled case up front lets us surface an actionable
+        // message instead of an opaque OSStatus.
+        let enabled_key = CFString::new("TISPropertyInputSourceIsEnabled");
+        let enabled_ref =
+            TISGetInputSourceProperty(first, enabled_key.as_concrete_TypeRef().cast());
+        let enabled = if enabled_ref.is_null() {
+            // Property not available (e.g. older macOS or non-keyboard
+            // source). Assume enabled and let TISSelectInputSource
+            // tell us otherwise via its return code.
+            true
+        } else {
+            // `TISGetInputSourceProperty` is a Get-rule function:
+            // the returned ref is borrowed, not retained. We must not
+            // CFRelease it ourselves. `wrap_under_get_rule` correctly
+            // models this ownership.
+            bool::from(CFBoolean::wrap_under_get_rule(enabled_ref.cast()))
+        };
+
+        if !enabled {
+            CFRelease(list_ref.cast());
+            return Err(BackendError::Inject(format!(
+                "input source '{id}' is installed but not enabled. \
+                 Enable it via System Settings > Keyboard > Text Input > Input Sources."
+            )));
+        }
+
         let rc = TISSelectInputSource(first);
         CFRelease(list_ref.cast());
 
@@ -43,7 +76,7 @@ pub fn set_input_source(id: &str) -> Result<(), BackendError> {
             Ok(())
         } else {
             Err(BackendError::Inject(format!(
-                "TISSelectInputSource returned {rc}"
+                "TISSelectInputSource returned {rc} for '{id}'"
             )))
         }
     }
@@ -62,6 +95,10 @@ unsafe extern "C" {
         include_all_installed: bool,
     ) -> CFArrayRef;
     fn TISSelectInputSource(input_source: TISInputSourceRef) -> OSStatus;
+    fn TISGetInputSourceProperty(
+        input_source: TISInputSourceRef,
+        property_key: *const core::ffi::c_void,
+    ) -> *const core::ffi::c_void;
     fn CFArrayGetCount(array: CFArrayRef) -> CFIndex;
     fn CFArrayGetValueAtIndex(array: CFArrayRef, idx: CFIndex) -> *const core::ffi::c_void;
 }
