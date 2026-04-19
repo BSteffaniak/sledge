@@ -23,6 +23,14 @@
 
 set -euo pipefail
 
+# Ensure a deterministic PATH. This script may be invoked from
+# constrained environments (e.g. a nix build sandbox or a minimal
+# PATH set by a calling script) where /usr/bin is not on PATH. The
+# external tools we use (awk, sed, mktemp, xattr, codesign, etc.)
+# all live under /usr/bin or /bin on macOS, so pinning the PATH to
+# those locations is both sufficient and the most defensive choice.
+export PATH="/usr/bin:/bin"
+
 SIGN=true
 if [[ "${1:-}" == "--no-sign" ]]; then
   SIGN=false
