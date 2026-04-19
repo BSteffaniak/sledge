@@ -4,7 +4,7 @@
 //! see events before any app does. Our callback:
 //!
 //! 1. Checks the event-source userdata for the self-event sentinel; if
-//!    present, returns `Pass` immediately \u2014 we never re-process our
+//!    present, returns `Pass` immediately — we never re-process our
 //!    own injected output.
 //! 2. Handles `TapDisabledByTimeout` / `TapDisabledByUserInput` by
 //!    re-enabling the tap in place.
@@ -12,18 +12,26 @@
 //! 4. Calls the [`EventSink`] for a verdict.
 //! 5. Applies the verdict: drops the event, passes it through, or queues
 //!    a synthesized replacement to run on a worker thread.
+//!
+//! We create the tap via raw `CGEventTapCreate` FFI rather than the
+//! `core-graphics` crate's `CGEventTap::new` wrapper, because the wrapper
+//! does not support returning a NULL event from the callback (which is
+//! how a CGEventTap signals "swallow this event" to the OS). Its `None`
+//! return value is mapped to "pass through the original event unchanged,"
+//! which silently breaks `Verdict::Swallow` and `Verdict::Replace`
+//! (injection followed by original-event leak).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use core_foundation::base::TCFType;
-use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
-use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
-    CGEventType, EventField,
+use core_foundation::base::{CFRelease, TCFType};
+use core_foundation::runloop::{
+    CFRunLoop, CFRunLoopRef, CFRunLoopSourceRef, kCFRunLoopCommonModes,
 };
+use core_graphics::event::{CGEvent, CGEventFlags, CGEventType, EventField};
+use foreign_types::ForeignType;
 use parking_lot::Mutex;
 use sledge_core::{
     Action, BackendError, BackendVerdict, EventKind, EventSink, InputBackend, KeyEvent, Modifiers,
@@ -107,35 +115,60 @@ impl InputBackend for MacOsBackend {
         let focus = self.focus.clone();
         let sink_ref = self.sink.clone();
 
-        let event_types: [CGEventType; 3] = [
-            CGEventType::KeyDown,
-            CGEventType::KeyUp,
-            CGEventType::FlagsChanged,
-        ];
+        // Event-type mask: KeyDown | KeyUp | FlagsChanged. The values are
+        // the bit indices of the respective CGEventType variants; the mask
+        // is `1 << variant` per Apple's documentation.
+        let event_mask: u64 =
+            (1u64 << 10/* KeyDown */) | (1u64 << 11/* KeyUp */) | (1u64 << 12/* FlagsChanged */);
 
-        // SAFETY: we own the CFRunLoop source and tap for the duration of
-        // this function; see watchdog for re-enable semantics.
-        let tap = CGEventTap::new(
-            CGEventTapLocation::HID,
-            CGEventTapPlacement::HeadInsertEventTap,
-            CGEventTapOptions::Default,
-            event_types.to_vec(),
-            move |_proxy, etype, event| handle_event(etype, event, &focus, &sink_ref),
-        )
-        .map_err(|_| BackendError::TapInstall("CGEventTapCreate failed".into()))?;
+        // Build the callback context. The Box is leaked into the tap and
+        // owned by the CFMachPort's lifetime \u2014 it's freed when the
+        // tap itself goes away. For a daemon this is process lifetime.
+        let ctx = Box::new(CallbackCtx { focus, sink_ref });
+        let ctx_ptr = Box::into_raw(ctx);
+
+        // SAFETY: We pass a valid C function pointer and the raw boxed
+        // context. `CGEventTapCreate` is a standard CF/CG call; we check
+        // the return for NULL. The `ctx` pointer is valid for the lifetime
+        // of the mach port we create.
+        let port = unsafe {
+            CGEventTapCreate(
+                K_CG_HID_EVENT_TAP,
+                K_CG_HEAD_INSERT_EVENT_TAP,
+                K_CG_EVENT_TAP_OPTION_DEFAULT,
+                event_mask,
+                tap_trampoline,
+                ctx_ptr.cast(),
+            )
+        };
+        if port.is_null() {
+            // Reclaim the leaked context so we don't leak it on failure.
+            // SAFETY: ctx_ptr was freshly leaked above and was not consumed
+            // by a successful tap install; safe to reconstitute.
+            drop(unsafe { Box::from_raw(ctx_ptr) });
+            return Err(BackendError::TapInstall("CGEventTapCreate failed".into()));
+        }
 
         // Attach the tap to the current run loop.
+        // SAFETY: `port` is valid until we release it; the returned run
+        // loop source is owned by us. We add it to the current run loop
+        // and release our local reference; the run loop retains what it
+        // needs.
         let current = CFRunLoop::get_current();
-        // SAFETY: mach ports are valid for the lifetime of `tap` which is
-        // moved into the run loop.
+        let current_ref = current.as_concrete_TypeRef();
         unsafe {
-            let loop_source = tap
-                .mach_port
-                .create_runloop_source(0)
-                .map_err(|_| BackendError::TapInstall("create_runloop_source failed".into()))?;
-            current.add_source(&loop_source, kCFRunLoopCommonModes);
+            let source = CFMachPortCreateRunLoopSource(core::ptr::null(), port, 0);
+            if source.is_null() {
+                CFRelease(port.cast());
+                drop(Box::from_raw(ctx_ptr));
+                return Err(BackendError::TapInstall(
+                    "CFMachPortCreateRunLoopSource failed".into(),
+                ));
+            }
+            CFRunLoopAddSource(current_ref, source, kCFRunLoopCommonModes.cast());
+            CFRelease(source.cast());
+            CGEventTapEnable(port, true);
         }
-        tap.enable();
 
         info!("CGEventTap installed and enabled");
 
@@ -144,25 +177,24 @@ impl InputBackend for MacOsBackend {
         // both thread-safe on their CFMachPortRef argument.
         self.watchdog_running.store(true, Ordering::Relaxed);
         let wd_flag = self.watchdog_running.clone();
-        let port_raw = PortRef(
-            tap.mach_port
-                .as_concrete_TypeRef()
-                .cast::<core::ffi::c_void>() as usize,
-        );
+        let port_raw = PortRef(port as usize);
         thread::Builder::new()
             .name("sledge-tap-watchdog".into())
             .spawn(move || watchdog(port_raw, wd_flag))
             .map_err(|e| BackendError::Other(format!("watchdog spawn failed: {e}")))?;
 
-        // Keep the tap alive for the lifetime of this function.
-        let _tap_alive = tap;
-
         // Run forever on the calling thread (expected to be the daemon's
         // main thread, which owns the CFRunLoop).
         CFRunLoop::run_current();
 
-        // If we ever return, shut down the watchdog.
+        // If we ever return, shut down the watchdog and release our refs.
         self.watchdog_running.store(false, Ordering::Relaxed);
+        // SAFETY: `port` and `ctx_ptr` have remained valid while the run
+        // loop was active. After `run_current` returns, we own them.
+        unsafe {
+            CFRelease(port.cast());
+            drop(Box::from_raw(ctx_ptr));
+        }
         Ok(())
     }
 
@@ -174,25 +206,132 @@ impl InputBackend for MacOsBackend {
     }
 }
 
+struct CallbackCtx {
+    focus: Arc<FocusTracker>,
+    sink_ref: Arc<Mutex<Option<Box<dyn EventSink>>>>,
+}
+
+/// Trampoline called by `CGEventTapCreate`.
+///
+/// The return value semantics are: returning the event pointer passes the
+/// event through; returning NULL swallows it. We decide based on the
+/// [`handle_event`] result.
+///
+/// # Safety
+///
+/// Called by the OS from the CFRunLoop thread. `event_ref` is a valid
+/// `CGEventRef`; `user_info` is the raw pointer to the `CallbackCtx`
+/// we leaked when installing the tap.
+unsafe extern "C" fn tap_trampoline(
+    _proxy: *mut core::ffi::c_void,
+    etype: u32,
+    event_ref: *const core::ffi::c_void,
+    user_info: *mut core::ffi::c_void,
+) -> *const core::ffi::c_void {
+    // Translate the raw event-type integer into the Rust enum. Unknown
+    // values (e.g. TapDisabledByTimeout / ByUserInput at 0xFFFFFFFE /
+    // 0xFFFFFFFF) cannot be constructed via the Rust enum, so we handle
+    // them explicitly before the conversion.
+    const TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
+    const TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
+
+    // SAFETY: `event_ref` is a borrowed CGEventRef owned by the caller.
+    // `CGEvent::from_ptr` wraps it under get-rule semantics (no retain),
+    // so we must not CFRelease it ourselves \u2014 the OS owns it.
+    let event = unsafe { CGEvent::from_ptr(event_ref.cast_mut().cast()) };
+
+    let ctx = unsafe { &*(user_info as *const CallbackCtx) };
+
+    let typed = match etype {
+        TAP_DISABLED_BY_TIMEOUT => {
+            warn!("tap disabled: timeout");
+            // Return the event pointer (re-enable is handled by watchdog).
+            // ManuallyDrop so we don't CFRelease what we don't own.
+            let _ = std::mem::ManuallyDrop::new(event);
+            return event_ref;
+        }
+        TAP_DISABLED_BY_USER_INPUT => {
+            warn!("tap disabled: user input");
+            let _ = std::mem::ManuallyDrop::new(event);
+            return event_ref;
+        }
+        10 => CGEventType::KeyDown,
+        11 => CGEventType::KeyUp,
+        12 => CGEventType::FlagsChanged,
+        _ => {
+            // Unknown type we didn't subscribe to; pass through.
+            let _ = std::mem::ManuallyDrop::new(event);
+            return event_ref;
+        }
+    };
+
+    let verdict = handle_event(typed, &event, &ctx.focus, &ctx.sink_ref);
+    // Don't drop the CGEvent wrapper: the CGEventRef is owned by the
+    // caller (the OS), not by us.
+    let _ = std::mem::ManuallyDrop::new(event);
+
+    match verdict {
+        TapVerdict::Pass => event_ref,
+        TapVerdict::Swallow => core::ptr::null(),
+    }
+}
+
+enum TapVerdict {
+    Pass,
+    Swallow,
+}
+
+// -- Raw CF/CG FFI ------------------------------------------------------------
+
+const K_CG_HID_EVENT_TAP: u32 = 0;
+const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
+const K_CG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
+
+type CGEventTapCallBack = unsafe extern "C" fn(
+    proxy: *mut core::ffi::c_void,
+    etype: u32,
+    event: *const core::ffi::c_void,
+    user_info: *mut core::ffi::c_void,
+) -> *const core::ffi::c_void;
+
+unsafe extern "C" {
+    fn CGEventTapCreate(
+        tap: u32,
+        place: u32,
+        options: u32,
+        events_of_interest: u64,
+        callback: CGEventTapCallBack,
+        user_info: *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void;
+
+    fn CGEventTapEnable(tap: *mut core::ffi::c_void, enable: bool);
+
+    fn CGEventTapIsEnabled(tap: *mut core::ffi::c_void) -> bool;
+
+    fn CFMachPortCreateRunLoopSource(
+        allocator: *const core::ffi::c_void,
+        port: *mut core::ffi::c_void,
+        order: isize,
+    ) -> CFRunLoopSourceRef;
+
+    fn CFRunLoopAddSource(
+        rl: CFRunLoopRef,
+        source: CFRunLoopSourceRef,
+        mode: *const core::ffi::c_void,
+    );
+}
+
 fn watchdog(port: PortRef, running: Arc<AtomicBool>) {
     debug!("tap watchdog started");
     while running.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(500));
-        let port_ptr = port.0 as *const core::ffi::c_void;
+        let port_ptr = port.0 as *mut core::ffi::c_void;
         // SAFETY: The mach port is owned by the main thread's CGEventTap
         // which outlives this watchdog. Both functions are thread-safe.
-        let enabled = unsafe {
-            unsafe extern "C" {
-                fn CGEventTapIsEnabled(tap: *const core::ffi::c_void) -> bool;
-            }
-            CGEventTapIsEnabled(port_ptr)
-        };
+        let enabled = unsafe { CGEventTapIsEnabled(port_ptr) };
         if !enabled {
             warn!("CGEventTap was disabled; re-enabling");
             unsafe {
-                unsafe extern "C" {
-                    fn CGEventTapEnable(tap: *const core::ffi::c_void, enable: bool);
-                }
                 CGEventTapEnable(port_ptr, true);
             }
         }
@@ -218,16 +357,13 @@ fn handle_event(
     event: &CGEvent,
     focus: &Arc<FocusTracker>,
     sink: &Arc<Mutex<Option<Box<dyn EventSink>>>>,
-) -> Option<CGEvent> {
-    // Tap-disabled events: re-enable happens in watchdog; we log here too.
+) -> TapVerdict {
+    // Tap-disabled events are handled by the trampoline (via raw etype
+    // matching on `TAP_DISABLED_BY_*`), not here, because the typed
+    // `CGEventType` enum doesn't include them on all crate versions.
     match etype {
-        CGEventType::TapDisabledByTimeout => {
-            warn!("tap disabled: timeout");
-            return Some(event.clone());
-        }
-        CGEventType::TapDisabledByUserInput => {
-            warn!("tap disabled: user input");
-            return Some(event.clone());
+        CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput => {
+            return TapVerdict::Pass;
         }
         _ => {}
     }
@@ -236,26 +372,26 @@ fn handle_event(
     let userdata = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA);
     if userdata == SLEDGE_EVENT_SOURCE_TAG {
         trace!("passing through self-event (sentinel matched)");
-        return Some(event.clone());
+        return TapVerdict::Pass;
     }
 
     // Translate.
     let Some(kevent) = translate(etype, event) else {
-        return Some(event.clone());
+        return TapVerdict::Pass;
     };
 
     let focused = focus.current();
     let verdict = {
         let mut guard = sink.lock();
         let Some(sink) = guard.as_mut() else {
-            return Some(event.clone());
+            return TapVerdict::Pass;
         };
         sink.on_event(kevent, focused.as_deref())
     };
 
     match verdict {
-        BackendVerdict::Pass => Some(event.clone()),
-        BackendVerdict::Swallow => None,
+        BackendVerdict::Pass => TapVerdict::Pass,
+        BackendVerdict::Swallow => TapVerdict::Swallow,
     }
 }
 

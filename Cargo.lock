@@ -1082,6 +1082,7 @@ dependencies = [
  "core-foundation-sys",
  "core-graphics",
  "crossbeam-channel",
+ "foreign-types",
  "libc",
  "objc2",
  "objc2-app-kit",

@@ -4,7 +4,7 @@
 //! along with focused-app information, emitting [`Verdict`]s that tell the
 //! platform backend what to do.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use tracing::{debug, trace};
@@ -94,6 +94,14 @@ pub struct Matcher {
     /// Track which modifier keys are currently down so the FSM can be fed
     /// `was_down` correctly.
     modifier_state: HashMap<KeyCode, bool>,
+    /// Track key codes whose most recent `KeyDown` was consumed by a rule
+    /// (`Verdict::Replace` or `Verdict::Swallow`). When the matching
+    /// `KeyUp` arrives we also swallow it so the consumer app never sees
+    /// a bare up-without-down. Without this, apps watching for matched
+    /// press/release pairs (e.g. zellij via the kitty keyboard protocol)
+    /// observe a spurious lingering key-up event, which they may mis-
+    /// interpret as triggering their own binding for that key.
+    swallowed_downs: HashSet<KeyCode>,
 }
 
 impl Matcher {
@@ -104,6 +112,7 @@ impl Matcher {
             rules,
             tap_fsm: TapFsm::new(),
             modifier_state: HashMap::new(),
+            swallowed_downs: HashSet::new(),
         }
     }
 
@@ -113,6 +122,10 @@ impl Matcher {
         self.rules = new_rules;
         // Reset tap state; no reason to preserve it across reloads.
         self.tap_fsm = TapFsm::new();
+        // Any in-flight swallow bookkeeping is scoped to the previous
+        // rule set; forget it so a subsequent key-up for a code whose
+        // down was matched by an old rule still propagates.
+        self.swallowed_downs.clear();
     }
 
     /// Access the current rule set.
@@ -174,10 +187,24 @@ impl Matcher {
                     if RuleSet::hotkey_matches(trig, event)
                         && RuleSet::scope_matches(rule, focused_app)
                     {
+                        // Record that we're consuming this code's down so
+                        // the matching up is also suppressed (see the
+                        // KeyUp branch below for rationale).
+                        self.swallowed_downs.insert(event.code);
                         return Verdict::Replace(rule.action.clone());
                     }
                 }
             }
+        }
+
+        // Mirror a previously-swallowed KeyDown by swallowing the paired
+        // KeyUp for the same code. Without this, an app watching key
+        // press/release pairs sees a bare up-without-down, which some
+        // terminal multiplexers (e.g. zellij with the kitty keyboard
+        // protocol) interpret as a spurious trigger for their own
+        // binding on that key.
+        if matches!(event.kind, EventKind::KeyUp) && self.swallowed_downs.remove(&event.code) {
+            return Verdict::Swallow;
         }
 
         Verdict::Pass
@@ -340,5 +367,114 @@ mod tests {
             }
             other => panic!("expected Replace(Ctrl+Return), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn hotkey_replace_also_swallows_matching_key_up() {
+        // Regression test: a hotkey rule that replaces Alt+K with Alt+T
+        // must swallow not only the Alt+K KeyDown but also its matching
+        // KeyUp. Otherwise consumers that track press/release pairs
+        // (e.g. zellij with the kitty keyboard protocol) observe a bare
+        // up-without-down and may mis-interpret it as a spurious trigger
+        // for their own binding on that key.
+        let rule = hk(
+            KeyCode::KeyK,
+            Modifiers::ALT,
+            Action::SendKey {
+                key: KeyCode::KeyT,
+                mods: Modifiers::ALT,
+            },
+        );
+        let rules = RuleSet::new(vec![rule]);
+        let mut m = Matcher::new(rules);
+
+        let now = Instant::now();
+
+        // KeyDown should produce a Replace verdict.
+        let down = kdown(KeyCode::KeyK, Modifiers::ALT);
+        match m.dispatch(down, None, now) {
+            Verdict::Replace(Action::SendKey { key, mods }) => {
+                assert_eq!(key, KeyCode::KeyT);
+                assert_eq!(mods, Modifiers::ALT);
+            }
+            other => panic!("expected Replace(Alt+T), got {other:?}"),
+        }
+
+        // KeyUp for the same code must be swallowed, even if the modifier
+        // bits have changed (e.g. user released Alt before K).
+        let up = KeyEvent {
+            code: KeyCode::KeyK,
+            kind: EventKind::KeyUp,
+            mods: Modifiers::empty(),
+        };
+        let v = m.dispatch(up, None, now + std::time::Duration::from_millis(50));
+        assert!(
+            matches!(v, Verdict::Swallow),
+            "expected KeyUp to be Swallow, got {v:?}",
+        );
+
+        // A subsequent unrelated KeyUp should NOT be swallowed.
+        let other_up = KeyEvent {
+            code: KeyCode::KeyJ,
+            kind: EventKind::KeyUp,
+            mods: Modifiers::empty(),
+        };
+        let v = m.dispatch(other_up, None, now + std::time::Duration::from_millis(100));
+        assert!(
+            matches!(v, Verdict::Pass),
+            "expected unrelated KeyUp to Pass, got {v:?}",
+        );
+
+        // A KeyUp for our code that has NOT had a matching swallowed
+        // down should Pass (state was cleared by the first matching up).
+        let repeat_up = KeyEvent {
+            code: KeyCode::KeyK,
+            kind: EventKind::KeyUp,
+            mods: Modifiers::empty(),
+        };
+        let v = m.dispatch(repeat_up, None, now + std::time::Duration::from_millis(150));
+        assert!(
+            matches!(v, Verdict::Pass),
+            "expected stale KeyUp to Pass, got {v:?}",
+        );
+    }
+
+    #[test]
+    fn hotkey_out_of_scope_does_not_swallow_key_up() {
+        // If the hotkey rule is scoped to a specific app and we're not
+        // in that app, the KeyDown should Pass and the KeyUp should also
+        // Pass (no swallow bookkeeping recorded).
+        let mut rule = hk(
+            KeyCode::KeyK,
+            Modifiers::ALT,
+            Action::SendKey {
+                key: KeyCode::KeyT,
+                mods: Modifiers::ALT,
+            },
+        );
+        rule.when_app_in = Some(vec!["ghostty".to_string()]);
+        let rules = RuleSet::new(vec![rule]);
+        let mut m = Matcher::new(rules);
+
+        let now = Instant::now();
+        let down = kdown(KeyCode::KeyK, Modifiers::ALT);
+        assert!(matches!(
+            m.dispatch(down, Some("safari"), now),
+            Verdict::Pass
+        ));
+
+        let up = KeyEvent {
+            code: KeyCode::KeyK,
+            kind: EventKind::KeyUp,
+            mods: Modifiers::ALT,
+        };
+        assert!(matches!(
+            m.dispatch(
+                up,
+                Some("safari"),
+                now + std::time::Duration::from_millis(50)
+            ),
+            Verdict::Pass
+        ));
     }
 }
