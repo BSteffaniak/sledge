@@ -28,6 +28,14 @@
 
 set -euo pipefail
 
+# Ensure a deterministic PATH. This script may be invoked from
+# constrained environments (e.g. nix home-manager activation) where
+# PATH does not include /usr/bin. Every external tool we use (awk,
+# mktemp, security, openssl, codesign) lives under /usr/bin or /bin
+# on macOS, so pinning the PATH to those locations is both sufficient
+# and the most defensive choice.
+export PATH="/usr/bin:/bin"
+
 IDENTITY_NAME="Sledge Local Signing"
 KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 
