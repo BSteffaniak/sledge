@@ -84,29 +84,66 @@ impl MacOsBackend {
 
 impl InputBackend for MacOsBackend {
     fn run(&mut self, sink: Box<dyn EventSink>) -> Result<(), BackendError> {
-        let perms = check_permissions();
-        if !perms.accessibility || !perms.input_monitoring {
+        let initial = check_permissions();
+        if !initial.accessibility || !initial.input_monitoring {
             warn!(
-                accessibility = perms.accessibility,
-                input_monitoring = perms.input_monitoring,
-                "permissions missing; firing prompts"
+                accessibility = initial.accessibility,
+                input_monitoring = initial.input_monitoring,
+                "permissions missing; firing prompts and waiting"
             );
-            // Fire the user-facing prompts. Both calls return the current
-            // (unchanged) state synchronously; the prompts themselves are
-            // handled asynchronously by the system. We discard the returns
-            // because we want to short-circuit with a consistent error
-            // regardless, leaving the user to grant + relaunch.
-            if !perms.accessibility {
+            // Fire the user-facing prompts exactly once. Both calls
+            // return the current (unchanged) state synchronously; the
+            // dialogs are dispatched asynchronously by the system. We
+            // discard the returns because we only use them to decide
+            // whether to fire in the first place.
+            //
+            // Crucially, we do NOT re-fire prompts on each polling
+            // iteration below: TCC treats each call as a fresh prompt
+            // request, and launchd's KeepAlive policy combined with a
+            // fast exit-on-failure would produce a prompt storm. Firing
+            // once-per-process and then waiting is the UX-correct
+            // behaviour that keyboard tools like Karabiner and
+            // Hammerspoon use.
+            if !initial.accessibility {
                 let _ = crate::permission::accessibility_trusted(true);
             }
-            if !perms.input_monitoring {
+            if !initial.input_monitoring {
                 let _ = crate::permission::input_monitoring_request();
             }
-            return Err(BackendError::MissingPermission(format!(
-                "accessibility={} input_monitoring={}. Grant both in \
-                 System Settings > Privacy & Security, then relaunch sledge.",
-                perms.accessibility, perms.input_monitoring
-            )));
+
+            info!(
+                "Waiting for Accessibility and Input Monitoring grants. \
+                 Grant both in System Settings > Privacy & Security; \
+                 the daemon will automatically proceed once granted."
+            );
+
+            // Poll until both permissions are granted. We sleep 2s
+            // between checks so the daemon is essentially idle while
+            // waiting. Every 30 iterations (~1 minute) we emit a DEBUG
+            // line so the log shows the daemon is still alive and
+            // waiting rather than silently stalled.
+            let mut tick: u64 = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                tick = tick.saturating_add(1);
+                let p = check_permissions();
+                if p.accessibility && p.input_monitoring {
+                    info!(
+                        accessibility = p.accessibility,
+                        input_monitoring = p.input_monitoring,
+                        "permissions granted; installing event tap"
+                    );
+                    break;
+                }
+                if tick.is_multiple_of(30) {
+                    debug!(
+                        accessibility = p.accessibility,
+                        input_monitoring = p.input_monitoring,
+                        elapsed_secs = tick * 2,
+                        "still waiting for permissions"
+                    );
+                }
+            }
         }
 
         *self.sink.lock() = Some(sink);
