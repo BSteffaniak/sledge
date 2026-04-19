@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bundle-macos.sh BINARY OUTDIR
+# bundle-macos.sh [--no-sign] BINARY OUTDIR
 #
 # Wrap a sledge binary into a code-signed .app bundle at OUTDIR/Sledge.app.
 # The bundle uses a stable CFBundleIdentifier (com.braden.sledge) and is
@@ -14,11 +14,23 @@
 #
 # Usage:
 #   ./scripts/bundle-macos.sh target/release/sledge ./dist
+#   ./scripts/bundle-macos.sh --no-sign target/release/sledge ./dist
+#
+# The `--no-sign` flag produces the bundle tree WITHOUT running the
+# signing-identity setup or codesign steps. This is intended for build
+# systems (e.g. the nix build sandbox) that cannot access the login
+# keychain; signing is deferred to a later stage.
 
 set -euo pipefail
 
-BINARY="${1:?usage: bundle-macos.sh BINARY OUTDIR}"
-OUTDIR="${2:?usage: bundle-macos.sh BINARY OUTDIR}"
+SIGN=true
+if [[ "${1:-}" == "--no-sign" ]]; then
+  SIGN=false
+  shift
+fi
+
+BINARY="${1:?usage: bundle-macos.sh [--no-sign] BINARY OUTDIR}"
+OUTDIR="${2:?usage: bundle-macos.sh [--no-sign] BINARY OUTDIR}"
 
 if [[ ! -x "$BINARY" ]]; then
   echo "binary not found or not executable: $BINARY" >&2
@@ -49,21 +61,25 @@ APP="$OUTDIR/Sledge.app"
 MACOS="$APP/Contents/MacOS"
 RESOURCES="$APP/Contents/Resources"
 
-# Ensure the self-signed signing identity exists in the login keychain
-# and capture its SHA-1 hash. Idempotent: a no-op if the identity is
-# already present and trusted. Otherwise creates the identity and
-# trusts it for code signing (may prompt for keychain password on first
-# run to authorise the trust-settings change).
 IDENTITY_NAME="Sledge Local Signing"
-SETUP_OUTPUT="$("$REPO_ROOT/scripts/setup-signing-identity.sh")"
-printf '%s\n' "$SETUP_OUTPUT"
+IDENTITY_HASH=""
 
-IDENTITY_HASH="$(printf '%s\n' "$SETUP_OUTPUT" \
-  | awk '/^==> SHA-1:/ { print $NF; exit }')"
+if [[ "$SIGN" == "true" ]]; then
+  # Ensure the self-signed signing identity exists in the login keychain
+  # and capture its SHA-1 hash. Idempotent: a no-op if the identity is
+  # already present and trusted. Otherwise creates the identity and
+  # trusts it for code signing (may prompt for keychain password on
+  # first run to authorise the trust-settings change).
+  SETUP_OUTPUT="$("$REPO_ROOT/scripts/setup-signing-identity.sh")"
+  printf '%s\n' "$SETUP_OUTPUT"
 
-if [[ -z "$IDENTITY_HASH" ]]; then
-  echo "failed: setup-signing-identity.sh did not report a SHA-1" >&2
-  exit 1
+  IDENTITY_HASH="$(printf '%s\n' "$SETUP_OUTPUT" \
+    | awk '/^==> SHA-1:/ { print $NF; exit }')"
+
+  if [[ -z "$IDENTITY_HASH" ]]; then
+    echo "failed: setup-signing-identity.sh did not report a SHA-1" >&2
+    exit 1
+  fi
 fi
 
 echo "==> Creating bundle at $APP (version $VERSION)"
@@ -76,9 +92,17 @@ chmod +x "$MACOS/sledge"
 # Substitute version into Info.plist.
 sed "s/__VERSION__/$VERSION/g" "$TEMPLATE" > "$APP/Contents/Info.plist"
 
-echo "==> Codesigning with \"$IDENTITY_NAME\" ($IDENTITY_HASH)"
-# Remove any extended attributes that would invalidate the signature.
+# Remove any extended attributes that would invalidate a signature.
+# Always safe; harmless when --no-sign is set.
 xattr -cr "$APP" || true
+
+if [[ "$SIGN" == "false" ]]; then
+  echo "==> Skipping codesign (--no-sign)"
+  echo "==> Bundle ready (unsigned): $APP"
+  exit 0
+fi
+
+echo "==> Codesigning with \"$IDENTITY_NAME\" ($IDENTITY_HASH)"
 # We sign by the identity's SHA-1 hash rather than its CN so the result
 # is unambiguous even if multiple certs with the same CN exist in the
 # keychain (e.g. leftover entries from prior experiments).
