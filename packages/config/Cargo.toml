@@ -11,13 +11,9 @@ version.workspace    = true
 sledge_config_models = { workspace = true }
 sledge_core          = { workspace = true }
 
-serde     = { workspace = true }
 thiserror = { workspace = true }
 toml      = { workspace = true }
 tracing   = { workspace = true }
-
-[dev-dependencies]
-insta = { workspace = true }
 
 [lints]
 workspace = true

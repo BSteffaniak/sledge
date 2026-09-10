@@ -15,6 +15,33 @@ use crate::cli::{Cli, RunArgs};
 use crate::ipc::{self, ServerState, StatusPermissions};
 use crate::logging;
 
+/// Rules and aliases share one lock so an event never observes mixed config
+/// generations during a reload.
+struct MatchingState {
+    matcher: Matcher,
+    aliases: HashMap<String, AppAlias>,
+}
+
+impl MatchingState {
+    fn new(config: &sledge_config::Config) -> Self {
+        Self {
+            matcher: Matcher::new(config.rules.clone()),
+            aliases: config.app_aliases.clone(),
+        }
+    }
+
+    fn replace(&mut self, config: &sledge_config::Config) {
+        self.matcher.swap_rules(config.rules.clone());
+        self.aliases.clone_from(&config.app_aliases);
+    }
+
+    fn dispatch(&mut self, event: KeyEvent, focused_app: Option<&str>) -> Verdict {
+        let logical = focused_app.and_then(|bid| resolve_logical(&self.aliases, bid));
+        self.matcher
+            .dispatch(event, logical.as_deref().or(focused_app), Instant::now())
+    }
+}
+
 /// Run the daemon.
 ///
 /// # Errors
@@ -36,9 +63,8 @@ pub fn run(cli: &Cli, args: RunArgs) -> Result<()> {
         "sledge starting"
     );
 
-    let matcher = Arc::new(Mutex::new(Matcher::new(initial.rules.clone())));
+    let matcher = Arc::new(Mutex::new(MatchingState::new(&initial)));
     let rules_loaded = Arc::new(Mutex::new(initial.rules.len()));
-    let aliases = Arc::new(initial.app_aliases.clone());
     let config_path = Arc::new(config_path);
 
     #[cfg(target_os = "macos")]
@@ -46,18 +72,11 @@ pub fn run(cli: &Cli, args: RunArgs) -> Result<()> {
         // Keep `guard` alive for the lifetime of the daemon so file-log
         // flushing works on shutdown.
         let _guard = guard;
-        run_macos(
-            cli,
-            matcher,
-            rules_loaded,
-            config_path,
-            aliases,
-            reload_handle,
-        )
+        run_macos(cli, matcher, rules_loaded, config_path, reload_handle)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (matcher, rules_loaded, config_path, aliases, reload_handle);
+        let _ = (matcher, rules_loaded, config_path, reload_handle);
         drop(guard);
         anyhow::bail!("only the macOS backend is implemented")
     }
@@ -66,10 +85,9 @@ pub fn run(cli: &Cli, args: RunArgs) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn run_macos(
     cli: &Cli,
-    matcher: Arc<Mutex<Matcher>>,
+    matcher: Arc<Mutex<MatchingState>>,
     rules_loaded: Arc<Mutex<usize>>,
     config_path: Arc<PathBuf>,
-    aliases: Arc<HashMap<String, AppAlias>>,
     reload_handle: logging::FilterReloadHandle,
 ) -> Result<()> {
     use sledge_macos::MacOsBackend;
@@ -87,7 +105,6 @@ fn run_macos(
 
     let sink: Box<dyn EventSink> = Box::new(MatcherSink {
         matcher: matcher.clone(),
-        aliases: aliases.clone(),
         backend: sink_backend,
     });
 
@@ -107,7 +124,7 @@ fn run_macos(
     let reload_fn: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
         let cfg =
             sledge_config::load_from_file(&config_path_for_reload).map_err(|e| e.to_string())?;
-        matcher_for_reload.lock().swap_rules(cfg.rules.clone());
+        matcher_for_reload.lock().replace(&cfg);
         *rules_for_reload.lock() = cfg.rules.len();
         *last_reload_for_reload.lock() = Some(Instant::now());
         info!("config reloaded");
@@ -203,21 +220,14 @@ fn resolve_config_path(cli: &Cli) -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 struct MatcherSink {
-    matcher: Arc<Mutex<Matcher>>,
-    aliases: Arc<HashMap<String, AppAlias>>,
+    matcher: Arc<Mutex<MatchingState>>,
     backend: Arc<sledge_macos::MacOsBackend>,
 }
 
 #[cfg(target_os = "macos")]
 impl EventSink for MatcherSink {
     fn on_event(&mut self, event: KeyEvent, focused_app: Option<&str>) -> BackendVerdict {
-        let logical = focused_app.and_then(|bid| resolve_logical(&self.aliases, bid));
-        let app_for_match = logical.as_deref().or(focused_app);
-
-        let verdict = self
-            .matcher
-            .lock()
-            .dispatch(event, app_for_match, Instant::now());
+        let verdict = self.matcher.lock().dispatch(event, focused_app);
 
         match verdict {
             Verdict::Pass => BackendVerdict::Pass,
@@ -239,4 +249,47 @@ fn resolve_logical(aliases: &HashMap<String, AppAlias>, bundle_id: &str) -> Opti
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sledge_core::{EventKind, KeyCode, Modifiers};
+
+    fn config(bundle: &str) -> sledge_config::Config {
+        sledge_config::parse_str(&format!(
+            r#"
+[app_aliases.editor]
+macos = "{bundle}"
+[[binding]]
+when = {{ app_in = ["editor"] }}
+trigger = {{ key = "KeyK", mods = ["ctrl"] }}
+action = {{ type = "send_key", key = "Return", mods = [] }}
+"#
+        ))
+        .expect("valid config")
+    }
+
+    #[test]
+    fn reload_replaces_aliases_together_with_rules() {
+        let mut state = MatchingState::new(&config("old.editor"));
+        let event = KeyEvent {
+            code: KeyCode::KeyK,
+            kind: EventKind::KeyDown,
+            mods: Modifiers::CTRL,
+        };
+        assert!(matches!(
+            state.dispatch(event, Some("old.editor")),
+            Verdict::Replace(_)
+        ));
+        state.replace(&config("new.editor"));
+        assert!(matches!(
+            state.dispatch(event, Some("old.editor")),
+            Verdict::Pass
+        ));
+        assert!(matches!(
+            state.dispatch(event, Some("new.editor")),
+            Verdict::Replace(_)
+        ));
+    }
 }

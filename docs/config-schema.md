@@ -27,8 +27,9 @@ macos   = "com.mitchellh.ghostty"
 # windows = "Ghostty.exe"           # window class / exe (future)
 ```
 
-On macOS, only `macos` is consulted. If a logical name is referenced from a
-binding but has no `macos` entry, config validation fails.
+On macOS, only `macos` is consulted. Validation rejects unknown logical
+aliases; an alias without a `macos` identifier cannot match a foreground app.
+Supply that identifier for every scoped binding you intend to use on macOS.
 
 ### `[[binding]]`
 

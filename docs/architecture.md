@@ -41,16 +41,16 @@ Option" is distinguishable from a triple-tap on "Left Option".
 
 When the backend hands the core a `KeyEvent`, the core returns a `Verdict`:
 
-- `Pass` \u2014 let the event through unmodified.
-- `Swallow` \u2014 drop the event; do not deliver it to any app.
-- `Replace(event)` \u2014 drop the original and inject a synthesized event.
+- `Pass` — let the event through unmodified.
+- `Swallow` — drop the event; do not deliver it to any app.
+- `Replace(event)` — drop the original and inject a synthesized event.
 
 The macOS tap callback applies the verdict synchronously.
 
 ## Self-event filtering
 
 Synthetic events are injected through a private `CGEventSource` whose
-`sourceUserData` is set to a sentinel value (`SLEDGE_SOURCE_TAG`). The tap
+`sourceUserData` is set to a sentinel value (`SLEDGE_EVENT_SOURCE_TAG`). The tap
 callback checks this field on every event and, if it matches, passes the
 event through without running rule matching. This breaks any potential
 feedback loop where a synthesized event re-triggers the same rule that
@@ -72,7 +72,7 @@ stream.
 ## Config reload
 
 `SIGHUP` triggers config reload. The new config is parsed and validated
-before the old `RuleSet` is swapped. If validation fails, the old rules stay
+before the rules and app aliases are swapped under one matching-state lock. If validation fails, the old rules stay
 live and the failure is logged. This makes `kill -HUP <pid>` safe to run
 during experimentation.
 

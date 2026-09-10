@@ -1,71 +1,42 @@
-# macOS permissions
+# macOS permissions and installation
 
-`sledge` requires two separate TCC grants on macOS:
+sledge needs **Accessibility** to synthesize events and **Input Monitoring** to receive keyboard events. Only grant these permissions to a build you trust.
 
-- **Accessibility** (`com.apple.security.accessibility`) \u2014 lets the
-  daemon synthesize keystrokes and query foreground-app identity.
-- **Input Monitoring** (`com.apple.security.input-monitoring`) \u2014 lets
-  the daemon read keystrokes via CGEventTap.
+## Startup behavior
 
-Both are required. Without Input Monitoring the tap never receives events.
-Without Accessibility, injection returns silently without effect.
+The backend checks both grants before installing `CGEventTap`. If a grant is missing, it requests the corresponding permission once and waits, polling every two seconds. Grant access under **System Settings → Privacy & Security → Accessibility / Input Monitoring**. The daemon continues once both checks succeed.
 
-## Grant persistence across rebuilds
+`check-permissions` reports grants without starting the event tap. `status` reports the running daemon's state. Permission revocation or Secure Input can stop event delivery; watchdog recovery is not a way to bypass either boundary.
 
-TCC keys grants off a binary's code-signing identity and bundle path. Every
-time you rebuild, the binary's hash changes; if the signing identity is also
-unstable, macOS treats the new build as an unknown application and silently
-revokes the previous grant. This is the root cause of the "Hammerspoon
-stopped working after a nix rebuild" class of failure.
+## Signing and grant persistence
 
-`sledge` mitigates this by:
+The bundle identifier is `com.braden.sledge`. `scripts/bundle-macos.sh` creates or reuses a self-signed **Sledge Local Signing** certificate in the login keychain, then signs the bundle with it. Setup may ask for keychain authorization and changes code-signing trust settings. Review `scripts/setup-signing-identity.sh` before running it.
 
-1. **Stable bundle id.** The `.app` bundle uses `CFBundleIdentifier =
-com.braden.sledge`. This identifier does not change across builds.
-2. **Ad-hoc code signing with a stable identifier.** `scripts/bundle-macos.sh`
-   runs `codesign --sign - --identifier com.braden.sledge --force ...` on
-   every build. The ad-hoc signature ("-") plus a stable identifier is
-   sufficient for TCC to treat successive builds as the same application.
-3. **Stable install path.** The bundle is installed at
-   `/Applications/Sledge.app`. Do not install under
-   `/nix/store/...-sledge/bin/sledge` directly \u2014 TCC partly keys off
-   the bundle path.
+This is deliberately **not ad-hoc signing**: an ad-hoc signature changes identity with the binary hash. Reusing the certificate and a stable path such as `/Applications/Sledge.app` helps macOS recognize successive builds. It is not a guarantee that TCC grants always survive an OS update, certificate change, or rebuild, and it does not provide Apple notarization.
 
-If you need to re-grant after a rebuild that did lose permissions, remove
-the stale entries from _System Settings \u2192 Privacy & Security \u2192
-Accessibility_ and _Input Monitoring_, then re-launch the bundle.
+`--no-sign` produces an unsigned bundle for build environments without keychain access; sign it before normal installation.
 
-## Preflight
+## Supervision
 
-On every startup `sledge` calls:
+Create and validate configuration before the first launch. Install the bundle at its final path, grant permissions, and only then opt into the per-user LaunchAgent:
 
-- `IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)` \u2014 Input Monitoring.
-- `AXIsProcessTrusted()` \u2014 Accessibility.
-
-If either is denied, the daemon logs an error (with the specific missing
-grant) and exits with a non-zero status. `launchd`'s backoff kicks in; you'll
-see the daemon restart-loop in `log stream --predicate 'subsystem contains
-"sledge"'`. Grant the permissions and the daemon will come up on the next
-launchd restart.
-
-## Secure input mode
-
-Password fields (1Password, `sudo`, Keychain prompts, etc.) cause macOS to
-enter _secure input mode_ for the duration of the prompt. No user-space
-event tap sees events during secure input \u2014 this is a kernel-level
-boundary, not something the daemon can route around. It's the same
-limitation every CGEventTap-based tool has, including Karabiner and
-Hammerspoon.
-
-## Dropping permissions
-
-To fully uninstall:
-
-```
-launchctl unload ~/Library/LaunchAgents/com.braden.sledge.plist
-rm ~/Library/LaunchAgents/com.braden.sledge.plist
-rm -rf /Applications/Sledge.app
+```sh
+./scripts/install-launchagent.sh /Applications/Sledge.app
+launchctl print "gui/$(id -u)/com.braden.sledge"
 ```
 
-Then manually remove the entries under System Settings \u2192 Privacy &
-Security \u2192 Accessibility / Input Monitoring.
+The installer writes `~/Library/LaunchAgents/com.braden.sledge.plist`, creates the log directory, and loads/starts the agent. `KeepAlive` supervises it. Do not simultaneously run another instance with the same socket.
+
+## Secure Input
+
+Password-entry and other Secure Input contexts can prevent user-space keyboard taps from receiving events. Do not rely on remappings there. The daemon does not disable Secure Input.
+
+## Stop and uninstall
+
+Unload the service before removing its files:
+
+```sh
+launchctl bootout "gui/$(id -u)/com.braden.sledge"
+```
+
+Remove the LaunchAgent plist and `/Applications/Sledge.app` using Finder. Remove their Accessibility/Input Monitoring entries in System Settings. Configuration and logs are separate user data; preserve or remove them deliberately. The locally created signing identity remains in Keychain Access and can be removed separately if no builds use it.

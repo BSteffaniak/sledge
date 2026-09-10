@@ -1,130 +1,112 @@
 # sledge
 
-Low-level keyboard-event daemon. A robust, minimal replacement for
-Hammerspoon-style key-remap and hotkey setups.
+**A native Rust keyboard-automation daemon for macOS.**
 
-> **Alpha software.** This tool installs a system-wide keyboard event tap and
-> synthesizes keystrokes. Read the source, review the config, and only grant
-> permissions to builds you trust.
+sledge provides declarative hotkeys, application-scoped remapping, modifier-tap sequences, and input-source switching without an embedded scripting runtime. A platform-neutral matching engine is connected directly to macOS's keyboard event tap.
 
-## Why
+> **Alpha software.** The daemon can observe keyboard events and synthesize keystrokes. Review your configuration and only grant permissions to a build you trust. Linux and Windows backends are stubs, not supported keyboard daemons.
 
-Hammerspoon is great for throwing together Lua scripts, but the pieces you
-actually depend on every day — global hotkeys, app-scoped remaps, modifier-tap
-tricks — sit on top of a Lua VM that can silently die and an event tap that
-macOS happily disables without telling anyone. When that happens, typing just
-stops working right. You don't get a crash dialog. You get a keyboard that
-_almost_ behaves.
+## Design
 
-`sledge` does the small subset you actually use, but does it close to the
-metal:
+- Normalized key events and a modifier-tap state machine in [`sledge_core`](packages/core).
+- TOML parsing and rule validation in [`sledge_config`](packages/config).
+- Native `CGEventTap` integration, focus tracking, and watchdog recovery in [`sledge_macos`](packages/macos).
+- Synthetic-event tagging to prevent the daemon from matching its own output.
+- Atomic rule/alias reload through IPC, SIGHUP, or a debounced file watcher.
+- Optional per-user `launchd` supervision; no background service is installed by a Cargo build.
 
-- One Rust binary, no embedded scripting runtime, no plugin loader.
-- CGEventTap installed at the HID level with an active watchdog that
-  re-enables the tap whenever macOS disables it.
-- Injected events are tagged with a private event-source userdata so the
-  daemon never re-processes its own output.
-- Permissions (Accessibility + Input Monitoring) are checked up-front; if
-  they're missing, the daemon says so loudly and exits.
-- Config is declarative TOML. No arbitrary code paths. If the config parses,
-  it runs; if it doesn't, the daemon refuses to start.
-- Runs under `launchd` with `KeepAlive` so it auto-restarts on crash.
+## Build and configure
 
-## How it works
-
-Three layers:
-
-1. **Core engine** (`sledge_core`) — platform-agnostic. Owns the rule set,
-   modifier-tap state machine, and app-scope filter. Speaks in normalized
-   `KeyEvent`s keyed by USB-HID usage codes, not per-OS codes.
-2. **Platform backend** — currently just `sledge_macos`. Implements the
-   `InputBackend` trait: install a tap, deliver events, inject synthesized
-   events, report focus changes, switch input sources.
-3. **Daemon** (`sledge`) — wires core + backend together, owns the main loop,
-   handles SIGHUP reloads, exposes a `status` socket, emits structured logs.
-
-`sledge_linux` and `sledge_windows` exist as target-gated stubs so the
-workspace shape is right for future backends. They don't do anything yet.
-
-## Install (from source)
+Requirements: macOS, Git, stable Rust, and the Xcode Command Line Tools. Packaging uses the system code-signing and keychain tools.
 
 ```sh
-git clone https://github.com/BSteffaniak/sledge ~/GitHub/sledge
-cd ~/GitHub/sledge
-cargo build --release
+git clone https://github.com/BSteffaniak/sledge.git
+cd sledge
+cargo build --locked --release
+mkdir -p ~/.config/sledge
+# For a new installation only; do not overwrite an existing configuration.
+cp -n config.example.toml ~/.config/sledge/config.toml
+./target/release/sledge validate ~/.config/sledge/config.toml
 ```
 
-Then either invoke the binary directly, or wrap it into a `.app` bundle for
-stable TCC grants:
-
-```sh
-./scripts/bundle-macos.sh target/release/sledge ./dist
-open ./dist/Sledge.app   # triggers permission prompts on first run
-```
-
-## Configure
-
-Drop a config at `~/.config/sledge/config.toml`. An annotated example lives
-at [`config.example.toml`](./config.example.toml).
+Review the [annotated configuration](config.example.toml) before starting. For example:
 
 ```toml
-[daemon]
-log_level = "info"
-
 [app_aliases.ghostty]
 macos = "com.mitchellh.ghostty"
 
-# Cmd+Alt+1 -> switch to US layout
 [[binding]]
-trigger = { key = "Digit1", mods = ["cmd", "alt"] }
-action  = { type = "set_input_source", id = "com.apple.keylayout.US" }
+when = { app_in = ["ghostty"] }
+trigger = { key = "Semicolon", mods = ["ctrl"] }
+action = { type = "send_key", key = "KeyS", mods = ["ctrl"] }
 
-# Triple-tap right Option -> Ctrl+Enter
 [[binding]]
 trigger = { tap = "RightAlt", count = 3, within_ms = 600 }
-action  = { type = "send_key", key = "Return", mods = ["ctrl"] }
-
-# Terminal-only: Ctrl+; -> Ctrl+s
-[[binding]]
-when    = { app_in = ["ghostty"] }
-trigger = { key = "Semicolon", mods = ["ctrl"] }
-action  = { type = "send_key", key = "KeyS", mods = ["ctrl"] }
+action = { type = "send_key", key = "Return", mods = ["ctrl"] }
 ```
+
+## Run
+
+For a foreground evaluation:
+
+```sh
+./target/release/sledge run --stdout-logs
+```
+
+For a stable application path and signing identity:
+
+```sh
+./scripts/bundle-macos.sh target/release/sledge ./dist
+# Move dist/Sledge.app to /Applications/Sledge.app using Finder.
+open /Applications/Sledge.app
+```
+
+The bundling script creates/reuses a self-signed **Sledge Local Signing** identity in your login keychain and may request authorization for trust settings. It is not Apple notarization. A stable certificate and installation path help preserve TCC grants across rebuilds, but reauthorization can still be necessary. See [macOS permissions](docs/macos-permissions.md).
+
+Grant **Accessibility** and **Input Monitoring** in System Settings. When grants are missing at startup, the daemon requests them once and waits; it does not install the tap until both are granted.
+
+To opt into login startup, stop the foreground instance first, then run:
+
+```sh
+./scripts/install-launchagent.sh /Applications/Sledge.app
+```
+
+This writes and loads a per-user LaunchAgent with `KeepAlive`. Do not run a foreground daemon and a supervised instance simultaneously.
 
 ## Commands
 
+Use `./target/release/sledge` below, or put the installed binary on `PATH`:
+
+```text
+sledge run                       Run in the foreground (also the default)
+sledge status                    Query the daemon over its Unix socket
+sledge reload                    Request a reload over that socket
+sledge validate <path>           Validate without starting a keyboard tap
+sledge check-permissions         Report current permission grants
 ```
-sledge                           # run the daemon in the foreground
-sledge run                       # same as above, explicit
-sledge status                    # query a running daemon via its socket
-sledge reload                    # send SIGHUP to a running daemon
-sledge validate <path>           # parse and validate a config file
-sledge check-permissions         # report Accessibility + Input Monitoring status
+
+The default configuration is `~/.config/sledge/config.toml`; override it with `--config` or `SLEDGE_CONFIG`. Successful reload replaces rules and app aliases together and updates the log level. Invalid configuration leaves the previous configuration active. SIGHUP and file watching use the same reload path.
+
+## Limitations and security
+
+- Secure Input and OS permission boundaries can prevent events from reaching the tap. Watchdog recovery cannot bypass those protections.
+- App scoping uses foreground application identity, not window titles or document contents.
+- Debug/trace logging can expose key codes; keep normal logging at `info` or lower.
+- A syntactically valid action is not a guarantee that macOS will permit it or that an input-source identifier exists.
+
+Read the [security policy](SECURITY.md), [configuration schema](docs/config-schema.md), and [architecture](docs/architecture.md).
+
+## Development
+
+```sh
+cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all
+cargo machete --with-metadata
 ```
 
-## Permissions
-
-On first run, macOS will prompt for **Accessibility** and **Input
-Monitoring**. Both are required. If either is missing or revoked, `sledge`
-logs an error and exits non-zero — it never silently "sort of" runs.
-
-The app bundle uses a stable `CFBundleIdentifier` (`com.braden.sledge`) and
-is ad-hoc codesigned so TCC preserves grants across rebuilds. See
-[`docs/macos-permissions.md`](./docs/macos-permissions.md) for detail.
-
-## Project layout
-
-```
-packages/
-  core/              sledge_core \u2014 engine, types, rule matching
-  config/            sledge_config \u2014 TOML parser + validation
-  config/models/     sledge_config_models \u2014 serde types
-  macos/             sledge_macos \u2014 CGEventTap backend
-  linux/             sledge_linux \u2014 stub
-  windows/           sledge_windows \u2014 stub
-  cli/               sledge binary
-```
+Automated tests cover rule handling, configuration, and backend helpers. Permission prompts, event-tap recovery, signing, and login startup also need manual macOS testing. Report non-sensitive bugs through [GitHub Issues](https://github.com/BSteffaniak/sledge/issues).
 
 ## License
 
-MPL-2.0. See [`LICENSE`](./LICENSE).
+[Mozilla Public License 2.0](LICENSE).
