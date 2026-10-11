@@ -1,0 +1,27 @@
+[Unit]
+Description=Sledge unprivileged graphical-session daemon
+Documentation=file:/usr/share/doc/sledge/linux-installation.md
+Requisite=graphical-session.target
+After=graphical-session.target
+BindsTo=graphical-session.target
+PartOf=graphical-session.target
+ConditionUser=!root
+ConditionPathExists=%h/.config/sledge/config.toml
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sledge run --stdout-logs
+Restart=no
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectSystem=full
+RestrictAddressFamilies=AF_UNIX
+KillMode=control-group
+TimeoutStopSec=10s
+SendSIGKILL=yes
+
+[Install]
+WantedBy=graphical-session.target

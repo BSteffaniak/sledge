@@ -17,6 +17,7 @@ unsafe extern "C" {}
 pub mod bundle;
 pub mod focus;
 pub mod inject;
+mod input_source_worker;
 pub mod keycode;
 pub mod permission;
 pub mod tap;

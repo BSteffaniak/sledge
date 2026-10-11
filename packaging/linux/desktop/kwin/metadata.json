@@ -1,0 +1,13 @@
+{
+  "KPlugin": {
+    "Id": "sledge-desktop",
+    "Name": "Sledge Desktop Bridge",
+    "Description": "Same-user typed focus hints; not broker lock authority",
+    "Version": "1",
+    "License": "MIT"
+  },
+  "KPackageStructure": "KWin/Script",
+  "X-Plasma-API": "declarativescript",
+  "X-Plasma-MainScript": "ui/main.qml",
+  "X-KDE-PluginInfo-EnabledByDefault": false
+}

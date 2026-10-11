@@ -27,9 +27,21 @@ macos   = "com.mitchellh.ghostty"
 # windows = "Ghostty.exe"           # window class / exe (future)
 ```
 
-On macOS, only `macos` is consulted. Validation rejects unknown logical
-aliases; an alias without a `macos` identifier cannot match a foreground app.
-Supply that identifier for every scoped binding you intend to use on macOS.
+On macOS, only `macos` is consulted. Linux adapters distinguish exact Wayland
+application IDs from X11 classes; legacy `linux` strings remain available as an
+explicit fallback in the observed identity category. There is no fuzzy matching
+or window-title/process-name inference.
+
+```toml
+[app_aliases.editor.linux_ids]
+wayland = "org.example.Editor"
+x11_class = "ExampleEditor"
+```
+
+Identifiers are case-sensitive. Duplicate identities within a category are
+rejected deterministically. Validation rejects unknown logical aliases; an
+alias without an identifier for the current platform cannot match its app.
+Missing or stale desktop focus never matches scoped rules.
 
 ### `[[binding]]`
 
@@ -89,10 +101,29 @@ don't re-trigger the daemon's own rules.
 action = { type = "set_input_source", id = "com.apple.keylayout.Dvorak" }
 ```
 
-macOS only. Switches the active Text Input Source to the given identifier.
-`sledge validate` does not verify that the identifier exists (it may be
-installed later); the action will no-op with a warning at runtime if the
-source is not found.
+Native identifiers are passed unchanged to the platform provider. `sledge
+validate` does not verify that a native identifier is installed or enabled.
+Linux source providers are subject to the [compatibility qualification
+contract](linux-compatibility.md); an unavailable provider is not silently
+substituted with another source.
+
+Logical source aliases allow the same binding to select platform-specific IDs:
+
+```toml
+[input_source_aliases.us]
+macos = "com.apple.keylayout.US"
+linux = "xkb:us::eng" # example IBus engine ID; use the selected provider's inventory
+
+[[binding]]
+trigger = { tap = "RightAlt", count = 3, within_ms = 600 }
+action = { type = "set_input_source", source = "us" }
+```
+
+Exactly one of `id` or `source` is required. Logical aliases must exist and
+provide an identifier for the selected platform. Compilation resolves the ID
+before the matching generation is swapped. IDs are not guessed from labels or
+translated from Apple identifiers. Provider-specific indexed inventories must
+be checked for changes before selection.
 
 ## Scope predicate
 

@@ -11,8 +11,8 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
-    /// Override the health socket path (default:
-    /// $XDG_RUNTIME_DIR/sledge.sock or /tmp/sledge-<uid>.sock)
+    /// Override the health socket path (Linux requires a private same-user
+    /// parent; default is $XDG_RUNTIME_DIR/sledge.sock with no /tmp fallback).
     #[arg(long, global = true)]
     pub socket: Option<PathBuf>,
 
@@ -31,7 +31,7 @@ pub enum Command {
     Reload,
     /// Validate a configuration file without running the daemon.
     Validate(ValidateArgs),
-    /// Report whether the required macOS permissions are granted.
+    /// Report platform permission/authorization status without grabbing devices.
     CheckPermissions,
 }
 
@@ -40,6 +40,54 @@ pub struct RunArgs {
     /// Write logs to stdout as well as the log file.
     #[arg(long)]
     pub stdout_logs: bool,
+
+    /// Explicit privileged Linux broker socket. Connecting does not authorize
+    /// capture; the broker must approve the session/seat independently.
+    #[cfg(target_os = "linux")]
+    #[arg(long)]
+    pub linux_broker_socket: Option<PathBuf>,
+
+    /// Explicit Linux desktop adapter; never inferred from environment variables.
+    #[cfg(target_os = "linux")]
+    #[arg(long, value_enum)]
+    pub linux_desktop: Option<LinuxDesktop>,
+
+    /// Explicit adapter socket (required for Sway, Hyprland and X11).
+    #[cfg(target_os = "linux")]
+    #[arg(long, requires = "linux_desktop")]
+    pub linux_desktop_socket: Option<PathBuf>,
+
+    /// X11 screen index; used only with explicitly selected X11.
+    #[cfg(target_os = "linux")]
+    #[arg(long, default_value_t = 0)]
+    pub linux_x11_screen: usize,
+
+    /// File containing raw MIT-MAGIC-COOKIE-1 bytes, not a full Xauthority file.
+    #[cfg(target_os = "linux")]
+    #[arg(long, requires = "linux_desktop")]
+    pub linux_x11_cookie: Option<PathBuf>,
+
+    /// Explicit source-only input method overlay.
+    #[cfg(target_os = "linux")]
+    #[arg(long, value_enum, requires = "linux_desktop")]
+    pub linux_input_method: Option<LinuxInputMethod>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum LinuxDesktop {
+    Gnome,
+    Kwin,
+    Sway,
+    Hyprland,
+    X11,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum LinuxInputMethod {
+    Ibus,
+    Fcitx5,
 }
 
 #[derive(Debug, Args)]

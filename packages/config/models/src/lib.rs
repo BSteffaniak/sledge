@@ -13,6 +13,8 @@ pub struct ConfigDoc {
     pub daemon: DaemonSection,
     #[serde(default)]
     pub app_aliases: HashMap<String, AppAlias>,
+    #[serde(default)]
+    pub input_source_aliases: HashMap<String, InputSourceAlias>,
     #[serde(default, rename = "binding")]
     pub bindings: Vec<BindingDoc>,
 }
@@ -41,6 +43,30 @@ fn default_log_level() -> String {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppAlias {
+    #[serde(default)]
+    pub macos: Option<String>,
+    #[serde(default)]
+    pub linux: Option<String>,
+    #[serde(default)]
+    pub windows: Option<String>,
+    #[serde(default)]
+    pub linux_ids: Option<LinuxAppIds>,
+}
+
+/// Exact, case-sensitive Linux application identities, separated by protocol.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinuxAppIds {
+    #[serde(default)]
+    pub wayland: Option<String>,
+    #[serde(default)]
+    pub x11_class: Option<String>,
+}
+
+/// Native input source identifiers for a logical source alias.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputSourceAlias {
     #[serde(default)]
     pub macos: Option<String>,
     #[serde(default)]
@@ -94,6 +120,9 @@ pub enum ActionDoc {
         mods: Vec<String>,
     },
     SetInputSource {
-        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
 }

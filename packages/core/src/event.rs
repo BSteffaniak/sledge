@@ -4,6 +4,11 @@
 //! the way in, and translate back on the way out. Names and values follow the
 //! USB HID Keyboard/Keypad Usage Page (0x07) where possible.
 
+/// Backend-assigned identity for a physical input stream. Zero is the legacy stream.
+/// Reuse an identity only after calling `Matcher::reset_device`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeviceId(pub u64);
+
 /// A single key-down / key-up / flags-changed event delivered by a backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyEvent {
@@ -209,6 +214,7 @@ impl KeyCode {
             Self::RightAlt => Modifiers::RIGHT_ALT,
             Self::LeftCmd => Modifiers::LEFT_CMD,
             Self::RightCmd => Modifiers::RIGHT_CMD,
+            Self::Fn => Modifiers::FN,
             _ => Modifiers::empty(),
         }
     }

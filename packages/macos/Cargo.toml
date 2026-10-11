@@ -10,15 +10,16 @@ version.workspace    = true
 [target.'cfg(target_os = "macos")'.dependencies]
 sledge_core = { workspace = true }
 
+crossbeam-channel = { workspace = true }
 parking_lot       = { workspace = true }
 tracing           = { workspace = true }
 
-core-foundation     = { workspace = true }
-core-graphics       = { workspace = true }
-foreign-types       = { workspace = true }
-objc2               = { workspace = true }
-objc2-app-kit       = { workspace = true }
-objc2-foundation    = { workspace = true }
+core-foundation  = { workspace = true }
+core-graphics    = { workspace = true }
+foreign-types    = { workspace = true }
+objc2            = { workspace = true }
+objc2-app-kit    = { workspace = true }
+objc2-foundation = { workspace = true }
 
 [lints]
 workspace = true

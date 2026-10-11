@@ -6,7 +6,22 @@ use anyhow::{Context, Result};
 
 use crate::cli::Cli;
 use crate::ipc::{Request, Response, send_request_blocking};
+#[cfg(not(target_os = "linux"))]
 use crate::logging;
+
+pub(crate) fn socket_path(cli: &Cli) -> Result<std::path::PathBuf> {
+    if let Some(path) = &cli.socket {
+        return Ok(path.clone());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        sledge_linux::ipc::default_socket_path().context("resolving private Linux runtime socket")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(logging::default_socket_path())
+    }
+}
 
 /// Print daemon status by querying the IPC socket.
 ///
@@ -14,10 +29,7 @@ use crate::logging;
 ///
 /// Returns an error if the daemon is not reachable.
 pub fn print_status(cli: &Cli) -> Result<()> {
-    let path = cli
-        .socket
-        .clone()
-        .unwrap_or_else(logging::default_socket_path);
+    let path = socket_path(cli)?;
     let resp = send_request_blocking(&path, &Request::Status)?;
     match resp {
         Response::Status(s) => {
@@ -28,8 +40,19 @@ pub fn print_status(cli: &Cli) -> Result<()> {
                 "  focused app    : {}",
                 s.focused_app.as_deref().unwrap_or("<unknown>")
             );
-            println!("  accessibility  : {}", yn(s.permissions.accessibility));
-            println!("  input monitor  : {}", yn(s.permissions.input_monitoring));
+            if let Some(permissions) = &s.permissions {
+                println!("  accessibility  : {}", yn(permissions.accessibility));
+                println!("  input monitor  : {}", yn(permissions.input_monitoring));
+            }
+            if let Some(platform) = &s.platform {
+                println!(
+                    "  platform       : {platform} (status v{})",
+                    s.protocol_version
+                );
+            }
+            if let Some(capabilities) = &s.capabilities {
+                println!("  capabilities   : {capabilities}");
+            }
             match s.last_reload_secs_ago {
                 Some(secs) => println!("  last reload    : {secs}s ago"),
                 None => println!("  last reload    : never"),
@@ -47,10 +70,7 @@ pub fn print_status(cli: &Cli) -> Result<()> {
 ///
 /// Returns an error if the daemon is not reachable or reload fails.
 pub fn send_reload(cli: &Cli) -> Result<()> {
-    let path = cli
-        .socket
-        .clone()
-        .unwrap_or_else(logging::default_socket_path);
+    let path = socket_path(cli)?;
     let resp = send_request_blocking(&path, &Request::Reload)?;
     match resp {
         Response::Reloaded => {
@@ -80,11 +100,11 @@ pub fn validate_config(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Report macOS permission status. On non-macOS just prints a note.
+/// Report platform permission/authorization status without grabbing devices.
 ///
 /// # Errors
 ///
-/// Currently infallible.
+/// Returns an error when required authorization is missing or unsupported.
 pub fn print_permissions() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -95,9 +115,23 @@ pub fn print_permissions() -> Result<()> {
             anyhow::bail!("one or more permissions missing");
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
-        println!("permission checks are only meaningful on macOS");
+        let backend = sledge_linux::LinuxBackend::new();
+        let capabilities = backend.capabilities();
+        println!("broker connected : {}", yn(capabilities.broker_connected));
+        println!("verified session : {}", yn(capabilities.verified_session));
+        println!("source switching : {}", yn(capabilities.source_switching));
+        if let Some(reason) = capabilities.reason {
+            println!("reason           : {reason}");
+        }
+        backend
+            .check_permissions()
+            .context("Linux authorization is not granted")?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        anyhow::bail!("permission checks are unsupported on this platform");
     }
     Ok(())
 }

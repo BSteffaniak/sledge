@@ -4,7 +4,7 @@
 
 sledge provides declarative hotkeys, application-scoped remapping, modifier-tap sequences, and input-source switching without an embedded scripting runtime. A platform-neutral matching engine is connected directly to macOS's keyboard event tap.
 
-> **Alpha software.** The daemon can observe keyboard events and synthesize keystrokes. Review your configuration and only grant permissions to a build you trust. Linux and Windows backends are stubs, not supported keyboard daemons.
+> **Alpha software.** The daemon can observe keyboard events and synthesize keystrokes. Review your configuration and only grant permissions to a build you trust. macOS is the supported keyboard daemon. Linux has an experimental broker, desktop adapters, and diagnostic CLI, but capture is deliberately denied pending a qualified session/lock authority; native Linux `send_key` is not implemented. Windows remains a stub. See the [Linux compatibility contract](docs/linux-compatibility.md) and [installation notes](docs/linux-installation.md).
 
 ## Design
 

@@ -4,7 +4,7 @@
 //! core engine and execute [`Action`]s the core produces.
 
 use crate::action::Action;
-use crate::event::KeyEvent;
+use crate::event::{DeviceId, KeyEvent};
 
 /// What the core wants the backend to do with an incoming event.
 #[derive(Debug, Clone)]
@@ -47,6 +47,28 @@ pub trait EventSink: Send + 'static {
     /// Deliver an event. `focused_app` is the logical app identifier; may
     /// be `None` if not yet known.
     fn on_event(&mut self, event: KeyEvent, focused_app: Option<&str>) -> BackendVerdict;
+
+    /// Deliver an event with a backend-assigned physical stream identity.
+    /// Legacy sinks ignore identity; device-aware sinks must override this
+    /// method and route to `Matcher::dispatch_device`.
+    fn on_device_event(
+        &mut self,
+        _device: DeviceId,
+        event: KeyEvent,
+        focused_app: Option<&str>,
+    ) -> BackendVerdict {
+        self.on_event(event, focused_app)
+    }
+
+    /// Notify loss/removal of one stream before reusing its identity or
+    /// resuming events after a discontinuity. Device-aware sinks should call
+    /// `Matcher::reset_device`. Backends reconcile held forwarded/injected
+    /// output independently; this callback does not synthesize releases.
+    fn on_device_reset(&mut self, _device: DeviceId) {}
+
+    /// Notify a global stream discontinuity. Stateful sinks should call
+    /// `Matcher::reset`; output reconciliation remains the backend's job.
+    fn on_stream_reset(&mut self) {}
 }
 
 /// Errors a backend can raise.

@@ -8,18 +8,32 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use sledge_config::models::AppAlias;
-use sledge_core::{BackendVerdict, EventSink, InputBackend, KeyEvent, Matcher, Verdict};
+use sledge_core::{BackendVerdict, DeviceId, EventSink, InputBackend, KeyEvent, Matcher, Verdict};
 use tracing::{info, warn};
 
 use crate::cli::{Cli, RunArgs};
-use crate::ipc::{self, ServerState, StatusPermissions};
+#[cfg(target_os = "macos")]
+use crate::ipc::StatusPermissions;
+#[cfg(target_os = "macos")]
+use crate::ipc::{self, ServerState};
 use crate::logging;
+
+#[cfg(target_os = "linux")]
+mod desktop;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+mod source_queue;
+#[cfg(target_os = "linux")]
+use linux::run_linux;
 
 /// Rules and aliases share one lock so an event never observes mixed config
 /// generations during a reload.
 struct MatchingState {
     matcher: Matcher,
     aliases: HashMap<String, AppAlias>,
+    #[cfg(target_os = "linux")]
+    forwarded_failures: std::collections::HashSet<(DeviceId, sledge_core::KeyCode)>,
 }
 
 impl MatchingState {
@@ -27,6 +41,8 @@ impl MatchingState {
         Self {
             matcher: Matcher::new(config.rules.clone()),
             aliases: config.app_aliases.clone(),
+            #[cfg(target_os = "linux")]
+            forwarded_failures: std::collections::HashSet::new(),
         }
     }
 
@@ -35,10 +51,51 @@ impl MatchingState {
         self.aliases.clone_from(&config.app_aliases);
     }
 
+    #[cfg(test)]
     fn dispatch(&mut self, event: KeyEvent, focused_app: Option<&str>) -> Verdict {
-        let logical = focused_app.and_then(|bid| resolve_logical(&self.aliases, bid));
+        self.dispatch_device(DeviceId(0), event, focused_app)
+    }
+
+    fn dispatch_device(
+        &mut self,
+        device: DeviceId,
+        event: KeyEvent,
+        focused_app: Option<&str>,
+    ) -> Verdict {
+        self.dispatch_identity(device, event, focused_app, focused_app.map(app_identity))
+    }
+
+    fn dispatch_identity(
+        &mut self,
+        device: DeviceId,
+        event: KeyEvent,
+        focused_app: Option<&str>,
+        identity: Option<sledge_config::AppIdentity<'_>>,
+    ) -> Verdict {
+        #[cfg(target_os = "linux")]
+        if self.forwarded_failures.contains(&(device, event.code)) {
+            if event.kind == sledge_core::EventKind::KeyUp {
+                self.forwarded_failures.remove(&(device, event.code));
+                // Reconcile consumed ownership with the actual physical release,
+                // not a fabricated event or a whole-device reset.
+                self.matcher
+                    .dispatch_device(device, event, None, Instant::now());
+            }
+            return Verdict::Pass;
+        }
+        let logical =
+            identity.and_then(|id| sledge_config::resolve_app_identity(&self.aliases, id));
+        #[cfg(target_os = "linux")]
+        let logical = logical.or_else(|| {
+            focused_app.and_then(|id| {
+                sledge_config::resolve_app_identity(
+                    &self.aliases,
+                    sledge_config::AppIdentity::LinuxLegacy(id),
+                )
+            })
+        });
         self.matcher
-            .dispatch(event, logical.as_deref().or(focused_app), Instant::now())
+            .dispatch_device(device, event, logical.or(focused_app), Instant::now())
     }
 }
 
@@ -74,7 +131,19 @@ pub fn run(cli: &Cli, args: RunArgs) -> Result<()> {
         let _guard = guard;
         run_macos(cli, matcher, rules_loaded, config_path, reload_handle)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let _guard = guard;
+        run_linux(
+            cli,
+            &args,
+            matcher,
+            rules_loaded,
+            config_path,
+            reload_handle,
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (matcher, rules_loaded, config_path, reload_handle);
         drop(guard);
@@ -115,28 +184,13 @@ fn run_macos(
         .unwrap_or_else(logging::default_socket_path);
     let started_at = Instant::now();
     let last_reload_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
-    let matcher_for_reload = matcher.clone();
-    let rules_for_reload = rules_loaded.clone();
-    let config_path_for_reload = config_path.clone();
-    let last_reload_for_reload = last_reload_at.clone();
-    let reload_handle_for_reload = reload_handle.clone();
-
-    let reload_fn: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
-        let cfg =
-            sledge_config::load_from_file(&config_path_for_reload).map_err(|e| e.to_string())?;
-        matcher_for_reload.lock().replace(&cfg);
-        *rules_for_reload.lock() = cfg.rules.len();
-        *last_reload_for_reload.lock() = Some(Instant::now());
-        info!("config reloaded");
-        // Re-apply the log level from the reloaded config. Invalid
-        // directives fall back to `info` and are surfaced as a reload
-        // warning but do not cause the reload itself to fail \u2014 the
-        // rule swap already succeeded and the daemon should stay usable.
-        if let Err(e) = logging::apply_level(&reload_handle_for_reload, &cfg.daemon.log_level) {
-            warn!(error = %e, "log level change failed");
-        }
-        Ok(())
-    });
+    let reload_fn = reload_callback(
+        matcher.clone(),
+        rules_loaded.clone(),
+        config_path.clone(),
+        last_reload_at.clone(),
+        reload_handle,
+    );
 
     let focus_for_ipc = focus_tracker.clone();
     let ipc_state = Arc::new(ServerState {
@@ -146,11 +200,12 @@ fn run_macos(
         reload: reload_fn.clone(),
         check_permissions: Arc::new(|| {
             let p = sledge_macos::check_permissions();
-            StatusPermissions {
+            Some(StatusPermissions {
                 accessibility: p.accessibility,
                 input_monitoring: p.input_monitoring,
-            }
+            })
         }),
+        capabilities: Arc::new(|| None),
         last_reload_at: last_reload_at.clone(),
     });
 
@@ -208,6 +263,32 @@ fn install_signal_handler(reload_fn: Arc<dyn Fn() -> Result<(), String> + Send +
         .expect("spawn signal thread");
 }
 
+type ReloadFn = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+fn reload_callback(
+    matcher: Arc<Mutex<MatchingState>>,
+    rules_loaded: Arc<Mutex<usize>>,
+    config_path: Arc<PathBuf>,
+    last_reload_at: Arc<Mutex<Option<Instant>>>,
+    reload_handle: logging::FilterReloadHandle,
+) -> ReloadFn {
+    // Serialize parsing too: an older overlapping reload cannot publish after
+    // a newer generation from IPC, SIGHUP or the file watcher.
+    let reload_lock = Mutex::new(());
+    Arc::new(move || {
+        let _reload = reload_lock.lock();
+        let cfg = sledge_config::load_from_file(&config_path).map_err(|e| e.to_string())?;
+        matcher.lock().replace(&cfg);
+        *rules_loaded.lock() = cfg.rules.len();
+        *last_reload_at.lock() = Some(Instant::now());
+        info!("config reloaded");
+        if let Err(e) = logging::apply_level(&reload_handle, &cfg.daemon.log_level) {
+            warn!(error = %e, "log level change failed");
+        }
+        Ok(())
+    })
+}
+
 fn resolve_config_path(cli: &Cli) -> Result<PathBuf> {
     if let Some(p) = &cli.config {
         return Ok(p.clone());
@@ -218,23 +299,114 @@ fn resolve_config_path(cli: &Cli) -> Result<PathBuf> {
     logging::default_config_path().context("no default config path available")
 }
 
-#[cfg(target_os = "macos")]
-struct MatcherSink {
+struct MatcherSink<B> {
     matcher: Arc<Mutex<MatchingState>>,
-    backend: Arc<sledge_macos::MacOsBackend>,
+    backend: Arc<B>,
+    #[cfg(target_os = "linux")]
+    sources: Option<source_queue::SourceQueue>,
+    #[cfg(target_os = "linux")]
+    focus: Option<sledge_linux::desktop::worker::FocusCache>,
 }
 
-#[cfg(target_os = "macos")]
-impl EventSink for MatcherSink {
+impl<B: InputBackend + Sync> EventSink for MatcherSink<B> {
     fn on_event(&mut self, event: KeyEvent, focused_app: Option<&str>) -> BackendVerdict {
-        let verdict = self.matcher.lock().dispatch(event, focused_app);
+        self.deliver(DeviceId(0), event, focused_app)
+    }
 
+    fn on_device_event(
+        &mut self,
+        device: DeviceId,
+        event: KeyEvent,
+        focused_app: Option<&str>,
+    ) -> BackendVerdict {
+        self.deliver(device, event, focused_app)
+    }
+
+    fn on_device_reset(&mut self, device: DeviceId) {
+        let mut state = self.matcher.lock();
+        state.matcher.reset_device(device);
+        #[cfg(target_os = "linux")]
+        state.forwarded_failures.retain(|(id, _)| *id != device);
+    }
+
+    fn on_stream_reset(&mut self) {
+        let mut state = self.matcher.lock();
+        state.matcher.reset();
+        #[cfg(target_os = "linux")]
+        state.forwarded_failures.clear();
+    }
+}
+
+impl<B: InputBackend> MatcherSink<B> {
+    fn deliver(
+        &self,
+        device: DeviceId,
+        event: KeyEvent,
+        focused_app: Option<&str>,
+    ) -> BackendVerdict {
+        #[cfg(target_os = "linux")]
+        let verdict = if let Some(cache) = &self.focus {
+            let focus = cache.current();
+            let identity = focus.as_ref().map(|focus| match focus.category {
+                sledge_linux::desktop::FocusCategory::Wayland => {
+                    sledge_config::AppIdentity::LinuxWayland(&focus.value)
+                }
+                sledge_linux::desktop::FocusCategory::X11Class => {
+                    sledge_config::AppIdentity::LinuxX11Class(&focus.value)
+                }
+                sledge_linux::desktop::FocusCategory::KwinResourceClass => {
+                    sledge_config::AppIdentity::LinuxLegacy(&focus.value)
+                }
+            });
+            self.matcher.lock().dispatch_identity(
+                device,
+                event,
+                focus.as_ref().map(|focus| focus.value.as_str()),
+                identity,
+            )
+        } else {
+            self.matcher
+                .lock()
+                .dispatch_device(device, event, focused_app)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let verdict = self
+            .matcher
+            .lock()
+            .dispatch_device(device, event, focused_app);
+        self.apply(device, event, verdict)
+    }
+
+    fn apply(&self, device: DeviceId, event: KeyEvent, verdict: Verdict) -> BackendVerdict {
+        #[cfg(not(target_os = "linux"))]
+        let _ = (device, event);
         match verdict {
             Verdict::Pass => BackendVerdict::Pass,
             Verdict::Swallow => BackendVerdict::Swallow,
             Verdict::Replace(action) => {
-                if let Err(e) = self.backend.inject(&action) {
+                #[cfg(target_os = "linux")]
+                let result = if let sledge_core::Action::SetInputSource { id } = &action {
+                    self.sources
+                        .as_ref()
+                        .ok_or_else(|| sledge_core::BackendError::UnknownInputSource(id.clone()))
+                        .and_then(|queue| queue.submit(id.clone()))
+                } else {
+                    self.backend.inject(&action)
+                };
+                #[cfg(not(target_os = "linux"))]
+                let result = self.backend.inject(&action);
+                if let Err(e) = result {
                     warn!(error = %e, "inject failed");
+                    #[cfg(target_os = "linux")]
+                    {
+                        if event.kind == sledge_core::EventKind::KeyDown {
+                            self.matcher
+                                .lock()
+                                .forwarded_failures
+                                .insert((device, event.code));
+                        }
+                        return BackendVerdict::Pass;
+                    }
                 }
                 BackendVerdict::Swallow
             }
@@ -242,13 +414,19 @@ impl EventSink for MatcherSink {
     }
 }
 
-fn resolve_logical(aliases: &HashMap<String, AppAlias>, bundle_id: &str) -> Option<String> {
-    for (name, a) in aliases {
-        if a.macos.as_deref() == Some(bundle_id) {
-            return Some(name.clone());
-        }
+fn app_identity(id: &str) -> sledge_config::AppIdentity<'_> {
+    #[cfg(target_os = "macos")]
+    {
+        sledge_config::AppIdentity::MacOS(id)
     }
-    None
+    #[cfg(target_os = "linux")]
+    {
+        sledge_config::AppIdentity::LinuxLegacy(id)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        sledge_config::AppIdentity::Windows(id)
+    }
 }
 
 #[cfg(test)]
@@ -257,10 +435,15 @@ mod tests {
     use sledge_core::{EventKind, KeyCode, Modifiers};
 
     fn config(bundle: &str) -> sledge_config::Config {
+        let platform_key = match sledge_config::Platform::current() {
+            sledge_config::Platform::MacOS => "macos",
+            sledge_config::Platform::Linux => "linux",
+            sledge_config::Platform::Windows => "windows",
+        };
         sledge_config::parse_str(&format!(
             r#"
 [app_aliases.editor]
-macos = "{bundle}"
+{platform_key} = "{bundle}"
 [[binding]]
 when = {{ app_in = ["editor"] }}
 trigger = {{ key = "KeyK", mods = ["ctrl"] }}
@@ -268,6 +451,209 @@ action = {{ type = "send_key", key = "Return", mods = [] }}
 "#
         ))
         .expect("valid config")
+    }
+
+    #[cfg(target_os = "linux")]
+    struct RejectingBackend;
+
+    #[cfg(target_os = "linux")]
+    impl InputBackend for RejectingBackend {
+        fn run(&mut self, _sink: Box<dyn EventSink>) -> Result<(), sledge_core::BackendError> {
+            Ok(())
+        }
+
+        fn inject(&self, _action: &sledge_core::Action) -> Result<(), sledge_core::BackendError> {
+            Err(sledge_core::BackendError::Inject("unsupported".into()))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_replacement_preserves_original_linux_event() {
+        let mut sink = MatcherSink {
+            matcher: Arc::new(Mutex::new(MatchingState::new(&config("editor.app")))),
+            backend: Arc::new(RejectingBackend),
+            sources: None,
+            focus: None,
+        };
+        let down = KeyEvent {
+            code: KeyCode::KeyK,
+            kind: EventKind::KeyDown,
+            mods: Modifiers::CTRL,
+        };
+        assert!(matches!(
+            sink.on_event(down, Some("editor.app")),
+            BackendVerdict::Pass
+        ));
+        // Repeat and release must follow the disposition of the forwarded down,
+        // even if scope or configuration changes before the release.
+        sink.matcher.lock().replace(&config("other.app"));
+        assert!(matches!(
+            sink.on_event(down, Some("other.app")),
+            BackendVerdict::Pass
+        ));
+        let up = KeyEvent {
+            kind: EventKind::KeyUp,
+            ..down
+        };
+        assert!(matches!(sink.on_event(up, None), BackendVerdict::Pass));
+        assert!(matches!(
+            sink.on_device_event(DeviceId(7), down, Some("other.app")),
+            BackendVerdict::Pass
+        ));
+        assert!(matches!(
+            sink.on_device_event(DeviceId(7), up, None),
+            BackendVerdict::Pass
+        ));
+    }
+
+    struct AcceptingBackend;
+
+    impl InputBackend for AcceptingBackend {
+        fn run(&mut self, _sink: Box<dyn EventSink>) -> Result<(), sledge_core::BackendError> {
+            Ok(())
+        }
+
+        fn inject(&self, _action: &sledge_core::Action) -> Result<(), sledge_core::BackendError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn device_sink_preserves_reload_ownership_and_isolates_resets() {
+        let state = Arc::new(Mutex::new(MatchingState::new(&config("editor.app"))));
+        let mut sink = MatcherSink {
+            matcher: state.clone(),
+            backend: Arc::new(AcceptingBackend),
+            #[cfg(target_os = "linux")]
+            sources: None,
+            #[cfg(target_os = "linux")]
+            focus: None,
+        };
+        let down = KeyEvent {
+            code: KeyCode::KeyK,
+            kind: EventKind::KeyDown,
+            mods: Modifiers::CTRL,
+        };
+        let up = KeyEvent {
+            kind: EventKind::KeyUp,
+            ..down
+        };
+        for device in [DeviceId(1), DeviceId(2)] {
+            assert!(matches!(
+                sink.on_device_event(device, down, Some("editor.app")),
+                BackendVerdict::Swallow
+            ));
+        }
+        state.lock().replace(&sledge_config::parse_str("").unwrap());
+        assert!(matches!(
+            sink.on_device_event(DeviceId(3), up, None),
+            BackendVerdict::Pass
+        ));
+        sink.on_device_reset(DeviceId(1));
+        assert!(matches!(
+            sink.on_device_event(DeviceId(1), up, None),
+            BackendVerdict::Pass
+        ));
+        assert!(matches!(
+            sink.on_device_event(DeviceId(2), up, None),
+            BackendVerdict::Swallow
+        ));
+
+        state.lock().replace(&config("editor.app"));
+        assert!(matches!(
+            sink.on_device_event(DeviceId(2), down, Some("editor.app")),
+            BackendVerdict::Swallow
+        ));
+        sink.on_stream_reset();
+        assert!(matches!(
+            sink.on_device_event(DeviceId(2), up, None),
+            BackendVerdict::Pass
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn typed_focus_resolution_does_not_guess_kwin_protocol() {
+        let config = sledge_config::parse_str(
+            r#"
+[app_aliases.editor]
+linux_ids = { wayland = "same", x11_class = "xclass" }
+[[binding]]
+when = { app_in = ["editor"] }
+trigger = { key = "KeyK", mods = ["ctrl"] }
+action = { type = "send_key", key = "Return", mods = [] }
+"#,
+        )
+        .unwrap();
+        let mut state = MatchingState::new(&config);
+        let down = KeyEvent {
+            code: KeyCode::KeyK,
+            kind: EventKind::KeyDown,
+            mods: Modifiers::CTRL,
+        };
+        assert!(matches!(
+            state.dispatch_identity(
+                DeviceId(1),
+                down,
+                Some("same"),
+                Some(sledge_config::AppIdentity::LinuxWayland("same"))
+            ),
+            Verdict::Replace(_)
+        ));
+        assert!(matches!(
+            state.dispatch_identity(
+                DeviceId(2),
+                down,
+                Some("same"),
+                Some(sledge_config::AppIdentity::LinuxLegacy("same"))
+            ),
+            Verdict::Pass
+        ));
+        assert!(matches!(
+            state.dispatch_identity(DeviceId(3), down, None, None),
+            Verdict::Pass
+        ));
+        assert!(matches!(
+            state.dispatch_identity(
+                DeviceId(4),
+                down,
+                Some("xclass"),
+                Some(sledge_config::AppIdentity::LinuxX11Class("xclass"))
+            ),
+            Verdict::Replace(_)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_id_is_committed_by_matching_generation_before_reload() {
+        let config = |id| {
+            sledge_config::parse_str(&format!(
+                r#"
+[input_source_aliases.editor]
+linux = "{id}"
+[[binding]]
+trigger = {{ key = "KeyK", mods = ["ctrl"] }}
+action = {{ type = "set_input_source", source = "editor" }}
+"#
+            ))
+            .unwrap()
+        };
+        let mut state = MatchingState::new(&config("native-old"));
+        let event = KeyEvent {
+            code: KeyCode::KeyK,
+            kind: EventKind::KeyDown,
+            mods: Modifiers::CTRL,
+        };
+        let committed = state.dispatch_device(DeviceId(1), event, None);
+        state.replace(&config("native-new"));
+        assert!(
+            matches!(committed, Verdict::Replace(sledge_core::Action::SetInputSource { id }) if id == "native-old")
+        );
+        assert!(
+            matches!(state.dispatch_device(DeviceId(2), event, None), Verdict::Replace(sledge_core::Action::SetInputSource { id }) if id == "native-new")
+        );
     }
 
     #[test]
@@ -282,6 +668,13 @@ action = {{ type = "send_key", key = "Return", mods = [] }}
             state.dispatch(event, Some("old.editor")),
             Verdict::Replace(_)
         ));
+        state.dispatch(
+            KeyEvent {
+                kind: EventKind::KeyUp,
+                ..event
+            },
+            Some("old.editor"),
+        );
         state.replace(&config("new.editor"));
         assert!(matches!(
             state.dispatch(event, Some("old.editor")),

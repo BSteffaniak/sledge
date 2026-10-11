@@ -10,8 +10,10 @@ use std::time::{Duration, Instant};
 use crate::event::{KeyCode, Modifiers};
 
 /// State machine for modifier-tap triggers.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TapFsm {
+    /// Maximum interval between consecutive tap releases.
+    within: Duration,
     /// Per-modifier-key counter state.
     states: HashMap<KeyCode, TapState>,
     /// True after we observed the last modifier key going _down_ but before
@@ -43,7 +45,25 @@ pub enum TapResult {
     Tapped { key: KeyCode, count: u32 },
 }
 
+impl Default for TapFsm {
+    fn default() -> Self {
+        Self::with_window(Duration::from_millis(800))
+    }
+}
+
 impl TapFsm {
+    /// Construct a sequence tracker using the rule's window.
+    #[must_use]
+    pub fn with_window(within: Duration) -> Self {
+        Self {
+            within,
+            states: HashMap::new(),
+            active_key: None,
+            active_down_at: None,
+            active_tainted: false,
+        }
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -61,8 +81,23 @@ impl TapFsm {
         new_mods: Modifiers,
         now: Instant,
     ) -> TapResult {
+        let bit = key.modifier_bit();
+        if bit.is_empty() {
+            return TapResult::None;
+        }
+        self.on_transition(key, was_down, new_mods.contains(bit), new_mods, now)
+    }
+
+    /// Feed an explicit physical transition; never infer Fn/Caps from empty bits.
+    pub fn on_transition(
+        &mut self,
+        key: KeyCode,
+        was_down: bool,
+        is_down: bool,
+        new_mods: Modifiers,
+        now: Instant,
+    ) -> TapResult {
         debug_assert!(key.is_modifier());
-        let is_down = (new_mods & key.modifier_bit()) == key.modifier_bit();
 
         match (was_down, is_down) {
             (false, true) => {
@@ -70,10 +105,15 @@ impl TapFsm {
                 // reset this key's counter.
                 let other_mods = new_mods - key.modifier_bit() - key.generic_bit();
                 if other_mods.any() {
-                    self.reset(key);
+                    self.states.clear();
                     self.active_key = None;
+                    self.active_down_at = None;
                     return TapResult::None;
                 }
+                if self.active_key.is_some_and(|active| active != key) {
+                    self.on_other_key();
+                }
+                self.states.retain(|candidate, _| *candidate == key);
                 self.active_key = Some(key);
                 self.active_down_at = Some(now);
                 self.active_tainted = false;
@@ -86,14 +126,15 @@ impl TapFsm {
                     self.active_key = None;
                     self.active_down_at = None;
                     let state = self.states.entry(key).or_default();
-                    let within = state
-                        .last_tap_at
-                        .is_some_and(|t| now.duration_since(t) <= Duration::from_millis(800));
-                    if within {
-                        state.count += 1;
+                    let within = state.last_tap_at.is_some_and(|previous| {
+                        now.checked_duration_since(previous)
+                            .is_some_and(|elapsed| elapsed <= self.within)
+                    });
+                    state.count = if within {
+                        state.count.saturating_add(1)
                     } else {
-                        state.count = 1;
-                    }
+                        1
+                    };
                     state.last_tap_at = Some(now);
                     return TapResult::Tapped {
                         key,
@@ -122,11 +163,6 @@ impl TapFsm {
         // Reset all counters: once a non-modifier is pressed, any in-flight
         // tap sequence is over.
         self.states.clear();
-    }
-
-    /// Reset the counter for a single modifier key.
-    fn reset(&mut self, key: KeyCode) {
-        self.states.remove(&key);
     }
 }
 

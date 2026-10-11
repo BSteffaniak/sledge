@@ -1,6 +1,6 @@
 [package]
 authors.workspace    = true
-description          = "Linux backend stub for sledge (not yet implemented)"
+description          = "Linux evdev/uinput backend and narrowly privileged broker for sledge"
 edition.workspace    = true
 license.workspace    = true
 name                 = "sledge_linux"
@@ -8,7 +8,27 @@ repository.workspace = true
 version.workspace    = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+evdev = { version = "0.13.2", default-features = false }
+nix = { version = "0.29", default-features = false, features = [
+    "socket",
+    "poll",
+    "user",
+    "fs",
+] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sledge_core = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "time",
+    "net",
+] }
+x11rb = { version = "0.13", default-features = false, features = ["xkb"] }
+zbus = { version = "5", default-features = false, features = [
+    "tokio",
+    "blocking-api",
+] }
 
 [lints]
 workspace = true

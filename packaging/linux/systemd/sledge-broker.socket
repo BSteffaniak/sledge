@@ -1,0 +1,16 @@
+[Unit]
+Description=Sledge broker listener (root-only diagnostic boundary)
+Documentation=file:/usr/share/doc/sledge/linux-installation.md
+
+[Socket]
+ListenStream=/run/sledge-broker/broker.sock
+SocketUser=root
+SocketGroup=root
+SocketMode=0600
+DirectoryMode=0700
+Accept=no
+RemoveOnStop=yes
+Service=sledge-broker.service
+
+[Install]
+WantedBy=sockets.target

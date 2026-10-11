@@ -5,14 +5,14 @@
 //! platform backend what to do.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, trace};
 
 use crate::action::Action;
-use crate::event::{EventKind, KeyCode, KeyEvent};
+use crate::event::{DeviceId, EventKind, KeyCode, KeyEvent};
 use crate::tap_fsm::{TapFsm, TapResult};
-use crate::trigger::{HotkeyTrigger, TapTrigger, Trigger};
+use crate::trigger::{HotkeyTrigger, Trigger};
 
 /// A compiled rule. Cheap to clone.
 #[derive(Debug, Clone)]
@@ -90,10 +90,10 @@ impl RuleSet {
 /// verdicts in response to [`KeyEvent`]s.
 pub struct Matcher {
     rules: RuleSet,
-    tap_fsm: TapFsm,
+    tap_fsms: HashMap<DeviceId, Vec<TapFsm>>,
     /// Track which modifier keys are currently down so the FSM can be fed
     /// `was_down` correctly.
-    modifier_state: HashMap<KeyCode, bool>,
+    modifier_state: HashMap<(DeviceId, KeyCode), bool>,
     /// Track key codes whose most recent `KeyDown` was consumed by a rule
     /// (`Verdict::Replace` or `Verdict::Swallow`). When the matching
     /// `KeyUp` arrives we also swallow it so the consumer app never sees
@@ -101,7 +101,7 @@ pub struct Matcher {
     /// press/release pairs (e.g. zellij via the kitty keyboard protocol)
     /// observe a spurious lingering key-up event, which they may mis-
     /// interpret as triggering their own binding for that key.
-    swallowed_downs: HashSet<KeyCode>,
+    swallowed_downs: HashSet<(DeviceId, KeyCode)>,
 }
 
 impl Matcher {
@@ -110,7 +110,7 @@ impl Matcher {
     pub fn new(rules: RuleSet) -> Self {
         Self {
             rules,
-            tap_fsm: TapFsm::new(),
+            tap_fsms: HashMap::new(),
             modifier_state: HashMap::new(),
             swallowed_downs: HashSet::new(),
         }
@@ -121,11 +121,8 @@ impl Matcher {
         debug!(count = new_rules.len(), "swapping rule set");
         self.rules = new_rules;
         // Reset tap state; no reason to preserve it across reloads.
-        self.tap_fsm = TapFsm::new();
-        // Any in-flight swallow bookkeeping is scoped to the previous
-        // rule set; forget it so a subsequent key-up for a code whose
-        // down was matched by an old rule still propagates.
-        self.swallowed_downs.clear();
+        self.tap_fsms.clear();
+        // Consumed physical presses remain ours until release, even across reload.
     }
 
     /// Access the current rule set.
@@ -144,40 +141,107 @@ impl Matcher {
         focused_app: Option<&str>,
         now: Instant,
     ) -> Verdict {
+        self.dispatch_device(DeviceId::default(), event, focused_app, now)
+    }
+
+    /// Clear a lost/disconnected stream. The backend must reconcile any
+    /// forwarded or injected held keys itself before resuming delivery.
+    pub fn reset_device(&mut self, device: DeviceId) {
+        self.tap_fsms.remove(&device);
+        self.modifier_state.retain(|(id, _), _| *id != device);
+        self.swallowed_downs.retain(|(id, _)| *id != device);
+    }
+
+    /// Clear all stream state after a global discontinuity.
+    pub fn reset(&mut self) {
+        self.tap_fsms.clear();
+        self.modifier_state.clear();
+        self.swallowed_downs.clear();
+    }
+
+    /// Device-aware dispatch. Modifier `KeyDown`/`KeyUp` are physical
+    /// transitions; `ModifiersChanged` is supported only when a nonempty
+    /// modifier bit can prove the transition (not Caps Lock lock-state).
+    pub fn dispatch_device(
+        &mut self,
+        device: DeviceId,
+        event: KeyEvent,
+        focused_app: Option<&str>,
+        now: Instant,
+    ) -> Verdict {
         trace!(?event, ?focused_app, "matcher dispatch");
+        let press = (device, event.code);
+        if event.kind == EventKind::KeyUp && self.swallowed_downs.remove(&press) {
+            return Verdict::Swallow;
+        }
+        if event.kind == EventKind::KeyDown && self.swallowed_downs.contains(&press) {
+            return Verdict::Swallow;
+        }
 
-        // Modifier changes feed the tap FSM.
-        if matches!(event.kind, EventKind::ModifiersChanged) && event.code.is_modifier() {
-            let was_down = *self.modifier_state.get(&event.code).unwrap_or(&false);
-            let is_down = (event.mods & event.code.modifier_bit()) == event.code.modifier_bit();
-            self.modifier_state.insert(event.code, is_down);
-
-            let result = self
-                .tap_fsm
-                .on_modifier_change(event.code, was_down, event.mods, now);
-            if let TapResult::Tapped { key, count } = result {
-                for rule in &self.rules.taps {
-                    if let Trigger::Tap(TapTrigger {
-                        tap,
-                        count: wanted,
-                        within_ms: _,
-                    }) = &rule.trigger
+        let fsms = self.tap_fsms.entry(device).or_insert_with(|| {
+            self.rules
+                .taps
+                .iter()
+                .map(|rule| {
+                    let Trigger::Tap(trig) = &rule.trigger else {
+                        unreachable!()
+                    };
+                    TapFsm::with_window(Duration::from_millis(u64::from(trig.within_ms)))
+                })
+                .collect()
+        });
+        if event.code.is_modifier() {
+            let was_down = *self.modifier_state.get(&press).unwrap_or(&false);
+            let is_down = match event.kind {
+                EventKind::KeyDown => true,
+                EventKind::KeyUp => false,
+                EventKind::ModifiersChanged => {
+                    let bit = event.code.modifier_bit();
+                    if bit.is_empty() {
+                        return Verdict::Pass;
+                    }
+                    event.mods.contains(bit)
+                }
+            };
+            self.modifier_state.insert(press, is_down);
+            if is_down
+                && !was_down
+                && self
+                    .modifier_state
+                    .iter()
+                    .any(|((id, key), down)| *id == device && *key != event.code && *down)
+            {
+                for fsm in fsms {
+                    fsm.on_other_key();
+                }
+                return Verdict::Pass;
+            }
+            let mut action = None;
+            for (rule, fsm) in self.rules.taps.iter().zip(fsms.iter_mut()) {
+                let result = fsm.on_transition(event.code, was_down, is_down, event.mods, now);
+                if let (TapResult::Tapped { key, count }, Trigger::Tap(trig)) =
+                    (result, &rule.trigger)
+                {
+                    if action.is_none()
+                        && trig.tap == key
+                        && trig.count == count
+                        && RuleSet::scope_matches(rule, focused_app)
                     {
-                        if *tap == key
-                            && *wanted == count
-                            && RuleSet::scope_matches(rule, focused_app)
-                        {
-                            return Verdict::Replace(rule.action.clone());
-                        }
+                        action = Some(rule.action.clone());
                     }
                 }
+            }
+            if let Some(action) = action {
+                return Verdict::Replace(action);
             }
             return Verdict::Pass;
         }
 
         // Non-modifier events taint any in-flight tap candidate.
-        if matches!(event.kind, EventKind::KeyDown) && !event.code.is_modifier() {
-            self.tap_fsm.on_other_key();
+        if matches!(event.kind, EventKind::KeyDown) {
+            for fsm in fsms {
+                fsm.on_other_key();
+            }
         }
 
         // Hotkey matching on key-down only.
@@ -190,21 +254,11 @@ impl Matcher {
                         // Record that we're consuming this code's down so
                         // the matching up is also suppressed (see the
                         // KeyUp branch below for rationale).
-                        self.swallowed_downs.insert(event.code);
+                        self.swallowed_downs.insert(press);
                         return Verdict::Replace(rule.action.clone());
                     }
                 }
             }
-        }
-
-        // Mirror a previously-swallowed KeyDown by swallowing the paired
-        // KeyUp for the same code. Without this, an app watching key
-        // press/release pairs sees a bare up-without-down, which some
-        // terminal multiplexers (e.g. zellij with the kitty keyboard
-        // protocol) interpret as a spurious trigger for their own
-        // binding on that key.
-        if matches!(event.kind, EventKind::KeyUp) && self.swallowed_downs.remove(&event.code) {
-            return Verdict::Swallow;
         }
 
         Verdict::Pass
@@ -228,7 +282,7 @@ impl RuleSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Modifiers;
+    use crate::{Modifiers, TapTrigger};
 
     fn hk(key: KeyCode, mods: Modifiers, action: Action) -> Rule {
         Rule {

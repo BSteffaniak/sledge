@@ -9,9 +9,21 @@ running. Treat the binary as trust-sensitive:
 - The daemon never logs key contents at `info` or lower. `debug` and `trace`
   levels may log key codes (not text) for troubleshooting — do not leave
   trace-level logging enabled in normal use.
-- The daemon does not transmit any data off-host. There is no network code
-  path in `sledge_core`, `sledge_macos`, or `sledge` (the binary). The only
-  IPC is a per-user Unix domain socket for `sledge status` / `sledge reload`.
+- Physical-key capture, matching, and synthetic output must never perform network
+  transmission. Linux desktop integration uses local Unix sockets and D-Bus; no
+  off-host telemetry is permitted.
+- The Linux port separates the unprivileged user daemon from narrowly privileged
+  input-device handling. Kernel peer credentials alone are not proof of an active,
+  authorized graphical session or seat. Unknown session/lock authority must not
+  silently permit raw keyboard access.
+- Do not grant world-readable `/dev/input`, world-writable `/dev/uinput`, or broad
+  input-group membership as a default installation workaround. Do not run the
+  config-reading user daemon as root.
+- Builds do not install or activate services. Privileged/device integration tests
+  must use isolated test devices/VMs, not grab a developer's live keyboard.
+- Linux full compatibility remains subject to the qualification gates in
+  [the compatibility contract](docs/linux-compatibility.md). Compilation and fake
+  transport tests are not evidence of lock-screen isolation or crash recovery.
 
 ## Reporting a vulnerability
 

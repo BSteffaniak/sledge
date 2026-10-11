@@ -40,12 +40,18 @@ use tracing::{debug, info, trace, warn};
 
 use crate::focus::{FocusTracker, PollerHandle, spawn_poller};
 use crate::inject::{SLEDGE_EVENT_SOURCE_TAG, send_key};
+use crate::input_source_worker::InputSourceWorker;
 use crate::keycode::from_cg_keycode;
 use crate::permission::check_permissions;
-use crate::tis::set_input_source;
 
 /// macOS implementation of [`InputBackend`].
+///
+/// Input-source injection is asynchronous: success acknowledges bounded queue
+/// admission, not TIS completion. Saturation/unavailability returns an injection
+/// error; execution failures are logged by the worker. Key injection remains
+/// synchronous and preserves the private self-event sentinel.
 pub struct MacOsBackend {
+    input_source_worker: InputSourceWorker,
     focus: Arc<FocusTracker>,
     _poller: Option<PollerHandle>,
     // Shared live sink set once run() is called.
@@ -64,6 +70,7 @@ impl MacOsBackend {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            input_source_worker: InputSourceWorker::new(),
             focus: Arc::new(FocusTracker::new()),
             _poller: None,
             sink: Arc::new(Mutex::new(None)),
@@ -238,7 +245,7 @@ impl InputBackend for MacOsBackend {
     fn inject(&self, action: &Action) -> Result<(), BackendError> {
         match action {
             Action::SendKey { key, mods } => send_key(*key, *mods),
-            Action::SetInputSource { id } => set_input_source(id),
+            Action::SetInputSource { id } => self.input_source_worker.enqueue(id),
         }
     }
 }

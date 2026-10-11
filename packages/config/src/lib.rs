@@ -6,8 +6,13 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+mod aliases;
+
+pub use aliases::{AppIdentity, resolve_app_identity, resolve_input_source};
+
 use sledge_config_models::{
-    ActionDoc, AppAlias, BindingDoc, ConfigDoc, DaemonSection, TriggerDoc, WhenDoc,
+    ActionDoc, AppAlias, BindingDoc, ConfigDoc, DaemonSection, InputSourceAlias, TriggerDoc,
+    WhenDoc,
 };
 use sledge_core::{Action, HotkeyTrigger, KeyCode, Modifiers, Rule, RuleSet, TapTrigger, Trigger};
 use thiserror::Error;
@@ -16,7 +21,7 @@ use tracing::debug;
 pub use sledge_config_models as models;
 
 /// Target platform for alias resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Platform {
     MacOS,
     Linux,
@@ -51,6 +56,7 @@ impl Platform {
 pub struct Config {
     pub daemon: DaemonSection,
     pub app_aliases: HashMap<String, AppAlias>,
+    pub input_source_aliases: HashMap<String, InputSourceAlias>,
     pub rules: RuleSet,
 }
 
@@ -78,6 +84,25 @@ pub enum ConfigError {
     TapWindowZero { index: usize },
     #[error("binding #{index}: tap trigger key {name:?} is not a modifier")]
     TapNotModifier { index: usize, name: String },
+    #[error("binding #{index}: set_input_source requires exactly one of id or source")]
+    InvalidInputSourceAction { index: usize },
+    #[error("binding #{index} references unknown input source alias {name:?}")]
+    UnknownInputSource { index: usize, name: String },
+    #[error("binding #{index}: input source alias {name:?} has no identifier for {platform:?}")]
+    MissingInputSourcePlatform {
+        index: usize,
+        name: String,
+        platform: Platform,
+    },
+    #[error("{kind} alias {name:?} has an empty identifier")]
+    EmptyIdentifier { kind: &'static str, name: String },
+    #[error("duplicate {kind} identifier {identity}: aliases {first:?} and {second:?}")]
+    DuplicateIdentifier {
+        kind: &'static str,
+        identity: String,
+        first: String,
+        second: String,
+    },
 }
 
 /// Parse a config from a string.
@@ -86,8 +111,19 @@ pub enum ConfigError {
 ///
 /// Returns a [`ConfigError`] if the TOML fails to parse or validation fails.
 pub fn parse_str(text: &str) -> Result<Config, ConfigError> {
+    parse_str_for_platform(text, Platform::current())
+}
+
+/// Parse and compile a configuration for an explicitly selected platform.
+/// Native `id` actions are preserved verbatim, including offline configs for
+/// other platforms; logical `source` actions require the selected platform.
+///
+/// # Errors
+///
+/// Returns a [`ConfigError`] on parsing, validation, or source resolution failure.
+pub fn parse_str_for_platform(text: &str, platform: Platform) -> Result<Config, ConfigError> {
     let doc: ConfigDoc = toml::from_str(text)?;
-    validate(doc)
+    validate(doc, platform)
 }
 
 /// Read and parse a config file.
@@ -103,12 +139,20 @@ pub fn load_from_file(path: &Path) -> Result<Config, ConfigError> {
     parse_str(&text)
 }
 
-fn validate(doc: ConfigDoc) -> Result<Config, ConfigError> {
+fn validate(doc: ConfigDoc, platform: Platform) -> Result<Config, ConfigError> {
     validate_log_level(&doc.daemon.log_level)?;
+    aliases::validate_app_aliases(&doc.app_aliases)?;
+    aliases::validate_input_sources(&doc.input_source_aliases)?;
 
     let mut rules = Vec::with_capacity(doc.bindings.len());
     for (idx, b) in doc.bindings.into_iter().enumerate() {
-        rules.push(validate_binding(idx, b, &doc.app_aliases)?);
+        rules.push(validate_binding(
+            idx,
+            b,
+            &doc.app_aliases,
+            &doc.input_source_aliases,
+            platform,
+        )?);
     }
 
     debug!(count = rules.len(), "compiled rules");
@@ -116,6 +160,7 @@ fn validate(doc: ConfigDoc) -> Result<Config, ConfigError> {
     Ok(Config {
         daemon: doc.daemon,
         app_aliases: doc.app_aliases,
+        input_source_aliases: doc.input_source_aliases,
         rules: RuleSet::new(rules),
     })
 }
@@ -131,9 +176,11 @@ fn validate_binding(
     index: usize,
     b: BindingDoc,
     aliases: &HashMap<String, AppAlias>,
+    input_sources: &HashMap<String, InputSourceAlias>,
+    platform: Platform,
 ) -> Result<Rule, ConfigError> {
     let trigger = parse_trigger(index, &b.trigger)?;
-    let action = parse_action(index, &b.action)?;
+    let action = parse_action(index, &b.action, input_sources, platform)?;
     let when_app_in = b
         .when
         .map(|w| validate_when(index, &w, aliases))
@@ -199,14 +246,47 @@ fn parse_trigger(index: usize, t: &TriggerDoc) -> Result<Trigger, ConfigError> {
     }
 }
 
-fn parse_action(index: usize, a: &ActionDoc) -> Result<Action, ConfigError> {
+fn parse_action(
+    index: usize,
+    a: &ActionDoc,
+    input_sources: &HashMap<String, InputSourceAlias>,
+    platform: Platform,
+) -> Result<Action, ConfigError> {
     match a {
         ActionDoc::SendKey { key, mods } => {
             let key = parse_keycode(index, key)?;
             let mods = parse_mods(index, mods)?;
             Ok(Action::SendKey { key, mods })
         }
-        ActionDoc::SetInputSource { id } => Ok(Action::SetInputSource { id: id.clone() }),
+        ActionDoc::SetInputSource { id, source } => {
+            let id = match (id, source) {
+                (Some(id), None) => {
+                    aliases::validate_identifier(
+                        "native input source",
+                        &format!("binding #{index}"),
+                        id,
+                    )?;
+                    id.as_str()
+                }
+                (None, Some(name)) => {
+                    if !input_sources.contains_key(name) {
+                        return Err(ConfigError::UnknownInputSource {
+                            index,
+                            name: name.clone(),
+                        });
+                    }
+                    resolve_input_source(input_sources, name, platform).ok_or_else(|| {
+                        ConfigError::MissingInputSourcePlatform {
+                            index,
+                            name: name.clone(),
+                            platform,
+                        }
+                    })?
+                }
+                _ => return Err(ConfigError::InvalidInputSourceAction { index }),
+            };
+            Ok(Action::SetInputSource { id: id.to_owned() })
+        }
     }
 }
 
@@ -370,6 +450,9 @@ pub fn resolve_alias<'a>(
 }
 
 #[cfg(test)]
+mod compatibility_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -455,6 +538,7 @@ action = { type = "send_key", key = "KeyT", mods = ["alt"] }
                 macos: Some("com.mitchellh.ghostty".into()),
                 linux: None,
                 windows: None,
+                linux_ids: None,
             },
         );
         assert_eq!(

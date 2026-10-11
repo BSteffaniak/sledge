@@ -220,9 +220,27 @@ pub const fn to_cg_keycode(code: KeyCode) -> u16 {
     }
 }
 
+/// Checked native mapping. `KeyA` legitimately maps to zero; unsupported
+/// function keys have no mapping.
+#[must_use]
+pub const fn mapped_cg_keycode(code: KeyCode) -> Option<u16> {
+    match code {
+        KeyCode::F21 | KeyCode::F22 | KeyCode::F23 | KeyCode::F24 => None,
+        _ => Some(to_cg_keycode(code)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_is_a_valid_mapping_not_an_unsupported_key() {
+        assert_eq!(mapped_cg_keycode(KeyCode::KeyA), Some(0));
+        for key in [KeyCode::F21, KeyCode::F22, KeyCode::F23, KeyCode::F24] {
+            assert_eq!(mapped_cg_keycode(key), None);
+        }
+    }
 
     #[test]
     fn roundtrip_common_keys() {

@@ -1,41 +1,25 @@
-//! Linux backend stub.
-//!
-//! Scaffolded for future use. Currently unimplemented.
-
+//! Linux backend and narrowly privileged broker components.
 #[cfg(target_os = "linux")]
-mod imp {
-    use sledge_core::{Action, BackendError, EventSink, InputBackend};
-
-    /// Placeholder backend that returns errors for everything.
-    pub struct LinuxBackend;
-
-    impl LinuxBackend {
-        #[must_use]
-        pub const fn new() -> Self {
-            Self
-        }
-    }
-
-    impl Default for LinuxBackend {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl InputBackend for LinuxBackend {
-        fn run(&mut self, _sink: Box<dyn EventSink>) -> Result<(), BackendError> {
-            Err(BackendError::Other(
-                "sledge_linux backend is not yet implemented".into(),
-            ))
-        }
-
-        fn inject(&self, _action: &Action) -> Result<(), BackendError> {
-            Err(BackendError::Other(
-                "sledge_linux backend is not yet implemented".into(),
-            ))
-        }
-    }
-}
-
+pub mod authorization;
 #[cfg(target_os = "linux")]
-pub use imp::LinuxBackend;
+mod backend;
+#[cfg(target_os = "linux")]
+pub mod broker;
+#[cfg(target_os = "linux")]
+pub mod desktop;
+#[cfg(target_os = "linux")]
+pub mod ipc;
+#[cfg(target_os = "linux")]
+pub mod keymap;
+#[cfg(target_os = "linux")]
+pub mod lifecycle;
+#[cfg(target_os = "linux")]
+pub mod logind;
+#[cfg(target_os = "linux")]
+pub mod protocol;
+#[cfg(target_os = "linux")]
+pub mod state;
+#[cfg(target_os = "linux")]
+pub use authorization::authorize_socket_peer;
+#[cfg(target_os = "linux")]
+pub use backend::{Capabilities, FocusTracker, LinuxBackend, ShutdownHandle, SourceDispatcher};

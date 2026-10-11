@@ -9,7 +9,7 @@ use core_graphics::event::{CGEvent, CGEventTapLocation, EventField};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use sledge_core::{BackendError, KeyCode, Modifiers};
 
-use crate::keycode::to_cg_keycode;
+use crate::keycode::mapped_cg_keycode;
 
 /// Private sentinel value stamped into injected events' source-userdata
 /// field. Anything carrying this value must be passed through by the tap.
@@ -24,12 +24,8 @@ pub fn send_key(key: KeyCode, mods: Modifiers) -> Result<(), BackendError> {
     let source = CGEventSource::new(CGEventSourceStateID::Private)
         .map_err(|_| BackendError::Inject("CGEventSourceCreate failed".into()))?;
 
-    let cg_key = to_cg_keycode(key);
-    if cg_key == 0 {
-        return Err(BackendError::Inject(format!(
-            "no CGKeyCode mapping for {key:?}"
-        )));
-    }
+    let cg_key = mapped_cg_keycode(key)
+        .ok_or_else(|| BackendError::Inject(format!("no CGKeyCode mapping for {key:?}")))?;
 
     let flags = mods_to_cg_flags(mods);
 

@@ -1,0 +1,7 @@
+{
+  "uuid": "sledge-desktop@sledge",
+  "name": "Sledge Desktop Bridge",
+  "description": "Explicit same-user focus and enabled input-source bridge; not broker lock authority",
+  "shell-version": ["45", "46", "47", "48"],
+  "version": 1
+}

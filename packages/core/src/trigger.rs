@@ -18,6 +18,8 @@ pub struct HotkeyTrigger {
 }
 
 /// A modifier-tap trigger. `count` must be >= 2, `within_ms` > 0.
+/// The window is the maximum interval between consecutive physical tap releases.
+/// No maximum hold duration is configured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TapTrigger {
     pub tap: KeyCode,
