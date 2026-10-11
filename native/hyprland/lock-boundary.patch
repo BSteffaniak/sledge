@@ -1,0 +1,33 @@
+diff --git a/src/protocols/SessionLock.hpp b/src/protocols/SessionLock.hpp
+--- a/src/protocols/SessionLock.hpp
++++ b/src/protocols/SessionLock.hpp
+@@ -76,6 +76,10 @@ class CSessionLockProtocol : public IWaylandProtocol {
+ 
+     struct {
+         CSignalT<SP<CSessionLock>> newLock;
++        // Non-cancellable synchronous revocation before stock focus/locker
++        // routing. false only after genuine unlock callbacks have completed.
++        // Consumers MUST NOT wait on IPC or emit to the new locker focus.
++        CSignalT<bool> remapLockBoundary;
+     } m_events;
+ 
+   private:
+diff --git a/src/protocols/SessionLock.cpp b/src/protocols/SessionLock.cpp
+--- a/src/protocols/SessionLock.cpp
++++ b/src/protocols/SessionLock.cpp
+@@ -130,6 +130,7 @@ CSessionLock::CSessionLock(SP<CExtSessionLockV1> resource_) : m_resource(resource_) {
+         PROTO::lockNotify->onUnlocked();
+ 
+         m_events.unlockAndDestroy.emit();
++        PROTO::sessionLock->m_events.remapLockBoundary.emit(false);
+ 
+         // if lock tools have hidden it and doesn't restore it, we won't receive a new cursor until the cursorshape protocol gives us one.
+         // so set it to left_ptr so the "desktop/wallpaper" doesn't end up missing a cursor until hover over a window sending us a shape.
+@@ -195,6 +196,7 @@ void CSessionLockProtocol::onLock(CExtSessionLockManagerV1* pMgr, uint32_t id) {
+         return;
+     }
+ 
++    m_events.remapLockBoundary.emit(true);
+     m_events.newLock.emit(RESOURCE);
+ 
+     m_locked = true;

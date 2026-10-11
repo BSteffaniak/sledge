@@ -4,6 +4,26 @@ This document defines the Linux port's acceptance contract. It is not a claim th
 all listed environments are implemented or qualified. Platform qualification
 requires application-visible testing on the named desktop and hardware.
 
+## Hyprland integration decision
+
+Full parity must work with unmodified stock Hyprland; a maintained patched
+compositor is not an accepted deployment architecture. Stock 0.52.2 capture
+remains disabled: cancellable key hooks do not isolate subsequent XKB/modifier
+updates, and lock listeners alone do not prove revocation before locker delivery.
+Required upstream integration must expose authoritative lock revocation and actual
+seat/IME delivery ownership, including merged-device releases and focus-enter
+state. Do not substitute polled lock hints or unqualified runtime detours.
+
+The core delivery-result API and native routing/XKB components have deterministic
+tests. The isolated Nix VM establishes only the stock compositor prerequisite:
+0.52.2 with an enabled Virtual-1 640×480 output. It does not qualify keyboard
+capture, synthetic replacement, input methods, or lock behavior. Source patches
+and patched build artifacts under `native/hyprland` are research fixtures, not
+supported backends or replacements for the running compositor. Additional tooling
+is obtained through `nix shell`; the VM uses explicitly selected render-node
+acceleration and optional KVM, never host input devices or desktop sockets.
+
+
 ## Shared semantics
 
 - Bindings target normalized physical keys, not produced text. Desktop layouts,

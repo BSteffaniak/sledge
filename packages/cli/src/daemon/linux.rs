@@ -114,6 +114,79 @@ pub(super) fn run_linux(
     result
 }
 
+impl<B: InputBackend> MatcherSink<B> {
+    pub(super) fn deliver(
+        &self,
+        device: sledge_core::DeviceId,
+        event: sledge_core::KeyEvent,
+        focused_app: Option<&str>,
+    ) -> sledge_core::BackendVerdict {
+        let focus = self.focus.as_ref().and_then(|cache| cache.current());
+        let identity = focus.as_ref().map(|focus| match focus.category {
+            sledge_linux::desktop::FocusCategory::Wayland => {
+                sledge_config::AppIdentity::LinuxWayland(&focus.value)
+            }
+            sledge_linux::desktop::FocusCategory::X11Class => {
+                sledge_config::AppIdentity::LinuxX11Class(&focus.value)
+            }
+            sledge_linux::desktop::FocusCategory::KwinResourceClass => {
+                sledge_config::AppIdentity::LinuxLegacy(&focus.value)
+            }
+        });
+        let (focused_app, identity) = if self.focus.is_some() {
+            (focus.as_ref().map(|focus| focus.value.as_str()), identity)
+        } else {
+            (
+                focused_app,
+                focused_app.map(sledge_config::AppIdentity::LinuxLegacy),
+            )
+        };
+        // Current broker callbacks and injection/admission are synchronous.
+        // Hold the matching-state lock through settlement so reload/reset or
+        // another physical event cannot interleave before the backend verdict.
+        let mut state = self.matcher.lock();
+        let MatchingState { matcher, aliases } = &mut *state;
+        let logical = super::resolve_focused_app(aliases, focused_app, identity);
+        let (verdict, token) =
+            matcher.dispatch_device_with_delivery(device, event, logical, Instant::now());
+        match verdict {
+            sledge_core::Verdict::Pass => sledge_core::BackendVerdict::Pass,
+            sledge_core::Verdict::Swallow => sledge_core::BackendVerdict::Swallow,
+            sledge_core::Verdict::Replace(action) => {
+                let result = if let sledge_core::Action::SetInputSource { id } = &action {
+                    self.sources
+                        .as_ref()
+                        .ok_or_else(|| sledge_core::BackendError::UnknownInputSource(id.clone()))
+                        .and_then(|queue| queue.submit(id.clone()))
+                } else {
+                    self.backend.inject(&action)
+                };
+                let (delivery, verdict) = match result {
+                    Ok(()) => (
+                        // Queue admission consumes the original under existing
+                        // semantics; it is NOT proof of remote source completion.
+                        sledge_core::ReplacementDelivery::Delivered,
+                        sledge_core::BackendVerdict::Swallow,
+                    ),
+                    Err(error) => {
+                        warn!(%error, "inject failed");
+                        // Current Linux SendKey is unsupported before output;
+                        // SourceQueue errors are pre-admission only. Returning
+                        // Pass here is the broker's original-forwarding decision.
+                        // Do not extend this to timeout/partial-output errors.
+                        (
+                            sledge_core::ReplacementDelivery::RejectedOriginalForwarded,
+                            sledge_core::BackendVerdict::Pass,
+                        )
+                    }
+                };
+                matcher.report_delivery(token.expect("replacement token"), delivery);
+                verdict
+            }
+        }
+    }
+}
+
 struct SignalThread {
     handle: signal_hook::iterator::Handle,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -151,5 +224,202 @@ impl Drop for SignalThread {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sledge_core::{
+        Action, BackendError, BackendVerdict, DeviceId, EventKind, HotkeyTrigger, KeyCode,
+        KeyEvent, Modifiers, Rule, RuleSet, TapTrigger, Trigger,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SelectiveBackend(AtomicUsize);
+
+    impl InputBackend for SelectiveBackend {
+        fn run(&mut self, _sink: Box<dyn EventSink>) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn inject(&self, action: &Action) -> Result<(), BackendError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            if matches!(
+                action,
+                Action::SendKey {
+                    key: KeyCode::Return,
+                    ..
+                }
+            ) {
+                Ok(())
+            } else {
+                Err(BackendError::Inject("unsupported before output".into()))
+            }
+        }
+    }
+
+    fn send(key: KeyCode) -> Action {
+        Action::SendKey {
+            key,
+            mods: Modifiers::empty(),
+        }
+    }
+
+    fn rules(failed_action: Action) -> RuleSet {
+        let hotkey = |key, action| Rule {
+            trigger: Trigger::Hotkey(HotkeyTrigger {
+                key,
+                mods: Modifiers::empty(),
+            }),
+            action,
+            when_app_in: None,
+        };
+        let tap = |count| Rule {
+            trigger: Trigger::Tap(TapTrigger {
+                tap: KeyCode::Fn,
+                count,
+                within_ms: 600,
+            }),
+            action: send(KeyCode::Return),
+            when_app_in: None,
+        };
+        RuleSet::new(vec![
+            hotkey(KeyCode::KeyA, failed_action),
+            hotkey(KeyCode::KeyK, send(KeyCode::Return)),
+            tap(2),
+            tap(3),
+        ])
+    }
+
+    fn route(
+        sink: &mut MatcherSink<SelectiveBackend>,
+        device: u64,
+        key: KeyCode,
+        kind: EventKind,
+    ) -> BackendVerdict {
+        sink.on_device_event(
+            DeviceId(device),
+            KeyEvent {
+                code: key,
+                kind,
+                mods: Modifiers::empty(),
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn precommit_failures_keep_unrelated_consumed_press_and_modifier_tap_sequence() {
+        for failed_action in [
+            send(KeyCode::KeyB),
+            Action::SetInputSource {
+                id: "missing".into(),
+            },
+        ] {
+            let config = sledge_config::parse_str("").unwrap();
+            let mut state = MatchingState::new(&config);
+            state.matcher.swap_rules(rules(failed_action));
+            let backend = Arc::new(SelectiveBackend(AtomicUsize::new(0)));
+            let mut sink = MatcherSink {
+                matcher: Arc::new(Mutex::new(state)),
+                backend: backend.clone(),
+                sources: None,
+                focus: None,
+            };
+            assert!(matches!(
+                route(&mut sink, 1, KeyCode::KeyK, EventKind::KeyDown),
+                BackendVerdict::Swallow
+            ));
+            // A separate keyboard's second modifier tap is consumed. Its third
+            // tap must still fire after the failed replacement on keyboard 1.
+            for kind in [EventKind::KeyDown, EventKind::KeyUp, EventKind::KeyDown] {
+                assert!(matches!(
+                    route(&mut sink, 2, KeyCode::Fn, kind),
+                    BackendVerdict::Pass
+                ));
+            }
+            assert!(matches!(
+                route(&mut sink, 2, KeyCode::Fn, EventKind::KeyUp),
+                BackendVerdict::Swallow
+            ));
+            assert!(matches!(
+                route(&mut sink, 2, KeyCode::Fn, EventKind::KeyDown),
+                BackendVerdict::Pass
+            ));
+            assert!(matches!(
+                route(&mut sink, 1, KeyCode::KeyA, EventKind::KeyDown),
+                BackendVerdict::Pass
+            ));
+            assert!(matches!(
+                route(&mut sink, 2, KeyCode::Fn, EventKind::KeyUp),
+                BackendVerdict::Swallow
+            ));
+            let attempts = backend.0.load(Ordering::Relaxed);
+            // Reload does not discard either consumed or forwarded ownership.
+            sink.matcher.lock().replace(&config);
+            assert!(matches!(
+                route(&mut sink, 1, KeyCode::KeyK, EventKind::KeyDown),
+                BackendVerdict::Swallow
+            ));
+            assert!(matches!(
+                route(&mut sink, 1, KeyCode::KeyK, EventKind::KeyUp),
+                BackendVerdict::Swallow
+            ));
+            for kind in [EventKind::KeyDown, EventKind::KeyUp] {
+                assert!(matches!(
+                    route(&mut sink, 1, KeyCode::KeyA, kind),
+                    BackendVerdict::Pass
+                ));
+            }
+            assert_eq!(backend.0.load(Ordering::Relaxed), attempts);
+            assert!(matches!(
+                route(&mut sink, 1, KeyCode::KeyK, EventKind::KeyDown),
+                BackendVerdict::Pass
+            ));
+        }
+    }
+
+    #[test]
+    fn device_and_stream_reset_retire_only_core_delivery_ownership() {
+        let config = sledge_config::parse_str("").unwrap();
+        let mut state = MatchingState::new(&config);
+        state.matcher.swap_rules(rules(send(KeyCode::KeyB)));
+        let mut sink = MatcherSink {
+            matcher: Arc::new(Mutex::new(state)),
+            backend: Arc::new(SelectiveBackend(AtomicUsize::new(0))),
+            sources: None,
+            focus: None,
+        };
+        assert!(matches!(
+            route(&mut sink, 1, KeyCode::KeyA, EventKind::KeyDown),
+            BackendVerdict::Pass
+        ));
+        for device in [2, 3] {
+            assert!(matches!(
+                route(&mut sink, device, KeyCode::KeyK, EventKind::KeyDown),
+                BackendVerdict::Swallow
+            ));
+        }
+        sink.on_device_reset(DeviceId(2));
+        assert!(matches!(
+            route(&mut sink, 2, KeyCode::KeyK, EventKind::KeyUp),
+            BackendVerdict::Pass
+        ));
+        assert!(matches!(
+            route(&mut sink, 3, KeyCode::KeyK, EventKind::KeyUp),
+            BackendVerdict::Swallow
+        ));
+        assert!(matches!(
+            route(&mut sink, 1, KeyCode::KeyA, EventKind::KeyDown),
+            BackendVerdict::Pass
+        ));
+        let attempts = sink.backend.0.load(Ordering::Relaxed);
+        sink.on_stream_reset();
+        assert!(matches!(
+            route(&mut sink, 1, KeyCode::KeyA, EventKind::KeyDown),
+            BackendVerdict::Pass
+        ));
+        assert_eq!(sink.backend.0.load(Ordering::Relaxed), attempts + 1);
     }
 }

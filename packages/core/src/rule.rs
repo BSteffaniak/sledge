@@ -34,6 +34,28 @@ pub enum Verdict {
     Replace(Action),
 }
 
+/// Opaque acknowledgement identity, scoped to the matcher that issued it.
+/// Never reuse a token with a different matcher instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplacementToken {
+    device: DeviceId,
+    key: KeyCode,
+    generation: u64,
+}
+
+/// Actual compositor delivery result, not queue admission or an IPC timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacementDelivery {
+    /// The complete replacement was committed; keep consumed ownership.
+    Delivered,
+    /// No replacement output committed and the original was actually forwarded.
+    /// A timeout qualifies only if the backend can prove both conditions.
+    RejectedOriginalForwarded,
+    /// Partial output or uncertain commit. NEVER replay the original; backend
+    /// output reconciliation is required. Keep consumed ownership meanwhile.
+    Uncertain,
+}
+
 /// The compiled, immutable set of rules the engine is matching against.
 #[derive(Debug, Clone)]
 pub struct RuleSet {
@@ -102,6 +124,13 @@ pub struct Matcher {
     /// observe a spurious lingering key-up event, which they may mis-
     /// interpret as triggering their own binding for that key.
     swallowed_downs: HashSet<(DeviceId, KeyCode)>,
+    /// Failed replacements whose original down reached the consumer.
+    forwarded_downs: HashSet<(DeviceId, KeyCode)>,
+    pending_deliveries: HashMap<(DeviceId, KeyCode), u64>,
+    /// Cached nonempty pending/forwarded state gates legacy event overhead.
+    delivery_active: bool,
+    // Never reset/reuse generations, including after device/global reset.
+    delivery_generation: u64,
 }
 
 impl Matcher {
@@ -113,6 +142,10 @@ impl Matcher {
             tap_fsms: HashMap::new(),
             modifier_state: HashMap::new(),
             swallowed_downs: HashSet::new(),
+            forwarded_downs: HashSet::new(),
+            pending_deliveries: HashMap::new(),
+            delivery_active: false,
+            delivery_generation: 0,
         }
     }
 
@@ -144,12 +177,81 @@ impl Matcher {
         self.dispatch_device(DeviceId::default(), event, focused_app, now)
     }
 
+    /// Dispatch a compositor replacement decision with a one-shot delivery token.
+    ///
+    /// Only `Replace` issues a token. Until acknowledgement, consumed downs
+    /// stay consumed. Serialize dispatch and delivery reports with physical
+    /// events: rejection must be reported after forwarding the original and
+    /// before routing its repeats/release. No rollback of tap recognition occurs.
+    /// Release-triggered replacements can be acknowledged but own no held down.
+    /// Existing [`Self::dispatch_device`] callers need not use this API.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the matcher exhausts its non-reusable u64 token generations.
+    pub fn dispatch_device_with_delivery(
+        &mut self,
+        device: DeviceId,
+        event: KeyEvent,
+        focused_app: Option<&str>,
+        now: Instant,
+    ) -> (Verdict, Option<ReplacementToken>) {
+        let verdict = self.dispatch_device(device, event, focused_app, now);
+        let token = if matches!(verdict, Verdict::Replace(_)) {
+            self.delivery_generation = self
+                .delivery_generation
+                .checked_add(1)
+                .expect("replacement token generations exhausted");
+            self.pending_deliveries
+                .insert((device, event.code), self.delivery_generation);
+            self.delivery_active = true;
+            Some(ReplacementToken {
+                device,
+                key: event.code,
+                generation: self.delivery_generation,
+            })
+        } else {
+            None
+        };
+        (verdict, token)
+    }
+
+    /// Settle exactly one replacement. Returns false for stale, duplicate or
+    /// reset tokens without changing ownership. Tokens survive rule reload and
+    /// focus changes, but not release/new press or stream reset. Tokens must
+    /// originate from this matcher instance.
+    ///
+    /// Only definite precommit rejection with actual original delivery permits
+    /// fallback. This changes only that press; unrelated ownership and tap FSMs
+    /// are untouched. Delivered/uncertain results never permit original replay.
+    pub fn report_delivery(
+        &mut self,
+        token: ReplacementToken,
+        delivery: ReplacementDelivery,
+    ) -> bool {
+        let press = (token.device, token.key);
+        if self.pending_deliveries.get(&press) != Some(&token.generation) {
+            return false;
+        }
+        self.pending_deliveries.remove(&press);
+        if delivery == ReplacementDelivery::RejectedOriginalForwarded
+            && self.swallowed_downs.remove(&press)
+        {
+            self.forwarded_downs.insert(press);
+        }
+        self.refresh_delivery_active();
+        true
+    }
+
     /// Clear a lost/disconnected stream. The backend must reconcile any
     /// forwarded or injected held keys itself before resuming delivery.
     pub fn reset_device(&mut self, device: DeviceId) {
         self.tap_fsms.remove(&device);
         self.modifier_state.retain(|(id, _), _| *id != device);
         self.swallowed_downs.retain(|(id, _)| *id != device);
+        self.forwarded_downs.retain(|(id, _)| *id != device);
+        self.pending_deliveries.retain(|(id, _), _| *id != device);
+        self.refresh_delivery_active();
     }
 
     /// Clear all stream state after a global discontinuity.
@@ -157,6 +259,32 @@ impl Matcher {
         self.tap_fsms.clear();
         self.modifier_state.clear();
         self.swallowed_downs.clear();
+        self.forwarded_downs.clear();
+        self.pending_deliveries.clear();
+        self.delivery_active = false;
+    }
+
+    fn refresh_delivery_active(&mut self) {
+        self.delivery_active =
+            !self.pending_deliveries.is_empty() || !self.forwarded_downs.is_empty();
+    }
+
+    /// Also used by legacy dispatch when callers mix entry points.
+    fn reconcile_delivery_event(&mut self, press: (DeviceId, KeyCode), kind: EventKind) -> bool {
+        // Release (including tap-triggered replacement) retires the previous
+        // decision. A fresh down also invalidates a release-triggered token.
+        if kind != EventKind::KeyDown
+            || (!self.swallowed_downs.contains(&press) && !self.forwarded_downs.contains(&press))
+        {
+            self.pending_deliveries.remove(&press);
+        }
+        let forwarded = match kind {
+            EventKind::KeyUp => self.forwarded_downs.remove(&press),
+            EventKind::KeyDown => self.forwarded_downs.contains(&press),
+            EventKind::ModifiersChanged => false,
+        };
+        self.refresh_delivery_active();
+        forwarded
     }
 
     /// Device-aware dispatch. Modifier `KeyDown`/`KeyUp` are physical
@@ -171,6 +299,9 @@ impl Matcher {
     ) -> Verdict {
         trace!(?event, ?focused_app, "matcher dispatch");
         let press = (device, event.code);
+        if self.delivery_active && self.reconcile_delivery_event(press, event.kind) {
+            return Verdict::Pass;
+        }
         if event.kind == EventKind::KeyUp && self.swallowed_downs.remove(&press) {
             return Verdict::Swallow;
         }

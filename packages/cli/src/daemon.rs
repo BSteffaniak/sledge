@@ -8,7 +8,9 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use sledge_config::models::AppAlias;
-use sledge_core::{BackendVerdict, DeviceId, EventSink, InputBackend, KeyEvent, Matcher, Verdict};
+#[cfg(any(not(target_os = "linux"), test))]
+use sledge_core::Verdict;
+use sledge_core::{BackendVerdict, DeviceId, EventSink, InputBackend, KeyEvent, Matcher};
 use tracing::{info, warn};
 
 use crate::cli::{Cli, RunArgs};
@@ -32,8 +34,6 @@ use linux::run_linux;
 struct MatchingState {
     matcher: Matcher,
     aliases: HashMap<String, AppAlias>,
-    #[cfg(target_os = "linux")]
-    forwarded_failures: std::collections::HashSet<(DeviceId, sledge_core::KeyCode)>,
 }
 
 impl MatchingState {
@@ -41,8 +41,6 @@ impl MatchingState {
         Self {
             matcher: Matcher::new(config.rules.clone()),
             aliases: config.app_aliases.clone(),
-            #[cfg(target_os = "linux")]
-            forwarded_failures: std::collections::HashSet::new(),
         }
     }
 
@@ -56,6 +54,7 @@ impl MatchingState {
         self.dispatch_device(DeviceId(0), event, focused_app)
     }
 
+    #[cfg(any(not(target_os = "linux"), test))]
     fn dispatch_device(
         &mut self,
         device: DeviceId,
@@ -65,6 +64,7 @@ impl MatchingState {
         self.dispatch_identity(device, event, focused_app, focused_app.map(app_identity))
     }
 
+    #[cfg(any(not(target_os = "linux"), test))]
     fn dispatch_identity(
         &mut self,
         device: DeviceId,
@@ -72,31 +72,28 @@ impl MatchingState {
         focused_app: Option<&str>,
         identity: Option<sledge_config::AppIdentity<'_>>,
     ) -> Verdict {
-        #[cfg(target_os = "linux")]
-        if self.forwarded_failures.contains(&(device, event.code)) {
-            if event.kind == sledge_core::EventKind::KeyUp {
-                self.forwarded_failures.remove(&(device, event.code));
-                // Reconcile consumed ownership with the actual physical release,
-                // not a fabricated event or a whole-device reset.
-                self.matcher
-                    .dispatch_device(device, event, None, Instant::now());
-            }
-            return Verdict::Pass;
-        }
-        let logical =
-            identity.and_then(|id| sledge_config::resolve_app_identity(&self.aliases, id));
-        #[cfg(target_os = "linux")]
-        let logical = logical.or_else(|| {
-            focused_app.and_then(|id| {
-                sledge_config::resolve_app_identity(
-                    &self.aliases,
-                    sledge_config::AppIdentity::LinuxLegacy(id),
-                )
-            })
-        });
+        let logical = resolve_focused_app(&self.aliases, focused_app, identity);
         self.matcher
-            .dispatch_device(device, event, logical.or(focused_app), Instant::now())
+            .dispatch_device(device, event, logical, Instant::now())
     }
+}
+
+fn resolve_focused_app<'a>(
+    aliases: &'a HashMap<String, AppAlias>,
+    focused_app: Option<&'a str>,
+    identity: Option<sledge_config::AppIdentity<'_>>,
+) -> Option<&'a str> {
+    let logical = identity.and_then(|id| sledge_config::resolve_app_identity(aliases, id));
+    #[cfg(target_os = "linux")]
+    let logical = logical.or_else(|| {
+        focused_app.and_then(|id| {
+            sledge_config::resolve_app_identity(
+                aliases,
+                sledge_config::AppIdentity::LinuxLegacy(id),
+            )
+        })
+    });
+    logical.or(focused_app)
 }
 
 /// Run the daemon.
@@ -325,18 +322,15 @@ impl<B: InputBackend + Sync> EventSink for MatcherSink<B> {
     fn on_device_reset(&mut self, device: DeviceId) {
         let mut state = self.matcher.lock();
         state.matcher.reset_device(device);
-        #[cfg(target_os = "linux")]
-        state.forwarded_failures.retain(|(id, _)| *id != device);
     }
 
     fn on_stream_reset(&mut self) {
         let mut state = self.matcher.lock();
         state.matcher.reset();
-        #[cfg(target_os = "linux")]
-        state.forwarded_failures.clear();
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 impl<B: InputBackend> MatcherSink<B> {
     fn deliver(
         &self,
@@ -344,69 +338,21 @@ impl<B: InputBackend> MatcherSink<B> {
         event: KeyEvent,
         focused_app: Option<&str>,
     ) -> BackendVerdict {
-        #[cfg(target_os = "linux")]
-        let verdict = if let Some(cache) = &self.focus {
-            let focus = cache.current();
-            let identity = focus.as_ref().map(|focus| match focus.category {
-                sledge_linux::desktop::FocusCategory::Wayland => {
-                    sledge_config::AppIdentity::LinuxWayland(&focus.value)
-                }
-                sledge_linux::desktop::FocusCategory::X11Class => {
-                    sledge_config::AppIdentity::LinuxX11Class(&focus.value)
-                }
-                sledge_linux::desktop::FocusCategory::KwinResourceClass => {
-                    sledge_config::AppIdentity::LinuxLegacy(&focus.value)
-                }
-            });
-            self.matcher.lock().dispatch_identity(
-                device,
-                event,
-                focus.as_ref().map(|focus| focus.value.as_str()),
-                identity,
-            )
-        } else {
-            self.matcher
-                .lock()
-                .dispatch_device(device, event, focused_app)
-        };
-        #[cfg(not(target_os = "linux"))]
         let verdict = self
             .matcher
             .lock()
             .dispatch_device(device, event, focused_app);
-        self.apply(device, event, verdict)
+        self.apply(verdict)
     }
 
-    fn apply(&self, device: DeviceId, event: KeyEvent, verdict: Verdict) -> BackendVerdict {
-        #[cfg(not(target_os = "linux"))]
-        let _ = (device, event);
+    fn apply(&self, verdict: Verdict) -> BackendVerdict {
         match verdict {
             Verdict::Pass => BackendVerdict::Pass,
             Verdict::Swallow => BackendVerdict::Swallow,
             Verdict::Replace(action) => {
-                #[cfg(target_os = "linux")]
-                let result = if let sledge_core::Action::SetInputSource { id } = &action {
-                    self.sources
-                        .as_ref()
-                        .ok_or_else(|| sledge_core::BackendError::UnknownInputSource(id.clone()))
-                        .and_then(|queue| queue.submit(id.clone()))
-                } else {
-                    self.backend.inject(&action)
-                };
-                #[cfg(not(target_os = "linux"))]
                 let result = self.backend.inject(&action);
                 if let Err(e) = result {
                     warn!(error = %e, "inject failed");
-                    #[cfg(target_os = "linux")]
-                    {
-                        if event.kind == sledge_core::EventKind::KeyDown {
-                            self.matcher
-                                .lock()
-                                .forwarded_failures
-                                .insert((device, event.code));
-                        }
-                        return BackendVerdict::Pass;
-                    }
                 }
                 BackendVerdict::Swallow
             }
@@ -414,6 +360,7 @@ impl<B: InputBackend> MatcherSink<B> {
     }
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn app_identity(id: &str) -> sledge_config::AppIdentity<'_> {
     #[cfg(target_os = "macos")]
     {
