@@ -68,6 +68,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked --release --all
 
+  linux-packaging:
+    name: Linux packaging (offline)
+    runs-on: ubuntu-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/linux/test_package.py
+      - run: python3 scripts/linux/check_units.py
+
   machete:
     name: unused dependencies
     runs-on: ubuntu-latest

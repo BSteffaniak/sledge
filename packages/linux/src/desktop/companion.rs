@@ -60,6 +60,7 @@ pub struct Gnome {
 }
 impl Gnome {
     pub fn connect() -> Result<Self, DesktopError> {
+        let _operation = super::operation::adapter_scope();
         Ok(Self {
             bus: Bus::session(
                 "org.sledge.Desktop.Gnome",
@@ -90,13 +91,16 @@ impl Gnome {
 }
 impl DesktopProvider for Gnome {
     fn poll(&mut self) -> Result<DesktopSnapshot, DesktopError> {
+        let _operation = super::operation::adapter_scope();
         let observed_at = Instant::now();
         Ok(snapshot(&self.read()?, observed_at))
     }
     fn sources(&mut self) -> Result<SourceCatalog, DesktopError> {
+        let _operation = super::operation::adapter_scope();
         Ok(catalog("gnome", &self.read()?))
     }
     fn select(&mut self, old: &SourceCatalog, id: &str) -> Result<(), DesktopError> {
+        let _operation = super::operation::adapter_scope();
         let wire = self.read()?;
         old.check(&catalog("gnome", &wire), id)?;
         let selected: bool = self
@@ -154,6 +158,7 @@ pub struct KwinBridge {
 }
 impl KwinBridge {
     pub fn connect() -> Result<Self, DesktopError> {
+        let _operation = super::operation::adapter_scope();
         let layouts = Bus::session("org.kde.keyboard", "/Layouts", "org.kde.KeyboardLayouts")?;
         let state = Arc::new(Mutex::new(None));
         let kwin = Bus::session("org.kde.KWin", "/KWin", "org.kde.KWin")?;
@@ -163,6 +168,7 @@ impl KwinBridge {
         };
         let (stop, stopped) = std::sync::mpsc::channel();
         let (ready, result) = std::sync::mpsc::sync_channel(1);
+        let startup_deadline = std::time::Instant::now() + super::operation::remaining()?;
         let worker = std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -180,10 +186,13 @@ impl KwinBridge {
                     .and_then(|b| b.serve_at("/org/sledge/DesktopBridge", receiver))
                     .map(|b| b.max_queued(8).method_timeout(super::IPC_TIMEOUT))
                 {
-                    Ok(b) => tokio::time::timeout(super::IPC_TIMEOUT, b.build())
-                        .await
-                        .map_err(|e| e.to_string())
-                        .and_then(|r| r.map_err(|e| e.to_string())),
+                    Ok(b) => tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(startup_deadline),
+                        b.build(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r.map_err(|e| e.to_string())),
                     Err(e) => Err(e.to_string()),
                 };
                 match connection {
@@ -200,10 +209,14 @@ impl KwinBridge {
                 }
             });
         });
-        result
-            .recv_timeout(super::IPC_TIMEOUT * 2)
-            .map_err(unavailable)?
-            .map_err(unavailable)?;
+        let ready = result.recv_timeout(super::operation::remaining().unwrap_or_default());
+        if !matches!(ready, Ok(Ok(()))) {
+            let _ = stop.send(());
+            let _ = worker.join();
+            return Err(unavailable(format!(
+                "KWin bridge startup failed: {ready:?}"
+            )));
+        }
         Ok(Self {
             state,
             stop: Some(stop),
@@ -225,8 +238,9 @@ impl Drop for KwinBridge {
 }
 impl DesktopProvider for KwinBridge {
     fn poll(&mut self) -> Result<DesktopSnapshot, DesktopError> {
+        let _operation = super::operation::adapter_scope();
         self.kwin.check_owner()?;
-        let state = self.state.lock().map_err(unavailable)?;
+        let state = super::operation::lock(&self.state)?;
         let (wire, time) = state
             .as_ref()
             .ok_or_else(|| unavailable("KWin companion has not published"))?;
@@ -236,6 +250,7 @@ impl DesktopProvider for KwinBridge {
         Ok(snapshot(wire, *time))
     }
     fn sources(&mut self) -> Result<SourceCatalog, DesktopError> {
+        let _operation = super::operation::adapter_scope();
         let names: Vec<(String, String, String)> = self
             .layouts
             .call("getLayoutsList", &())?
@@ -266,6 +281,7 @@ impl DesktopProvider for KwinBridge {
         })
     }
     fn select(&mut self, old: &SourceCatalog, id: &str) -> Result<(), DesktopError> {
+        let _operation = super::operation::adapter_scope();
         old.check(&self.sources()?, id)?;
         let index = id.parse::<u32>().map_err(protocol)?;
         let selected: bool = self

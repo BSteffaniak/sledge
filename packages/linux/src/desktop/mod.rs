@@ -5,6 +5,7 @@ pub mod companion;
 pub mod fcitx5;
 pub mod hyprland;
 pub mod ibus;
+pub mod operation;
 pub mod sway;
 mod transport;
 pub mod worker;
@@ -124,6 +125,11 @@ pub enum DesktopError {
     Io(#[from] std::io::Error),
 }
 
+/// Synchronous cooperative desktop adapter. Worker calls share an aggregate
+/// deadline and shutdown token through `operation::remaining`. Implementations
+/// must check it before effects and bound all waits; non-cooperative custom code
+/// cannot be safely killed, and joining it may delay shutdown. No method may
+/// spawn detached work that continues provider effects after returning.
 pub trait DesktopProvider: Send {
     /// Errors invalidate the caller's cached focus immediately.
     fn poll(&mut self) -> Result<DesktopSnapshot, DesktopError>;

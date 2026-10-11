@@ -3,7 +3,6 @@
 use super::{DesktopError, DesktopProvider, DesktopSnapshot, FocusIdentity, SourceCatalog};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
 
 /// Combine focus from a compositor with explicitly selected IBus/Fcitx5 sources.
 /// No input-method framework is automatically preferred or started.
@@ -96,53 +95,58 @@ pub struct DesktopWorker {
 #[derive(Clone)]
 pub struct SourceDispatcher {
     provider: Arc<Mutex<Box<dyn DesktopProvider>>>,
+    stopped: Arc<AtomicBool>,
 }
 impl SourceDispatcher {
     pub fn catalog(&self) -> Result<SourceCatalog, DesktopError> {
-        self.provider.lock().map_err(super::unavailable)?.sources()
+        super::operation::run(self.stopped.clone(), || {
+            super::operation::lock(&self.provider)?.sources()
+        })
     }
     /// Select with the exact queued inventory generation; never silently
     /// reinterpret an old group index after a map/config change.
     pub fn select(&self, catalog: &SourceCatalog, id: &str) -> Result<(), DesktopError> {
-        self.provider
-            .lock()
-            .map_err(super::unavailable)?
-            .select(catalog, id)
+        super::operation::run(self.stopped.clone(), || {
+            super::operation::lock(&self.provider)?.select(catalog, id)
+        })
     }
     /// Resolve a native ID against current inventory on the injection worker.
     /// Use `select` instead when queue-time inventory is already captured.
     pub fn select_current(&self, id: &str) -> Result<(), DesktopError> {
-        let mut provider = self.provider.lock().map_err(super::unavailable)?;
-        let catalog = provider.sources()?;
-        provider.select(&catalog, id)
+        super::operation::run(self.stopped.clone(), || {
+            let mut provider = super::operation::lock(&self.provider)?;
+            let catalog = provider.sources()?;
+            provider.select(&catalog, id)
+        })
     }
 }
 impl DesktopWorker {
     pub fn start(provider: Box<dyn DesktopProvider>) -> Self {
+        let stopped = Arc::new(AtomicBool::new(false));
         let dispatcher = SourceDispatcher {
             provider: Arc::new(Mutex::new(provider)),
+            stopped: stopped.clone(),
         };
         let sources = SourceCache::default();
         let thread_sources = sources.clone();
         let focus = FocusCache::default();
-        let stopped = Arc::new(AtomicBool::new(false));
         let thread_provider = dispatcher.provider.clone();
         let thread_focus = focus.clone();
         let thread_stopped = stopped.clone();
         let worker = std::thread::spawn(move || {
             while !thread_stopped.load(Ordering::Acquire) {
-                let observation = thread_provider
-                    .lock()
+                let _operation = super::operation::scope(thread_stopped.clone());
+                let observation = super::operation::lock(&thread_provider)
                     .ok()
                     .and_then(|mut provider| provider.poll().ok());
+                let observation = observation.filter(|_| super::operation::remaining().is_ok());
                 let focus_ok = observation.is_some();
                 if let Ok(mut state) = thread_focus.state.write() {
                     *state = observation;
                 }
                 let started = std::time::Instant::now();
                 let catalog = if focus_ok {
-                    thread_provider
-                        .lock()
+                    super::operation::lock(&thread_provider)
                         .ok()
                         .and_then(|mut provider| provider.sources().ok())
                         .map(Arc::new)
@@ -150,9 +154,16 @@ impl DesktopWorker {
                     None
                 };
                 if let Ok(mut state) = thread_sources.state.write() {
-                    *state = catalog.map(|catalog| (catalog, started));
+                    *state = catalog
+                        .filter(|_| super::operation::remaining().is_ok())
+                        .map(|catalog| (catalog, started));
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                for _ in 0..10 {
+                    if thread_stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(super::operation::SLICE);
+                }
             }
             thread_focus.clear();
             thread_sources.clear();
@@ -190,6 +201,54 @@ mod tests {
     use super::*;
     use crate::desktop::{FocusCategory, LockHint};
     use std::time::Instant;
+    struct BlockedProvider(std::sync::mpsc::Sender<()>);
+    impl DesktopProvider for BlockedProvider {
+        fn poll(&mut self) -> Result<DesktopSnapshot, DesktopError> {
+            self.0.send(()).unwrap();
+            loop {
+                super::super::operation::remaining()?;
+                std::thread::sleep(super::super::operation::SLICE);
+            }
+        }
+        fn sources(&mut self) -> Result<SourceCatalog, DesktopError> {
+            panic!("cancelled poll must not start inventory work");
+        }
+        fn select(&mut self, _: &SourceCatalog, _: &str) -> Result<(), DesktopError> {
+            panic!("stopped dispatcher must not select");
+        }
+    }
+    #[test]
+    fn teardown_cancels_poll_and_retained_dispatcher() {
+        let (sender, entered) = std::sync::mpsc::channel();
+        let worker = DesktopWorker::start(Box::new(BlockedProvider(sender)));
+        let dispatcher = worker.dispatcher();
+        entered
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let started = Instant::now();
+        drop(worker);
+        assert!(started.elapsed() < super::super::IPC_TIMEOUT);
+        assert!(dispatcher.catalog().is_err());
+        assert!(dispatcher.select_current("id").is_err());
+    }
+    #[test]
+    fn contended_mutex_is_bounded_and_cancelled_on_shutdown() {
+        let (sender, _) = std::sync::mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let dispatcher = SourceDispatcher {
+            provider: Arc::new(Mutex::new(Box::new(BlockedProvider(sender)))),
+            stopped: stopped.clone(),
+        };
+        let guard = dispatcher.provider.lock().unwrap();
+        let caller = dispatcher.clone();
+        let started = Instant::now();
+        let thread = std::thread::spawn(move || caller.catalog());
+        assert!(thread.join().unwrap().is_err());
+        assert!(started.elapsed() < super::super::IPC_TIMEOUT + std::time::Duration::from_secs(1));
+        stopped.store(true, Ordering::Release);
+        assert!(dispatcher.catalog().is_err());
+        drop(guard);
+    }
     #[test]
     fn catalog_snapshot_is_nonblocking_and_expires() {
         let cache = SourceCache::default();

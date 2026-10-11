@@ -119,8 +119,12 @@ functional Linux keyboard daemon yet**:
   repeat-setting cloning are not implemented.
 - Desktop/provider APIs and companion syntax have automated checks, not native
   desktop/hardware qualification.
-- Source work is bounded at queue admission and runs outside the input callback,
-  but provider work/shutdown lacks a single aggregate cancellation deadline.
+- Source work is bounded at queue admission and runs outside the input callback.
+  Built-in adapters share a 400 ms aggregate operation budget across mutex waits,
+  inventory validation, selection, and confirmation. Shutdown cooperatively cancels
+  waits and joins workers; no provider threads are detached. A non-cooperative
+  custom provider can delay joining indefinitely. Already transmitted remote requests cannot be
+  recalled, so this is not a guarantee against delayed remote side effects.
 - Packaged broker units are diagnostic-only and deliberately deny device access.
   They are not production-capture installation assets.
 - Debian/RPM/Arch and Nix deployment qualification remains outstanding beyond
@@ -128,12 +132,40 @@ functional Linux keyboard daemon yet**:
 - macOS-specific changes require native macOS regression checks; Linux's
   target-gated macOS crate tests do not exercise them.
 
-A trusted compositor/session capture boundary or an explicit revised isolation
-policy is an architectural decision needed before production activation. Do not
-use fresh attestation files, negative lock hints, or manual permission grants as
+The production architecture is a trusted compositor/session capture boundary,
+retaining strict lock isolation. Session-owned evdev capture with polled lock
+hints is not an approved fallback. Before activation, a concrete adapter must
+establish suppression, injection, and revocation atomically with the compositor's
+lock state. The current focus/source companions do not establish that boundary.
+Do not use fresh attestation files, negative lock hints, or manual permission grants as
 an undocumented bypass. Remaining parity features and behavior qualification
 must still be implemented after that decision; approval alone does not complete
 this port.
+
+### Trusted-boundary implementation prerequisite
+
+Production capture must move event suppression and lock revocation into the
+compositor's event-delivery path, not grant the current evdev broker authority
+from desktop snapshots. The first concrete candidate is a native, version-pinned
+KWin input-filter plugin. Its existing QML focus/source companion is not such a
+plugin. Hyprland likewise needs native, release-specific integration; GNOME and
+Sway require additional compositor hooks. An ordinary X11 client cannot establish
+an atomic session-lock boundary.
+
+The native adapter must own per-device press/repeat/release routing, bypass
+unknown events, isolate replacement modifiers, exclude synthetic re-entry, and
+reset state synchronously before lock delivery. It must also bound any daemon
+round trip and pass original input on timeout/disconnection. These requirements
+are not implemented or qualified by the current source checkpoint. Implementing
+and testing the first adapter requires a selected compositor release, its native
+development APIs, and an isolated compositor test environment.
+
+Relevant upstream interfaces (capabilities, not qualified version ranges):
+[KWin input filters](https://github.com/KDE/kwin/blob/master/src/input.h),
+[KWin lock routing](https://github.com/KDE/kwin/blob/master/src/input.cpp), and
+[the InputCapture portal contract](https://github.com/flatpak/xdg-desktop-portal/blob/main/data/org.freedesktop.portal.InputCapture.xml).
+The portal's compositor-controlled capture does not by itself establish an
+always-on physical keyboard remapping transaction.
 
 ## Repository verification
 

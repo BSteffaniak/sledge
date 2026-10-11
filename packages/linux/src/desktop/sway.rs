@@ -78,6 +78,7 @@ fn catalog(inputs: &Value) -> Result<SourceCatalog, DesktopError> {
 }
 impl DesktopProvider for Sway {
     fn poll(&mut self) -> Result<DesktopSnapshot, DesktopError> {
+        let _operation = super::operation::adapter_scope();
         let observed_at = Instant::now();
         let epoch = self.socket.epoch()?;
         let tree = self.socket.sway(4, "")?;
@@ -93,6 +94,7 @@ impl DesktopProvider for Sway {
         })
     }
     fn sources(&mut self) -> Result<SourceCatalog, DesktopError> {
+        let _operation = super::operation::adapter_scope();
         let epoch = self.socket.epoch()?;
         let mut result = catalog(&self.socket.sway(100, "")?)?;
         if self.socket.epoch()? != epoch {
@@ -102,6 +104,7 @@ impl DesktopProvider for Sway {
         Ok(result)
     }
     fn select(&mut self, old: &SourceCatalog, id: &str) -> Result<(), DesktopError> {
+        let _operation = super::operation::adapter_scope();
         old.check(&self.sources()?, id)?;
         let (device, index): (String, usize) = serde_json::from_str(id).map_err(protocol)?;
         // Sway's command language needs its own escaping, not shell quoting.

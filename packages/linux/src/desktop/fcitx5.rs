@@ -7,6 +7,7 @@ pub struct Fcitx5 {
 type Entry = (String, String, String, String, String, String, bool);
 impl Fcitx5 {
     pub fn connect() -> Result<Self, DesktopError> {
+        let _operation = super::operation::adapter_scope();
         Ok(Self {
             bus: Bus::session(
                 "org.fcitx.Fcitx5",
@@ -16,6 +17,7 @@ impl Fcitx5 {
         })
     }
     pub fn sources(&mut self) -> Result<SourceCatalog, DesktopError> {
+        let _operation = super::operation::adapter_scope();
         let entries: Vec<Entry> = self
             .bus
             .call("AvailableInputMethods", &())?
@@ -76,6 +78,7 @@ impl Fcitx5 {
         })
     }
     pub fn select(&mut self, old: &SourceCatalog, id: &str) -> Result<(), DesktopError> {
+        let _operation = super::operation::adapter_scope();
         old.check(&self.sources()?, id)?;
         self.bus.call("SetCurrentIM", &(id,))?;
         if self.sources()?.current.as_deref() != Some(id) {

@@ -89,6 +89,7 @@ fn observation(
 }
 impl DesktopProvider for Hyprland {
     fn poll(&mut self) -> Result<DesktopSnapshot, DesktopError> {
+        let _operation = super::operation::adapter_scope();
         let epoch = self.socket.epoch()?;
         // Stamp before the focus round trip, not after a subsequent lock call.
         let observed_at = Instant::now();
@@ -121,6 +122,7 @@ impl DesktopProvider for Hyprland {
         ))
     }
     fn sources(&mut self) -> Result<SourceCatalog, DesktopError> {
+        let _operation = super::operation::adapter_scope();
         let epoch = self.socket.epoch()?;
         let mut result = catalog(&self.socket.hypr_json("j/devices")?)?;
         if self.socket.epoch()? != epoch {
@@ -130,6 +132,7 @@ impl DesktopProvider for Hyprland {
         Ok(result)
     }
     fn select(&mut self, old: &SourceCatalog, id: &str) -> Result<(), DesktopError> {
+        let _operation = super::operation::adapter_scope();
         old.check(&self.sources()?, id)?;
         let (device, index): (String, usize) = serde_json::from_str(id).map_err(protocol)?;
         if !device

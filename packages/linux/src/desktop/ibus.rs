@@ -35,6 +35,7 @@ impl IBus {
     /// Session-bus IBus installations only. A private-bus installation without
     /// this name is explicitly unavailable; never discover it via subprocess.
     pub fn connect() -> Result<Self, DesktopError> {
+        let _operation = super::operation::adapter_scope();
         Ok(Self {
             bus: Bus::session(
                 "org.freedesktop.IBus",
@@ -44,6 +45,7 @@ impl IBus {
         })
     }
     pub fn sources(&mut self) -> Result<SourceCatalog, DesktopError> {
+        let _operation = super::operation::adapter_scope();
         let installed = engines(&self.bus.property("Engines")?)?;
         let enabled = engines(&self.bus.property("ActiveEngines")?)?;
         let value = self.bus.property("GlobalEngine")?;
@@ -66,6 +68,7 @@ impl IBus {
         })
     }
     pub fn select(&mut self, old: &SourceCatalog, id: &str) -> Result<(), DesktopError> {
+        let _operation = super::operation::adapter_scope();
         old.check(&self.sources()?, id)?;
         self.bus.call("SetGlobalEngine", &(id,))?;
         if self.sources()?.current.as_deref() != Some(id) {

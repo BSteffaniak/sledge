@@ -12,28 +12,52 @@ struct DeadlineStream {
 }
 impl Read for DeadlineStream {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        let left = self.deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "desktop IPC deadline",
-            ));
+        loop {
+            let left = super::operation::remaining()
+                .map_err(std::io::Error::other)?
+                .min(self.deadline.saturating_duration_since(Instant::now()));
+            if left.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "desktop IPC deadline",
+                ));
+            }
+            self.socket
+                .set_read_timeout(Some(left.min(super::operation::SLICE)))?;
+            match self.socket.read(bytes) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
         }
-        self.socket.set_read_timeout(Some(left))?;
-        self.socket.read(bytes)
     }
 }
 impl Write for DeadlineStream {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let left = self.deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "desktop IPC deadline",
-            ));
+        loop {
+            let left = super::operation::remaining()
+                .map_err(std::io::Error::other)?
+                .min(self.deadline.saturating_duration_since(Instant::now()));
+            if left.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "desktop IPC deadline",
+                ));
+            }
+            self.socket
+                .set_write_timeout(Some(left.min(super::operation::SLICE)))?;
+            match self.socket.write(bytes) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
         }
-        self.socket.set_write_timeout(Some(left))?;
-        self.socket.write(bytes)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.socket.flush()
@@ -57,6 +81,7 @@ impl SocketTransport {
         }
     }
     fn connect(&self) -> Result<DeadlineStream, DesktopError> {
+        super::operation::remaining()?;
         // Paths are selected by the unprivileged caller, never sent to the broker.
         let deadline = Instant::now() + IPC_TIMEOUT;
         let fd = socket(
@@ -71,8 +96,11 @@ impl SocketTransport {
             Ok(()) => {}
             Err(nix::errno::Errno::EINPROGRESS) => {
                 let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLOUT)];
-                if poll(&mut fds, 400_u16).map_err(protocol)? == 0 {
-                    return Err(protocol("connect deadline"));
+                while poll(&mut fds, 10_u16).map_err(protocol)? == 0 {
+                    super::operation::remaining()?;
+                    if Instant::now() >= deadline {
+                        return Err(protocol("connect deadline"));
+                    }
                 }
                 let error = getsockopt(&fd, sockopt::SocketError).map_err(protocol)?;
                 if error != 0 {
@@ -147,6 +175,36 @@ impl SocketTransport {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+    #[test]
+    fn blocked_socket_is_cancelled_and_joined_without_followup_requests() {
+        let path =
+            std::env::temp_dir().join(format!("sledge-desktop-cancel-{}", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = stopped.clone();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 14];
+            socket.read_exact(&mut request).unwrap();
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+            released
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            let mut byte = [0];
+            assert_eq!(socket.read(&mut byte).unwrap(), 0);
+        });
+        let started = Instant::now();
+        let result: Result<(), DesktopError> = super::super::operation::run(stopped, || {
+            SocketTransport::new(&path).sway(4, "")?;
+            panic!("cancelled reply must not permit further calls");
+        });
+        assert!(result.is_err());
+        assert!(started.elapsed() < IPC_TIMEOUT);
+        release.send(()).unwrap();
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn rejects_oversized_frame_before_allocation() {
         let path =
