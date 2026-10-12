@@ -1,10 +1,25 @@
 # Compositor integration boundary (v0.52.2)
 
-**Frozen research only.** User architectural decision requires stock Hyprland;
-no patched compositor/fork is supported. The source integration discussion below
-records missing upstream boundaries, not an implementation roadmap or supported
-adapter. No patch expansion/transport implementation is proceeding. Stock capture
-stays disabled pending authoritative stock hooks and independent qualification.
+**Stock-plugin foundation; capture remains unqualified.** User architectural
+decision requires unmodified stock Hyprland. Exact-signature hooks are the accepted
+route, not patched signals. `stock_hooks.hpp` resolves all nine signatures before
+mutation, rejects every production artifact, and uses reverse transactional
+rollback. The VM-only `stock_hook_probe.cpp` exercises those SDK APIs independently;
+its ordered blocking file traces are not production callbacks. `physical_devices.hpp`
+provides bounded per-device generations/mapping; `forwarded_keyboard_state.hpp`
+rebuilds XKB/focus state from committed Router ownership, not physical state.
+`decision_mailbox.hpp` provides one bounded fixed-packet callback/worker exchange.
+`stock_adapter.cpp` is a concrete passive stock plugin with all nine call-through
+hooks and `stock_worker.hpp` private-client Hello/Ack connection, capabilities zero.
+It does NOT register physical devices, export input, mutate forwarded XKB/focus/IME,
+or emit replacements. Components are owned by the adapter, not admission evidence.
+`stock_sdk_identity.cpp` prints the exact SDK hash algorithm from version macros;
+`passive_handshake_test.cpp` exercises the same worker without loading hooks.
+These source components are not an installed, authorized capture backend.
+
+The source-patch sections below remain historical boundary analysis, not deployment
+requirements. Stock callback implementation/qualification must supply the same
+semantics before enabling any capture capability.
 
 `routing.hpp` and `isolated_output.hpp` are implemented, deterministic routing
 components, not installed callbacks. The probe remains separate. No stock
@@ -15,7 +30,7 @@ records stock-consumed original outcomes; bridge must call originalOutcome
 synchronously before any focus/keymap/IME state can change. No runtime detour is
 assumed safe simply because `findFunctionsByName` returns an address.
 
-## Smallest authoritative lock patch
+## Historical source-lock boundary (not supported deployment)
 
 `lock-boundary.patch` applies to upstream
 `386376400119dd46a767c9f8c8791fd22c7b6e61` (context checked). It adds a synchronous,
@@ -81,9 +96,10 @@ LockerOwned state never becomes app-forwarded merely because unlock occurred.
    Disconnect no longer releases/quarantines unrelated forwarded presses; lock
    revocation is the explicit old-focus reconciliation/quarantine boundary.
 
-These are genuine blockers for a stock plugin. The implemented host-independent
-component is useful executable behavior but cannot replace these source paths.
-No always-disabled production backend or speculative hook package is added.
+These remain qualification gaps for a stock plugin. Foundation tests do not
+establish application-visible delivery or permit activation. Production preflight
+cannot infer pair acceptance from the stock void-returning send methods, nor
+assume their allocation/logging paths meet production callback requirements.
 
 ## Deterministic test evidence
 

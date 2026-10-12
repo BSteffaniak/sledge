@@ -6,7 +6,7 @@ use crate::logging;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use sledge_core::{EventSink, InputBackend};
-use sledge_linux::{LinuxBackend, ShutdownHandle};
+use sledge_linux::LinuxBackend;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,6 +51,12 @@ pub(super) fn run_linux(
         None
     };
     let sources = source_work.as_ref().map(|(queue, _)| queue.clone());
+    let research = super::hyprland_research::ResearchListener::bind(
+        &args.linux_hyprland_research,
+        matcher.clone(),
+        sources.clone(),
+    )?;
+    let research_configured = research.is_some();
     let sink: Box<dyn EventSink> = Box::new(MatcherSink {
         matcher: matcher.clone(),
         backend: inject_backend,
@@ -83,6 +89,8 @@ pub(super) fn run_linux(
                 "source_switching": sources_configured,
                 "native_send_key": false,
                 "strict_lock_authority": false,
+                "hyprland_research_configured": research_configured,
+                "hyprland_capture_qualified": false,
                 "reason": caps.reason,
             }))
         }),
@@ -102,11 +110,19 @@ pub(super) fn run_linux(
         tokio::net::UnixListener::from_std(listener)?
     };
     let server = runtime.spawn(ipc::serve(listener, state));
-    let _signals = SignalThread::spawn(reload.clone(), shutdown)?;
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal_stop = stopped.clone();
+    let _signals = SignalThread::spawn_with(reload.clone(), move || {
+        signal_stop.store(true, std::sync::atomic::Ordering::Release);
+        shutdown.shutdown();
+    })?;
     let _watcher = crate::config_watcher::spawn((*config_path).clone(), reload);
     // The backend's fail-closed authorization remains authoritative. This CLI
     // does not open devices, connect a privileged broker, or invent permissions.
-    let result = backend.run(sink).map_err(anyhow::Error::from);
+    let result = match research {
+        Some(listener) => listener.run(&stopped),
+        None => backend.run(sink).map_err(anyhow::Error::from),
+    };
     server.abort();
     runtime.shutdown_timeout(Duration::from_secs(5));
     drop(source_work);
@@ -145,7 +161,9 @@ impl<B: InputBackend> MatcherSink<B> {
         // Hold the matching-state lock through settlement so reload/reset or
         // another physical event cannot interleave before the backend verdict.
         let mut state = self.matcher.lock();
-        let MatchingState { matcher, aliases } = &mut *state;
+        let MatchingState {
+            matcher, aliases, ..
+        } = &mut *state;
         let logical = super::resolve_focused_app(aliases, focused_app, identity);
         let (verdict, token) =
             matcher.dispatch_device_with_delivery(device, event, logical, Instant::now());
@@ -192,7 +210,7 @@ struct SignalThread {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl SignalThread {
-    fn spawn(reload: ReloadFn, shutdown: ShutdownHandle) -> Result<Self> {
+    fn spawn_with(reload: ReloadFn, shutdown: impl Fn() + Send + 'static) -> Result<Self> {
         use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
         let mut signals = signal_hook::iterator::Signals::new([SIGHUP, SIGINT, SIGTERM])?;
         let handle = signals.handle();
@@ -207,7 +225,7 @@ impl SignalThread {
                         }
                     } else {
                         info!(signal, "shutdown requested");
-                        shutdown.shutdown();
+                        shutdown();
                         break;
                     }
                 }

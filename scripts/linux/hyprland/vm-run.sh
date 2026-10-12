@@ -22,6 +22,11 @@ vm=${SLEDGE_VM_EXECUTABLE:?immutable Nix-generated executable required}
 python3 "${SLEDGE_VM_IDENTITY:?runner admission validator required}" "$vm" "$SLEDGE_VM_EXECUTABLE"
 : "${SLEDGE_VM_QEMU:?pinned QEMU required}"
 sha256sum "$SLEDGE_VM_QEMU" "$vm"
+driver=()
+if [[ -n ${SLEDGE_VM_DRIVER:-} ]]; then
+  [[ $SLEDGE_VM_DRIVER == /nix/store/* && -f $SLEDGE_VM_DRIVER ]] || exit 77
+  driver=(python3 "$SLEDGE_VM_DRIVER")
+fi
 # Namespace-local /tmp is the explicit disposable disk/state root.
 timeout --signal=TERM --kill-after=3s 180s \
   bwrap --unshare-all --die-with-parent --new-session --clearenv \
@@ -35,4 +40,4 @@ timeout --signal=TERM --kill-after=3s 180s \
     LIBGL_DRIVERS_PATH="$SLEDGE_VM_MESA/lib/dri" \
     __EGL_VENDOR_LIBRARY_FILENAMES="$SLEDGE_VM_MESA/share/glvnd/egl_vendor.d/50_mesa.json" \
     QEMU_OPTS="-machine accel=$accel -vga none -display egl-headless,rendernode=$node" \
-    "$vm"
+    "${driver[@]}" "$vm"

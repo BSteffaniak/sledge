@@ -94,14 +94,16 @@ impl DesktopProvider for Hyprland {
         // Stamp before the focus round trip, not after a subsequent lock call.
         let observed_at = Instant::now();
         let window = self.socket.hypr_json("j/activewindow")?;
-        let category = if window["xwayland"].as_bool() == Some(true) {
-            FocusCategory::X11Class
-        } else {
-            FocusCategory::Wayland
+        let category = match window["xwayland"].as_bool() {
+            Some(true) => Some(FocusCategory::X11Class),
+            Some(false) => Some(FocusCategory::Wayland),
+            None => None,
         };
-        let focus = window["class"]
-            .as_str()
-            .and_then(|id| FocusIdentity::new(category, id));
+        let focus = category.and_then(|category| {
+            window["class"]
+                .as_str()
+                .and_then(|id| FocusIdentity::new(category, id))
+        });
         let lock_hint = match self
             .socket
             .hypr_json("j/locked")
@@ -149,6 +151,10 @@ impl DesktopProvider for Hyprland {
             return Err(DesktopError::SelectionFailed);
         }
         let devices = self.socket.hypr_json("j/devices")?;
+        let epoch = self.socket.epoch()?;
+        let mut fresh = catalog(&devices)?;
+        fresh.generation = format!("{epoch}:{}", fresh.generation);
+        old.check(&fresh, id)?;
         let confirmed = devices["keyboards"].as_array().is_some_and(|items| {
             items.iter().any(|keyboard| {
                 keyboard["name"].as_str() == Some(&device)

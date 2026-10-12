@@ -110,6 +110,63 @@
               exec bash ${./scripts/linux/hyprland/vm-prepare.sh} "$@"
             '';
           };
+          hyprland-stock-qualification =
+            (import ./native/hyprland/stock-hook-investigation.nix {
+              inherit system;
+              peer = self.packages.${system}.hyprland-probe-peer;
+            }).runner;
+          hyprland-stock-research =
+            (import ./native/hyprland/stock-hook-investigation.nix {
+              inherit system;
+              peer = self.packages.${system}.hyprland-probe-peer;
+            }).researchRunner;
+          hyprland-stock-replacement =
+            (import ./native/hyprland/stock-hook-investigation.nix {
+              inherit system;
+              peer = self.packages.${system}.hyprland-probe-peer;
+            }).replacementRunner;
+          hyprland-stock-rollback =
+            (import ./native/hyprland/stock-hook-investigation.nix {
+              inherit system;
+              peer = self.packages.${system}.hyprland-probe-peer;
+            }).rollbackRunner;
+          hyprland-probe-peer =
+            (pkgs.makeRustPlatform {
+              cargo = rustToolchain;
+              rustc = rustToolchain;
+            }).buildRustPackage
+              {
+                pname = "sledge-hyprland-probe-peer";
+                version = "0";
+                src = pkgs.lib.cleanSourceWith {
+                  src = ./.;
+                  filter =
+                    path: type:
+                    let
+                      name = builtins.baseNameOf path;
+                    in
+                    name != "target" && name != ".git" && type != "symlink";
+                };
+                cargoLock.lockFile = ./Cargo.lock;
+                cargoBuildFlags = [
+                  "-p"
+                  "sledge_linux"
+                  "--example"
+                  "hyprland_probe_peer"
+                  "--example"
+                  "hyprland_research_peer"
+                ];
+                # This is a passive guest fixture, not a qualified runtime backend.
+                # Workspace and behavioral checks are run separately by contributors.
+                doCheck = false;
+                installPhase = ''
+                  runHook preInstall
+                  mkdir -p "$out/bin"
+                  cp target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/examples/hyprland_probe_peer "$out/bin/"
+                  cp target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/examples/hyprland_research_peer "$out/bin/"
+                  runHook postInstall
+                '';
+              };
         };
 
         devShells.default = pkgs.mkShell {

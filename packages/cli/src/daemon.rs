@@ -23,6 +23,8 @@ use crate::logging;
 #[cfg(target_os = "linux")]
 mod desktop;
 #[cfg(target_os = "linux")]
+mod hyprland_research;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 mod source_queue;
@@ -34,6 +36,8 @@ use linux::run_linux;
 struct MatchingState {
     matcher: Matcher,
     aliases: HashMap<String, AppAlias>,
+    #[cfg(target_os = "linux")]
+    hyprland: sledge_linux::hyprland::matcher::MatcherTransactions,
 }
 
 impl MatchingState {
@@ -41,10 +45,14 @@ impl MatchingState {
         Self {
             matcher: Matcher::new(config.rules.clone()),
             aliases: config.app_aliases.clone(),
+            #[cfg(target_os = "linux")]
+            hyprland: sledge_linux::hyprland::matcher::MatcherTransactions::default(),
         }
     }
 
     fn replace(&mut self, config: &sledge_config::Config) {
+        #[cfg(target_os = "linux")]
+        self.hyprland.invalidate_speculation(&mut self.matcher);
         self.matcher.swap_rules(config.rules.clone());
         self.aliases.clone_from(&config.app_aliases);
     }

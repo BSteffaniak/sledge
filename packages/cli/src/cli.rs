@@ -67,10 +67,35 @@ pub struct RunArgs {
     #[arg(long, requires = "linux_desktop")]
     pub linux_x11_cookie: Option<PathBuf>,
 
+    /// Isolated Hyprland research listener; never enables production capture.
+    #[cfg(target_os = "linux")]
+    #[command(flatten)]
+    pub linux_hyprland_research: HyprlandResearchArgs,
+
     /// Explicit source-only input method overlay.
     #[cfg(target_os = "linux")]
     #[arg(long, value_enum, requires = "linux_desktop")]
     pub linux_input_method: Option<LinuxInputMethod>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Args, Default)]
+pub struct HyprlandResearchArgs {
+    /// Explicit private SHP1 listener for an isolated research compositor only.
+    #[arg(long, requires_all = ["linux_hyprland_research_pid", "linux_hyprland_research_api_hash", "linux_hyprland_research_artifact"], conflicts_with = "linux_broker_socket")]
+    pub linux_hyprland_research_socket: Option<PathBuf>,
+
+    /// Exact same-user isolated compositor process, never desktop discovery.
+    #[arg(long, requires = "linux_hyprland_research_socket", value_parser = clap::value_parser!(i32).range(1..))]
+    pub linux_hyprland_research_pid: Option<i32>,
+
+    /// Exact research plugin API hash (identity check, not qualification).
+    #[arg(long, requires = "linux_hyprland_research_socket")]
+    pub linux_hyprland_research_api_hash: Option<String>,
+
+    /// Exact research artifact identity (identity check, not qualification).
+    #[arg(long, requires = "linux_hyprland_research_socket")]
+    pub linux_hyprland_research_artifact: Option<String>,
 }
 
 #[cfg(target_os = "linux")]

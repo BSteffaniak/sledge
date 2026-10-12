@@ -57,3 +57,27 @@ A stock plugin route is demonstrably possible for these narrow checkpoints.
 Full parity is unqualified, not proven impossible. Official function-hook support
 is evidence against a blanket intentional prohibition on trusted plugins;
 unprivileged client security restrictions are a different boundary.
+
+## Native foundation revision 1 (source-only)
+
+`stock_hook_probe.cpp` now records ordered `seq=` traces for input key/state/time/
+device identity, modifiers, seat key/modifiers/focus, IME key/modifiers and lock
+before/after the original. These retain the fixed virtual suppression fixture,
+not generalized physical capture. Traces intentionally do blocking file I/O in
+this research target ONLY.
+
+Successful hook installations now roll back in reverse order on initialization
+failure (including symbol lookup/self-test exceptions) and unload. Tests cover
+failure at all nine positions, exception cleanup and capacity rejection. Stock
+0.52.2 `unhook()` returns false for an inactive hook, so failed/conflicting hook
+objects must not be unhooked. Host owns their objects. A successful unhook does
+not establish instruction restoration under OS failure: stock ignores mprotect
+return values. That remains a production qualification gap.
+
+VM lane must include `hook_transaction.hpp` and `hook_bytes.hpp` alongside this
+`.cpp` in its Nix source. `SLEDGE_STOCK_ROLLBACK_ONLY=1` is research-only: after
+all-nine installation/self-test it restores all hooks, compares original source
+bytes and reports `ROLLBACK_ALL_NINE_BYTES_VERIFIED`. Ordinary unload reports
+`UNLOAD_RESTORED_BYTES_VERIFIED`. Installation also verifies each source changed.
+No VM run is claimed for this revision. byte equality is observed instruction
+restoration, not proof of page protections, signals or concurrent-client safety.

@@ -8,6 +8,8 @@ pub mod broker;
 #[cfg(target_os = "linux")]
 pub mod desktop;
 #[cfg(target_os = "linux")]
+pub mod hyprland;
+#[cfg(target_os = "linux")]
 pub mod ipc;
 #[cfg(target_os = "linux")]
 pub mod keymap;

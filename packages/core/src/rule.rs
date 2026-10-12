@@ -243,6 +243,37 @@ impl Matcher {
         true
     }
 
+    /// Invalidate speculative decisions after focus, connection, or keymap changes.
+    ///
+    /// Unlike [`Self::reset`], this preserves committed press ownership and
+    /// physical modifier transitions until release. Outstanding replacements
+    /// become uncertain: stale acknowledgements cannot authorize original replay.
+    /// Backends must reconcile output separately; this does not recover a lost
+    /// device or revoke lock routing.
+    pub fn invalidate_speculation(&mut self) {
+        self.tap_fsms.clear();
+        self.pending_deliveries.clear();
+        self.refresh_delivery_active();
+    }
+
+    /// Observe a backend-owned repeat/release without evaluating rules or
+    /// producing actions. The backend must still reconcile its own output.
+    /// Releases retire only the exact physical press; speculative tap state for
+    /// that device is discarded rather than firing a release-triggered action.
+    /// This is not an input replay or a delivery acknowledgment.
+    pub fn settle_device_event(&mut self, device: DeviceId, event: KeyEvent) {
+        if event.kind != EventKind::KeyUp {
+            return;
+        }
+        let press = (device, event.code);
+        self.swallowed_downs.remove(&press);
+        self.forwarded_downs.remove(&press);
+        self.pending_deliveries.remove(&press);
+        self.modifier_state.remove(&press);
+        self.tap_fsms.remove(&device);
+        self.refresh_delivery_active();
+    }
+
     /// Clear a lost/disconnected stream. The backend must reconcile any
     /// forwarded or injected held keys itself before resuming delivery.
     pub fn reset_device(&mut self, device: DeviceId) {

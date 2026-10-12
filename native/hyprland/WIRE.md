@@ -1,13 +1,13 @@
 # Authoritative proposed native transaction/reset wire
 
-**Frozen design research, not an adapter interface shipped to production.** Stock
-Hyprland compatibility is required. No patched fork is supported, no transport
-exists, and no placeholder will be added. This proposal cannot establish missing
-stock lock/input authority. Capture remains disabled.
+**Stock-plugin transaction contract; production capture is unqualified.** Stock
+Hyprland compatibility is required. No patched fork is supported. The native
+lifecycle/decision-mailbox components do not establish stock lock/input authority.
+Capture remains disabled; no artifact is admitted and all capability bits are zero.
 
-This supersedes all earlier wire/outcome handoffs. NOT implemented transport;
-no production capture or upstream callback qualification. One architecture:
-source-integrated compositor bridge plus early lock-boundary.patch, not detours.
+This supersedes all earlier wire/outcome handoffs. Stock exact-signature function
+hooks are the accepted integration route. Source patches are historical research,
+not deployment prerequisites. Hook installation alone does not qualify callbacks.
 
 ## Framing
 
@@ -20,6 +20,34 @@ u64 reserved0@56. Body@64. Generation0 is global; device generations never reuse
 All decision/outcome correlation echoes nonce/generation/epoch/sequence/deadline.
 One pending transaction, <=10ms aggregate callback wait: bounded BLOCKING, not
 fully nonblocking. Socket I/O stays worker-side. Compositor commits synchronously.
+`DecisionMailbox::decide` consumes already encoded fixed packets and returns false
+on unavailable slot or timeout. A false return invalidates ONLY the pending
+proposal, never the Router physical ownership ledger. `take`/`complete` are used
+by exactly one socket worker. An abandoned in-flight slot cannot be reused until
+that worker acknowledges it; a late decision cannot satisfy the next request.
+The worker must validate packet padding/UTF-8 and exact tuple correlation before
+publishing a decision; the compositor rechecks Router ticket/focus/deadline.
+No network connection, peer authorization or wire codec is implied by this mailbox.
+
+### Passive integration topology
+
+`stock_adapter.cpp` uses `StockWorker` as the connecting client; the Rust passive
+peer owns a private listener. Endpoint is explicitly supplied by
+`SLEDGE_HYPRLAND_PASSIVE_SOCKET`; the native worker pins the private parent
+with O_DIRECTORY/O_NOFOLLOW and checks socket/parent UID and group/other modes,
+then SO_PEERCRED UID. Rust must additionally verify the expected compositor PID.
+No implicit discovery, retries, desktop connection or capture override exists.
+Passive Hello alone uses zero generation/epoch/sequence/deadline, a random nonzero
+nonce, and capabilities zero. Its worker-side exchange still has a 10ms local
+budget. Rust must explicitly allow this passive-only zero-deadline handshake;
+Event/Decision/Outcome deadline rules are unchanged. HelloAck echoes the complete
+scope/identity body, changes only opcode, and retains capabilities zero.
+API identity is the stock SDK server hash; artifact literal for this fixture is
+`stock-0.52.2:8dee6b387615f14e8ce6c1f7bbd0b58524c31d783061093423e6a3fc6f89b9ca`.
+This is a recorded fixture identity, not verified runtime digest qualification.
+The passive plugin sends no keyboard Events and accepts no Inject; a successful
+Hello/Ack proves plumbing only. Unknown runtime path/API mismatch rejects hooks.
+
 
 Bodies (relative offsets; unused bytes zero):
 

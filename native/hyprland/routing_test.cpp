@@ -205,8 +205,34 @@ void outputSequence() {
         if (failure == 2) check(route.writes == std::vector<int>({1004,2030,3030,1001}));
     }
 }
+void lifecycleSettlement() {
+    Router router; RecordingOutput output;
+    check(router.add(1)); router.unlockConfirmed();
+    for (unsigned cycle=0; cycle<2; ++cycle) {
+        Event down{1,30,State::Down};
+        auto ticket=router.begin(down,100+cycle*100,10'000'000); check(ticket.has_value());
+        check(router.route(down,ticket,answer(*ticket,Verdict::Replace),101+cycle*100,output).outcome==Outcome::Replaced);
+        for (const auto state : {State::Repeat,State::Up}) {
+            Event event{1,30,state};
+            auto settlement=router.settlement(event,102+cycle*100,10'000'000); check(settlement.has_value());
+            // Even a malicious Replace reply cannot override committed hold.
+            auto result=router.route(event,settlement,answer(*settlement,Verdict::Replace),103+cycle*100,output);
+            check(!result.deliverClient && result.outcome==Outcome::Swallowed);
+        }
+        check(output.replacements==cycle+1);
+    }
+    Event down{1,30,State::Down};
+    auto ticket=router.begin(down,400,10'000'000); check(ticket.has_value());
+    output.result=Delivery::PartialFatal;
+    check(router.route(down,ticket,answer(*ticket,Verdict::Replace),401,output).outcome==Outcome::PartialFatal);
+    router.disconnect(output);
+    check(router.settlement({1,30,State::Up},402,10'000'000).has_value());
+    check(!router.route({1,30,State::Up},{},{},403,output).deliverClient);
+    check(!router.targetHeld(30));
+}
 } // namespace
 int main() {
+    lifecycleSettlement();
     ownership(); replies(); replacement(); lockAndRetirement(); reviewedOutcomes(); fiveReviewRegressions(); mergedStockOutcome(); outputSequence();
     std::cout << "PASS routing: ownership, stale/deadline replies, merged releases, modifier restore contract, lock quarantine, retirement\n";
 }

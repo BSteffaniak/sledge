@@ -65,6 +65,30 @@ fn replacement(m: &mut Matcher, device: u64, key: KeyCode) -> ReplacementToken {
 }
 
 #[test]
+fn speculative_reset_preserves_consumed_and_forwarded_ownership() {
+    let mut matcher = Matcher::new(rules());
+    let pending = replacement(&mut matcher, 1, KeyCode::KeyA);
+    let forwarded = replacement(&mut matcher, 2, KeyCode::KeyA);
+    assert!(matcher.report_delivery(forwarded, ReplacementDelivery::RejectedOriginalForwarded));
+    matcher.invalidate_speculation();
+    assert!(!matcher.report_delivery(pending, ReplacementDelivery::RejectedOriginalForwarded));
+    for kind in [EventKind::KeyDown, EventKind::KeyUp] {
+        assert!(matches!(
+            dispatch(&mut matcher, 1, KeyCode::KeyA, kind),
+            Verdict::Swallow
+        ));
+        assert!(matches!(
+            dispatch(&mut matcher, 2, KeyCode::KeyA, kind),
+            Verdict::Pass
+        ));
+    }
+    assert!(matches!(
+        dispatch(&mut matcher, 1, KeyCode::KeyA, EventKind::KeyDown),
+        Verdict::Replace(_)
+    ));
+}
+
+#[test]
 fn mixed_dispatch_retires_pending_tokens_and_keeps_other_forwarded_presses() {
     let mut m = Matcher::new(rules());
     // Legacy-only matching, before any transactional state exists.
@@ -353,4 +377,42 @@ fn pass_swallow_do_not_issue_tokens_and_reload_does_not_invalidate_pending_deliv
     );
     assert!(matches!(verdict, Verdict::Pass));
     assert!(passed.is_none());
+}
+
+#[test]
+fn settlement_retires_only_released_press_without_rules_or_replay() {
+    let mut matcher = Matcher::new(rules());
+    let token = replacement(&mut matcher, 1, KeyCode::KeyA);
+    assert!(matcher.report_delivery(token, ReplacementDelivery::Delivered));
+    let other = replacement(&mut matcher, 2, KeyCode::KeyA);
+    assert!(matcher.report_delivery(other, ReplacementDelivery::Delivered));
+    matcher.settle_device_event(DeviceId(1), event(KeyCode::KeyA, EventKind::KeyDown));
+    assert!(matches!(
+        dispatch(&mut matcher, 1, KeyCode::KeyA, EventKind::KeyDown),
+        Verdict::Swallow
+    ));
+    matcher.settle_device_event(DeviceId(1), event(KeyCode::KeyA, EventKind::KeyUp));
+    assert!(matches!(
+        dispatch(&mut matcher, 2, KeyCode::KeyA, EventKind::KeyDown),
+        Verdict::Swallow
+    ));
+    let next = replacement(&mut matcher, 1, KeyCode::KeyA);
+    assert!(!matcher.report_delivery(token, ReplacementDelivery::Delivered));
+    assert!(matcher.report_delivery(next, ReplacementDelivery::Delivered));
+}
+
+#[test]
+fn settlement_does_not_complete_modifier_tap_action() {
+    let mut matcher = Matcher::new(rules());
+    for _ in 0..2 {
+        assert!(matches!(
+            dispatch(&mut matcher, 1, KeyCode::Fn, EventKind::KeyDown),
+            Verdict::Pass
+        ));
+        matcher.settle_device_event(DeviceId(1), event(KeyCode::Fn, EventKind::KeyUp));
+    }
+    assert!(matches!(
+        dispatch(&mut matcher, 1, KeyCode::Fn, EventKind::KeyUp),
+        Verdict::Pass
+    ));
 }

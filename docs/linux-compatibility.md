@@ -8,11 +8,18 @@ requires application-visible testing on the named desktop and hardware.
 
 Full parity must work with unmodified stock Hyprland; a maintained patched
 compositor is not an accepted deployment architecture. Stock 0.52.2 capture
-remains disabled: cancellable key hooks do not isolate subsequent XKB/modifier
-updates, and lock listeners alone do not prove revocation before locker delivery.
-Required upstream integration must expose authoritative lock revocation and actual
-seat/IME delivery ownership, including merged-device releases and focus-enter
-state. Do not substitute polled lock hints or unqualified runtime detours.
+remains disabled pending behavioral qualification. An isolated stock-plugin
+investigation established function-hook installation, virtual-key suppression
+observed by an independent client, and lock-request entry before the original
+handler. This establishes a viable interception route, not modifier isolation,
+IME coverage, transactional replacement, or complete lock safety.
+
+The backend must establish authoritative lock revocation and actual seat/IME
+delivery ownership, including merged-device releases and focus-enter state.
+Do not substitute polled lock hints or infer qualification from hook installation
+or matching unknown build hashes. See
+[`STOCK-HOOK-INVESTIGATION.md`](../native/hyprland/STOCK-HOOK-INVESTIGATION.md)
+for the narrow evidence and remaining acceptance gaps.
 
 The core delivery-result API and native routing/XKB components have deterministic
 tests. The isolated Nix VM establishes only the stock compositor prerequisite:
@@ -48,6 +55,28 @@ acceleration and optional KVM, never host input devices or desktop sockets.
 - Config reload validates before atomically replacing rules and aliases. Invalid
   reloads keep the previous generation. IPC, SIGHUP, and file watching share the
   same reload path. Incomplete tap sequences reset; outstanding presses do not.
+
+## Explicit isolated Hyprland research listener
+
+The normal daemon remains fail-closed. An isolated guest can explicitly select
+`run --linux-hyprland-research-socket ABS_PATH
+--linux-hyprland-research-pid PID --linux-hyprland-research-api-hash HASH
+--linux-hyprland-research-artifact ARTIFACT`. These flags form one command; the
+listener requires a private same-user parent, exact peer PID and zero-capability
+Hello identity. They conflict with the input broker and never discover or load a
+plugin into the running desktop. Startup admission expires after 60 seconds;
+transport failure stops research without automatic reconnect or original replay.
+
+This path uses the real config matcher and typed app aliases under the same
+atomic reload lock. Correlated native outcomes settle replacement tokens;
+repeat/release notifications only retire physical ownership, never dispatch
+release-triggered rules. Source changes use bounded queue admission, not proof
+of remote completion. Status reports research configuration separately from
+capture qualification, which remains false. Stock research events currently
+omit app identity, so app-scoped rules cannot be qualified by this fixture.
+
+Workspace checks and mock transaction tests are distinct from consumer-visible
+VM acceptance. See [`REPLACEMENT-WIRE.md`](../native/hyprland/REPLACEMENT-WIRE.md).
 
 ## Linux privilege and lifecycle contract
 

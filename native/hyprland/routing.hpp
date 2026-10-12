@@ -87,6 +87,15 @@ public:
         pending = Ticket{event.device, epoch, focus, ++sequence, now + budgetNs, event.key};
         return pending;
     }
+    // Correlation only for committed lifecycle settlement. Does not create a
+    // matcher proposal or pending routing authority; valid even after fatal
+    // replacement uncertainty so physical releases can retire exact ownership.
+    std::optional<Ticket> settlement(Event event,uint64_t now,uint64_t budgetNs) {
+        if (!find(event.device) || locked || !event.modeled || event.key>=keyCount ||
+            event.state==State::Down || sequence==UINT64_MAX || budgetNs>10'000'000 ||
+            now>UINT64_MAX-budgetNs) return {};
+        return Ticket{event.device,epoch,focus,++sequence,now+budgetNs,event.key};
+    }
     // Return true to pass to the stock route. Existing ownership always wins,
     // including repeats/releases after timeout, focus changes and disconnection.
     RouteResult route(Event event, const std::optional<Ticket>& ticket,
@@ -157,7 +166,7 @@ public:
         auto* device = find(event.device);
         const bool originalProposal = proposal.outcome == Outcome::Merged || proposal.deliverClient;
         if (!device || event.key >= keyCount || event.state != State::Down || !originalProposal) return proposal;
-        if (device->owners[event.key] == Owner::Forwarded && !stockAdmitted) {
+        if ((device->owners[event.key] == Owner::Forwarded || device->owners[event.key] == Owner::LockerOwned) && !stockAdmitted) {
             device->owners[event.key] = Owner::StockConsumed;
             return {Outcome::StockConsumed,true,false,false};
         }
@@ -169,6 +178,14 @@ public:
             if (device.id != 0)
                 for (uint32_t key = 0; key < keyCount; ++key)
                     keys[key] = keys[key] || device.owners[key] == Owner::Forwarded;
+        return keys;
+    }
+    std::array<bool, keyCount> lockerEnterKeys() const {
+        std::array<bool, keyCount> keys{};
+        for (const auto& device : devices)
+            if (device.id != 0)
+                for (uint32_t key = 0; key < keyCount; ++key)
+                    keys[key] = keys[key] || device.owners[key] == Owner::LockerOwned;
         return keys;
     }
     void focusChanged() { pending.reset(); ++focus; ++epoch; }
