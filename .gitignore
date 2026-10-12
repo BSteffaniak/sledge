@@ -28,3 +28,5 @@ result-*
 /dist/
 /packaging/macos/build/
 /Sledge.app/
+
+__pycache__/

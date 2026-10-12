@@ -23,6 +23,18 @@ class HarnessTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     admit(str(fake), str(fake))
 
+    def test_store_runner_symlink_admission(self):
+        expected = "/nix/store/" + "a" * 32 + "-nixos-vm/bin/run-sledge-qualification-vm"
+        immutable = Path("/nix/store/" + "b" * 32 + "-run-nixos-vm")
+        with patch.object(Path, "resolve", return_value=immutable), \
+             patch.object(Path, "is_file", return_value=True), \
+             patch.object(Path, "read_bytes", return_value=b"runner"), \
+             patch("runner_identity.os.access", return_value=True):
+            self.assertEqual(len(admit(expected, expected)), 64)
+        with patch.object(Path, "resolve", return_value=Path("/tmp/mutable-runner")):
+            with self.assertRaises(ValueError):
+                admit(expected, expected)
+
     def test_guest_rejects_bad_outputs_and_identity(self):
         good = {"name": "Virtual-1", "width": 640, "height": 480, "scale": 1, "dpmsStatus": True}
         validate({"version": "0.52.2"}, [good], "/exact", "/exact")
