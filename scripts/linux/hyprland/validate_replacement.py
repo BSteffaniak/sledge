@@ -3,6 +3,7 @@ from pathlib import Path
 import re
 import sys
 
+from peer_evidence import outcome_records, require_reconciliation
 from validate_qualification import evidence_files, phases, require
 
 
@@ -56,10 +57,19 @@ def validate(text):
         ("KeyRelease", "0x0", "38", "a"), ("KeyRelease", "0x0", "56", "b")],
         "XWayland target-held rejection incorrect")
     peer = files.get("/tmp/replacement-peer-events", "")
-    require(re.search(r"research proposals=12 acknowledgments=24 uncertain=0 qualified=false", peer),
-            "missing actual peer lifecycle acknowledgments")
+    records = outcome_records(peer)
+    require(len(records) == 26 and all(r["report"].startswith("Acknowledged(") for r in records),
+            "missing current correlated lifecycle acknowledgments")
+    require_reconciliation(peer, records[0]["connection"], records[0]["nonce"])
+    for kind, identity in ((1, "wev"), (2, "SledgeFixtureX11")):
+        downs = [r for r in records if r["key"] == 30 and r["state"] == 1 and r["focus_kind"] == kind]
+        require(len(downs) == 4 and all(f'focus="{identity}"' in r["line"] for r in downs),
+                "typed consumer transaction identity missing")
+        require(all(r["decision"].startswith("Replace") and "result: Replaced," in r["report"] for r in downs[:3])
+                and downs[3]["decision"].startswith("Replace") and "result: RejectedOriginalAdmitted," in downs[3]["report"],
+                "missing selected replacements/held-target rejection")
     print("PASS_TWO_FRESH_NATIVE_AND_XWAYLAND_PAIRS_MASKS_REJECTION_NOT_CAPTURE")
-    print("PEER: 12 proposals, 24 acknowledgments, zero uncertain; disconnect on unload is not recovery qualification")
+    print("PEER: 26 correlated acknowledgments, typed replacements/rejection; disconnect on unload is not recovery qualification")
     print("GAPS: failure/timeout/disconnect/lock proposal; repeat/unknown keys; layouts/merged devices; production capture")
 
 

@@ -102,6 +102,13 @@ def step(qmp, name):
     elif name == "locker-release":
         qmp.key("j", False)
         qmp.key("shift_r", False)
+    elif name == "initial-reconcile":
+        qmp.pair("c")
+    elif name == "failure-recovery":
+        qmp.pair("c")
+        qmp.key("shift", True)
+        qmp.pair("d")
+        qmp.key("shift", False)
     elif name == "capability-hotplug":
         qmp.command("device_add", {"driver": "usb-kbd", "bus": "qualification-usb.0", "id": "capability-keyboard"})
         time.sleep(1)

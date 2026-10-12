@@ -65,6 +65,13 @@ class Router {
         return false;
     }
 public:
+    uint64_t lockEpoch() const noexcept { return epoch; }
+    uint64_t focusEpoch() const noexcept { return focus; }
+    bool quiescent() const noexcept {
+        for (const auto& device : devices)
+            for (const auto owner : device.owners) if (owner!=Owner::None) return false;
+        return !pending && !fatal;
+    }
     bool add(uint64_t id) {
         if (id == 0 || id <= lastGeneration || find(id)) return false;
         for (auto& device : devices)

@@ -1,4 +1,5 @@
 #include "isolated_output.hpp"
+#include "replacement_emission.hpp"
 
 #include <iostream>
 #include <stdexcept>
@@ -184,6 +185,13 @@ void mergedStockOutcome() {
     }
 }
 void outputSequence() {
+    for (unsigned failure=0;failure<3;++failure) {
+        std::vector<unsigned> emissions;
+        const bool complete=emitReplacement([&]{emissions.push_back(1);},
+            [&](bool down){emissions.push_back(down ? 2 : 3);},[&]{emissions.push_back(4);},failure);
+        check(complete==(failure==0));
+        check(emissions==(failure==1 ? std::vector<unsigned>{1,4} : std::vector<unsigned>{1,2,3,4}));
+    }
     struct Route : KeyRoute {
         bool ready = true;
         int failAt = -1;

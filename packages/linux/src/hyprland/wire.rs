@@ -227,7 +227,7 @@ impl Packet {
             7 | 8 if len == 8 => {
                 zero(&b[4..])?;
                 let reason = u32_at(b, 0);
-                if reason > 7 {
+                if reason > 8 || (u16_at(bytes, 6) == 8 && reason == 8) {
                     return Err(invalid());
                 }
                 if u16_at(bytes, 6) == 7 {

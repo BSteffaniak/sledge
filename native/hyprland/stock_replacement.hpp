@@ -1,6 +1,7 @@
 #pragma once
 #include "stock_research_route.hpp"
 #include "decision_mailbox.hpp"
+#include "replacement_emission.hpp"
 
 namespace sledge::hyprland {
 // Narrow stock seat reservation, compositor thread only. Binding is observed
@@ -67,15 +68,14 @@ public:
                     (reserved[i].get(),depressed,latched,locked,group);
         };
         // Direct resource methods, no InputManager/keybind/matcher reentry.
-        sendMods(mask,0,0,route.forwarded.group());
-        bool partial=failAfter==1;
-        if (!partial) for (unsigned i=0; i<count; ++i) reserved[i]->sendKey(route.output.time,key,WL_KEYBOARD_KEY_STATE_PRESSED);
-        partial=partial || failAfter==2;
-        // Best-effort up and restoration always, including forced partial path.
-        for (unsigned i=0; i<count; ++i) reserved[i]->sendKey(route.output.time,key,WL_KEYBOARD_KEY_STATE_RELEASED);
-        sendMods(route.forwarded.depressed(),route.forwarded.latched(),route.forwarded.locked(),route.forwarded.group());
-        if (monotonicNs()>=deadline) partial=true;
-        return partial ? Delivery::PartialFatal : Delivery::Accepted;
+        const bool complete=emitReplacement(
+            [&] { sendMods(mask,0,0,route.forwarded.group()); },
+            [&](bool down) {
+                for (unsigned i=0;i<count;++i) reserved[i]->sendKey(route.output.time,key,
+                    down ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
+            },
+            [&] { sendMods(route.forwarded.depressed(),route.forwarded.latched(),route.forwarded.locked(),route.forwarded.group()); },failAfter);
+        return !complete || monotonicNs()>=deadline ? Delivery::PartialFatal : Delivery::Accepted;
     }
 };
 } // namespace sledge::hyprland

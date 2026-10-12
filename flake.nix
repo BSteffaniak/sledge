@@ -125,6 +125,21 @@
               inherit system;
               peer = self.packages.${system}.hyprland-probe-peer;
             }).replacementRunner;
+          hyprland-stock-preflight =
+            (import ./native/hyprland/stock-hook-investigation.nix {
+              inherit system;
+              peer = self.packages.${system}.hyprland-probe-peer;
+            }).preflightRunner;
+          hyprland-stock-mods-failure =
+            (import ./native/hyprland/stock-hook-investigation.nix {
+              inherit system;
+              peer = self.packages.${system}.hyprland-probe-peer;
+            }).modsFailureRunner;
+          hyprland-stock-down-failure =
+            (import ./native/hyprland/stock-hook-investigation.nix {
+              inherit system;
+              peer = self.packages.${system}.hyprland-probe-peer;
+            }).downFailureRunner;
           hyprland-stock-rollback =
             (import ./native/hyprland/stock-hook-investigation.nix {
               inherit system;

@@ -2,6 +2,7 @@
 #include "physical_devices.hpp"
 #include "identity_policy.hpp"
 #include "lock_phase.hpp"
+#include "initial_reconciliation.hpp"
 #include <cassert>
 #include <vector>
 
@@ -81,6 +82,16 @@ void devices() {
     assert(!devices.event(&physical,42,true));
     const auto replacement = devices.attach(&physical,true,false,map,router);
     assert(replacement > generation); // same address never reuses stream identity
+    int power=0;
+    auto mediaMap=map;mediaMap.fill(PhysicalDevices::unmapped);mediaMap[116]=116;
+    const auto media=devices.attach(&power,true,false,mediaMap,router);
+    assert(media>replacement); // non-typing physical keyboard participates in proof
+    auto powerDown=devices.event(&power,116,true);
+    assert(powerDown && router.route(*powerDown,{},{},3,sink).deliverClient);
+    assert(!router.quiescent());
+    auto powerUp=devices.event(&power,116,false);
+    assert(powerUp);(void)router.route(*powerUp,{},{},4,sink);
+    assert(router.quiescent());
 }
 void phases() {
     LockPhase phase; Router router; Sink sink;
@@ -106,6 +117,29 @@ void phases() {
     assert(!phase.observe(false) && phase.routeLocked()); // rejected request stays uncertain
 }
 void recovery() {
+    uint64_t generation=0,nonce=0,sequence=0,epoch=0;
+    assert(bindConnection(1,17,generation,nonce,sequence,epoch));
+    // Focus emits four controls before any key callback.
+    for (unsigned i=1;i<=4;++i) assert(++sequence==i);
+    epoch=6;
+    assert(!bindConnection(1,17,generation,nonce,sequence,epoch));
+    assert(sequence==4 && epoch==6 && nonce==17);
+    assert(++sequence==5); // first-key boundary never regresses
+    assert(bindConnection(2,18,generation,nonce,sequence,epoch));
+    assert(sequence==0 && epoch==0 && nonce==18 && generation==2);
+    assert(++sequence==1);
+    assert(!bindConnection(2,18,generation,nonce,sequence,epoch));
+    assert(sequence==1);
+    assert(deferMapRefresh(false,false,false,false));
+    assert(deferMapRefresh(true,true,false,false));
+    assert(deferMapRefresh(true,false,true,false));
+    assert(deferMapRefresh(true,false,false,true));
+    assert(!deferMapRefresh(true,false,false,false));
+    int first=0,second=0;
+    assert(!preEventHold(true,&first,30,&first,30));
+    assert(preEventHold(true,&first,42,&first,30));
+    assert(preEventHold(true,&second,30,&first,30));
+    assert(!preEventHold(false,&second,30,&first,30));
     Router router; Sink sink; LockPhase phase;
     assert(router.add(1)); router.unlockConfirmed();
     // Observable stock duplicate-down ledger model, anchored to stock

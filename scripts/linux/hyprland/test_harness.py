@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,10 +11,56 @@ from runner_identity import admit
 from qmp_ready import probe
 from validate_guest import validate
 from qmp_qualification import QMP, step
+from peer_evidence import require_failure_outcome
+from validate_failure import validate as validate_failure
 from validate_qualification import require_ime_lock_exclusion, require_passive, require_restoration, validate_research, validate as validate_qualification
 
 
 class HarnessTests(unittest.TestCase):
+    def test_reporter_preserves_native_boundary_telemetry(self):
+        source = (Path(__file__).resolve().parents[3] / "native/hyprland/stock-hook-investigation.nix").read_text()
+        match = re.search(r"grep -E '([^']+)' \"\$log\"", source)
+        self.assertIsNotNone(match)
+        telemetry = ("[LOG] SLEDGE_RESEARCH_REGISTER device=1\n"
+                     "[LOG] SLEDGE_RESEARCH_EXIT modeled=26\n"
+                     "[LOG] SLEDGE_RESEARCH_BOUNDARY predicate=consumer_map count=26\n"
+                     "[LOG] SLEDGE_RESEARCH_BOUNDARY queued=0 queue_failed=0\n"
+                     "[LOG] SLEDGE_RESEARCH_CLOSE reason=layout count=1\n"
+                     "[LOG] SLEDGE_RESEARCH_FUTURE_TELEMETRY count=1\n"
+                     "[LOG] SLEDGE_WORKER hello_send=1 hello_ack=0\n"
+                     "SLEDGE_WORKER_PACKET direction=notify generation=1 hex=53485031\n")
+        result = subprocess.run(["grep", "-E", match[1]], input=telemetry, text=True,
+                                capture_output=True, check=True)
+        self.assertEqual(result.stdout, telemetry)
+
+    def test_failure_evidence_requires_same_nonce_reason8_and_replace(self):
+        evidence = ("reconciliation connection=1 nonce=9 scope={} accepted=true\n"
+                    "control connection=1 scope=Scope { nonce: 9 } body=Reset(8)\n"
+                    "outcome connection=1 nonce=9 generation=4 epoch=2 sequence=5 deadline=100 key=30 state=1 focus_epoch=3 focus_kind=1 decision=Replace { key: 48, modifiers: 0 } report=PartialUncertainFatal\n")
+        require_failure_outcome(evidence, "PartialUncertainFatal")
+        for bad in (evidence.replace("accepted=true", "accepted=false"),
+                    evidence.replace("nonce: 9", "nonce: 8"),
+                    evidence.replace("decision=Replace", "decision=Pass"),
+                    evidence.replace("generation=4", "generation=0"),
+                    evidence + evidence.splitlines()[-1] + "\n"):
+            with self.assertRaises(ValueError):
+                require_failure_outcome(bad, "PartialUncertainFatal")
+
+    def test_mods_failure_rejects_bare_target_up(self):
+        text = ("FAILURE_OBSERVATION_COMPLETED mods\n"
+                "EVIDENCE_FILE /tmp/replacement-peer-events\n"
+                "reconciliation connection=0 nonce=7 scope={} accepted=true\n"
+                "control connection=0 scope=Scope { nonce: 7 } body=Reset(8)\n"
+                "outcome connection=0 nonce=7 generation=1 epoch=2 sequence=3 deadline=100 key=30 state=1 focus_epoch=1 focus_kind=1 decision=Replace { key: 48, modifiers: 0 } report=PartialUncertainFatal\n"
+                "EVIDENCE_FILE /tmp/stock-consumer-events\nPHASE_BEGIN replacement-extra\n"
+                "key: 50; state: 1\nkey: 56; state: 0\nkey: 50; state: 0\n"
+                "PHASE_END replacement-extra\n")
+        with self.assertRaisesRegex(ValueError, "output/ownership"):
+            validate_failure(text, "mods")
+        for case in ("preflight", "mods", "down"):
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                validate_failure("", case)
+
     def test_ime_lock_exclusion_rejects_overlap_and_extra_keys(self):
         ime = "".join(f"IME_KEY code=30 state={i % 2} time={i}\n" for i in range(22))
         locker = "LOCK_KEY code=30 state=1 time=100 ack=1\nLOCK_KEY code=30 state=0 time=200 ack=1\n"

@@ -51,6 +51,9 @@ pub(super) fn bridge(transport: Transport) -> Bridge {
         epoch: 1,
         sequence: 0,
         retired: HashSet::new(),
+        previous_nonces: HashSet::new(),
+        awaiting_reconciliation: true,
+        locked: false,
     }
 }
 #[derive(Default)]
@@ -418,4 +421,135 @@ fn confirmed_focus_reset_is_reported_without_disconnect() {
     assert_eq!(handler.resets, 1);
     assert!(!handler.disconnected);
     assert!(handler.reports.is_empty());
+}
+
+#[test]
+fn reconciliation_control_is_global_once_current_epoch_and_not_locked() {
+    for mode in 0..4 {
+        let (transport, peer) = pair();
+        let mut bridge = bridge(transport);
+        let mut scope = scope();
+        scope.generation = 0;
+        match mode {
+            0 => {}
+            1 => scope.generation = 1,
+            2 => scope.lock_epoch = 0,
+            _ => bridge.locked = true,
+        }
+        raw(
+            &peer,
+            &Packet {
+                scope,
+                body: Body::Reset(8),
+            }
+            .encode()
+            .unwrap(),
+        );
+        let mut handler = Handler::default();
+        let result = bridge.research_step(&mut handler, scope.deadline_ns);
+        if mode == 0 {
+            result.unwrap();
+            assert_eq!(handler.resets, 1);
+            scope.sequence += 1;
+            raw(
+                &peer,
+                &Packet {
+                    scope,
+                    body: Body::Reset(8),
+                }
+                .encode()
+                .unwrap(),
+            );
+            assert!(
+                bridge
+                    .research_step(&mut handler, scope.deadline_ns)
+                    .is_err()
+            );
+        } else {
+            assert!(result.is_err());
+            assert_eq!(handler.resets, 0);
+        }
+    }
+}
+
+#[test]
+fn lifecycle_keymap_rearms_reason8_but_focus_and_duplicates_do_not() {
+    for reason in [2, 3] {
+        let (transport, peer) = pair();
+        let mut bridge = bridge(transport);
+        let mut handler = Handler::default();
+        let mut scope = scope();
+        scope.generation = 0;
+        for body in [Body::Reset(8), Body::Reset(reason), Body::Reset(8)] {
+            scope.deadline_ns = monotonic_ns().unwrap() + MAX_WAIT_NS;
+            raw(
+                &peer,
+                &Packet {
+                    scope,
+                    body: body.clone(),
+                }
+                .encode()
+                .unwrap(),
+            );
+            let result = bridge.research_step(&mut handler, scope.deadline_ns);
+            if scope.sequence == 3 && reason == 2 {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("unsolicited reconciliation reason8")
+                );
+            } else {
+                result.unwrap();
+            }
+            scope.sequence += 1;
+        }
+        if reason == 3 {
+            raw(
+                &peer,
+                &Packet {
+                    scope,
+                    body: Body::Reset(8),
+                }
+                .encode()
+                .unwrap(),
+            );
+            assert!(
+                bridge
+                    .research_step(&mut handler, scope.deadline_ns)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsolicited reconciliation reason8")
+            );
+        }
+    }
+}
+#[test]
+fn scope_diagnostics_are_specific_bounded_and_do_not_include_focus() {
+    for (mode, expected) in [
+        (0, "nonce mismatch"),
+        (1, "sequence not increasing"),
+        (2, "epoch mismatch"),
+        (3, "retired generation"),
+    ] {
+        let (transport, peer) = pair();
+        let mut bridge = bridge(transport);
+        let mut packet = packet();
+        match mode {
+            0 => packet.scope.nonce += 1,
+            1 => packet.scope.sequence = 0,
+            2 => packet.scope.lock_epoch = 0,
+            _ => {
+                bridge.retired.insert(packet.scope.generation);
+            }
+        }
+        raw(&peer, &packet.encode().unwrap());
+        let message = bridge
+            .research_step(&mut Handler::default(), packet.scope.deadline_ns)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(expected));
+        assert!(message.len() < 400);
+        assert!(!message.contains("app"));
+    }
 }

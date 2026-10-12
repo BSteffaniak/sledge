@@ -79,8 +79,45 @@ impl ResearchListener {
         };
         let mut bridge =
             Bridge::passive_handshake(transport, &self.identity, monotonic_ns()? + 10_000_000)?;
+        let nonce = bridge.connection_nonce();
+        {
+            let mut state = self.handler.matching.lock();
+            let MatchingState {
+                matcher, hyprland, ..
+            } = &mut *state;
+            hyprland.await_reconciliation(matcher, nonce);
+        }
         while !stopped.load(Ordering::Acquire) {
-            bridge.research_step_if_ready(&mut self.handler, monotonic_ns()? + 100_000_000)?;
+            if let Err(error) =
+                bridge.research_step_if_ready(&mut self.handler, monotonic_ns()? + 100_000_000)
+            {
+                // Preserve the same bridge/handler across admission so nonce
+                // history, retired generations and committed holds survive.
+                tracing::warn!(%error, "research transport lost; matching disabled until native reconciliation");
+                loop {
+                    if stopped.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let deadline = monotonic_ns()? + 100_000_000;
+                    match self.listener.accept(self.peer, deadline) {
+                        Ok(transport) => {
+                            bridge.reconnect(
+                                transport,
+                                &self.identity,
+                                monotonic_ns()? + 10_000_000,
+                            )?;
+                            let mut state = self.handler.matching.lock();
+                            let MatchingState {
+                                matcher, hyprland, ..
+                            } = &mut *state;
+                            hyprland.await_reconciliation(matcher, bridge.connection_nonce());
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
+                        Err(error) => return Err(error).context("research reconnect admission"),
+                    }
+                }
+            }
         }
         self.handler.disconnected();
         Ok(())
@@ -149,7 +186,12 @@ impl EventHandler for Handler {
         let MatchingState {
             matcher, hyprland, ..
         } = &mut *state;
-        hyprland.invalidate_speculation(matcher);
+        if matches!(body, Body::Reset(3)) {
+            hyprland.await_lifecycle_reconciliation(matcher, scope, body);
+        }
+        if !hyprland.reconciled(matcher, scope, body) {
+            hyprland.invalidate_speculation(matcher);
+        }
         if matches!(body, Body::Retire(_)) {
             hyprland.retire_device(matcher, scope.generation);
         }
@@ -263,6 +305,95 @@ when = { app_in = ["editor"] }
     fn wrong_focus_category_does_not_match_wayland_alias() {
         assert_eq!(handler().propose(scope(1), &event(1, 2)), Decision::Pass);
     }
+    #[test]
+    fn authenticated_recovery_boundary_is_required_after_disconnect() {
+        let mut handler = handler();
+        commit(&mut handler);
+        handler.disconnected();
+        {
+            let mut state = handler.matching.lock();
+            let MatchingState {
+                matcher, hyprland, ..
+            } = &mut *state;
+            hyprland.await_reconciliation(matcher, 2);
+        }
+        let boundary = Scope {
+            generation: 0,
+            nonce: 2,
+            ..scope(2)
+        };
+        handler.reset(boundary, &Body::Reset(0));
+        assert_eq!(
+            handler.propose(
+                Scope {
+                    nonce: 2,
+                    ..scope(3)
+                },
+                &event(1, 1)
+            ),
+            Decision::Pass
+        );
+        handler.reset(
+            Scope {
+                nonce: 1,
+                ..boundary
+            },
+            &Body::Reset(8),
+        );
+        assert_eq!(
+            handler.propose(
+                Scope {
+                    nonce: 2,
+                    ..scope(4)
+                },
+                &event(1, 1)
+            ),
+            Decision::Pass
+        );
+        handler.reset(boundary, &Body::Reset(8));
+        assert_eq!(
+            handler.propose(
+                Scope {
+                    nonce: 2,
+                    ..scope(5)
+                },
+                &event(1, 1)
+            ),
+            Decision::Replace {
+                key: 48,
+                modifiers: 0
+            }
+        );
+    }
+
+    #[test]
+    fn lifecycle_reconciliation_rearms_the_same_authenticated_session() {
+        let mut handler = handler();
+        {
+            let mut state = handler.matching.lock();
+            let MatchingState {
+                matcher, hyprland, ..
+            } = &mut *state;
+            hyprland.await_reconciliation(matcher, 1);
+        }
+        let boundary = Scope {
+            generation: 0,
+            ..scope(1)
+        };
+        handler.reset(boundary, &Body::Reset(8));
+        commit(&mut handler);
+        handler.reset(boundary, &Body::Reset(3));
+        assert_eq!(handler.propose(scope(3), &event(1, 1)), Decision::Pass);
+        handler.reset(boundary, &Body::Reset(8));
+        assert_eq!(
+            handler.propose(scope(4), &event(1, 1)),
+            Decision::Replace {
+                key: 48,
+                modifiers: 0
+            }
+        );
+    }
+
     #[test]
     fn reload_keeps_committed_hold() {
         let mut handler = handler();

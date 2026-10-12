@@ -1,6 +1,7 @@
 {
   peer,
   system ? builtins.currentSystem,
+  peerOptions ? { },
 }:
 let
   pkgs = import (builtins.fetchTarball {
@@ -32,7 +33,7 @@ let
     buildPhase = ''
       export PKG_CONFIG_PATH=${pkgs.hyprland.dev}/share/pkgconfig:$PKG_CONFIG_PATH
       c++ -std=c++23 -O2 -Wall -Wextra -Werror -pthread -fPIC -shared \
-        $(pkg-config --cflags hyprland) "$src/stock_adapter.cpp" -o passive.so
+        $(pkg-config --cflags hyprland libdrm) "$src/stock_adapter.cpp" -o passive.so
       c++ -std=c++23 -O2 -Wall -Wextra -Werror \
         $(pkg-config --cflags hyprland) "$src/stock_sdk_identity.cpp" -o stock-sdk-identity
     '';
@@ -43,7 +44,7 @@ let
     buildPhase = ''
       export PKG_CONFIG_PATH=${pkgs.hyprland.dev}/share/pkgconfig:$PKG_CONFIG_PATH
       c++ -std=c++23 -O2 -Wall -Wextra -Werror -pthread -fPIC -shared -DSLEDGE_STOCK_RESEARCH \
-        $(pkg-config --cflags hyprland) "$src/stock_adapter.cpp" -o passive.so
+        $(pkg-config --cflags hyprland libdrm) "$src/stock_adapter.cpp" -o passive.so
       c++ -std=c++23 -O2 -Wall -Wextra -Werror \
         $(pkg-config --cflags hyprland) "$src/stock_sdk_identity.cpp" -o stock-sdk-identity
     '';
@@ -87,7 +88,7 @@ let
     installPhase = "mkdir -p $out/bin; cp ime-grab-client $out/bin/ime-grab-client";
   };
   makeVm =
-    rollbackOnly: research: replacement:
+    rollbackOnly: research: replacement: failure:
     (import "${pkgs.path}/nixos" {
       system = "x86_64-linux";
       configuration = { lib, ... }: {
@@ -97,13 +98,29 @@ let
         users.users.probe.extraGroups = lib.mkAfter [ "dialout" ];
         environment.systemPackages = [
           pkgs.xorg.xev
+          pkgs.xorg.xprop
           pkgs.wev
           pkgs.wtype
           pkgs.python3
         ];
         systemd.services.hyprland-prerequisite.script = lib.mkForce ''
+          ${pkgs.lib.optionalString (
+            failure != ""
+          ) "export SLEDGE_STOCK_RESEARCH_FAIL_AFTER=${pkgs.lib.escapeShellArg failure}"}
+          export SLEDGE_STOCK_RESEARCH_WIRE_TRACE=1
+          export SLEDGE_FAILURE_FIXTURE=${failure}
+          export SLEDGE_FAILURE_SCRIPT=${../../scripts/linux/hyprland/stock-failure-guest.sh}
           export SLEDGE_REPLACEMENT_FIXTURE=${if replacement then "1" else "0"}
+          export SLEDGE_FIXTURE_X11_LIBRARY=${pkgs.xorg.libX11}/lib/libX11.so.6
+          export SLEDGE_FIXTURE_CLASS_SCRIPT=${../../scripts/linux/hyprland/set_fixture_class.py}
           export SLEDGE_REPLACEMENT_SCRIPT=${../../scripts/linux/hyprland/stock-replacement-guest.sh}
+          export SLEDGE_PEER_FAULT=${pkgs.lib.escapeShellArg (peerOptions.fault or "normal")}
+          export SLEDGE_PEER_INDEX=${toString (peerOptions.index or 1)}
+          export SLEDGE_PEER_DELAY_MS=${toString (peerOptions.delayMs or 20)}
+          export SLEDGE_PEER_CATEGORY=${pkgs.lib.escapeShellArg (peerOptions.category or "any")}
+          export SLEDGE_PEER_APP=${pkgs.lib.escapeShellArg (peerOptions.app or "")}
+          export SLEDGE_PEER_MODIFIERS=${pkgs.lib.escapeShellArg (peerOptions.modifiers or "none")}
+          export SLEDGE_PEER_RECONNECTS=${toString (peerOptions.reconnects or 0)}
           export SLEDGE_RESEARCH_PEER=${peer}/bin/hyprland_research_peer
           export SLEDGE_RESEARCH_FIXTURE=${if research then "1" else "0"}
           export SLEDGE_RESEARCH_PLUGIN=${researchPlugin}/passive.so
@@ -128,7 +145,7 @@ let
             test ! -f "$file" || cat "$file"
           done
           for log in /tmp/hyprland-prerequisite/hypr/*/hyprland.log; do
-            test ! -f "$log" || grep -E 'SLEDGE_RESEARCH_REGISTER|SLEDGE_RESEARCH_EXIT' "$log" || true
+            test ! -f "$log" || grep -E 'SLEDGE_RESEARCH_[A-Z_]+|SLEDGE_WORKER' "$log" || true
           done
           journalctl -b -u hyprland-prerequisite --no-pager | grep -E 'SLEDGE_|hook|Hook|plugin|Plugin|error' || true
           echo SLEDGE_STOCK_HOOK_REPORT_END_NOT_PARITY
@@ -136,10 +153,11 @@ let
         '';
       };
     }).vm;
-  vm = makeVm false false false;
-  rollbackVm = makeVm true false false;
-  researchVm = makeVm false true false;
-  replacementVm = makeVm false false true;
+  vm = makeVm false false false "";
+  rollbackVm = makeVm true false false "";
+  researchVm = makeVm false true false "";
+  failureVm = failure: makeVm false false true failure;
+  replacementVm = makeVm false false true "";
   makeRunner =
     guest:
     pkgs.writeShellApplication {
@@ -162,6 +180,9 @@ let
         exec bash ${../../scripts/linux/hyprland/vm-run.sh} "$@"
       '';
     };
+  preflightRunner = makeRunner (failureVm "preflight");
+  modsFailureRunner = makeRunner (failureVm "mods");
+  downFailureRunner = makeRunner (failureVm "down");
   replacementRunner = makeRunner replacementVm;
   researchRunner = makeRunner researchVm;
   runner = makeRunner vm;
@@ -169,8 +190,11 @@ let
 in
 {
   inherit
-    replacementRunner
+    preflightRunner
+    modsFailureRunner
+    downFailureRunner
     replacementVm
+    replacementRunner
     researchPlugin
     researchVm
     researchRunner

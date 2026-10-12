@@ -86,6 +86,26 @@ impl MatcherAdapter {
     pub fn invalidate_speculation(&mut self) {
         self.transactions.invalidate_speculation(&mut self.matcher);
     }
+    pub fn await_reconciliation(&mut self, nonce: u64) -> bool {
+        self.transactions
+            .await_reconciliation(&mut self.matcher, nonce)
+    }
+    pub fn reconciled(&mut self, scope: Scope, body: &super::wire::Body) -> bool {
+        self.transactions.reconciled(&mut self.matcher, scope, body)
+    }
+    pub fn await_lifecycle_reconciliation(
+        &mut self,
+        scope: Scope,
+        body: &super::wire::Body,
+    ) -> bool {
+        self.transactions
+            .await_lifecycle_reconciliation(&mut self.matcher, scope, body)
+    }
+    /// Retire only a native-reconciled generation; unrelated holds survive.
+    pub fn retire_device(&mut self, generation: u64) {
+        self.transactions
+            .retire_device(&mut self.matcher, generation);
+    }
     pub fn disconnected(&mut self) {
         self.transactions.disconnected(&mut self.matcher);
     }
@@ -97,6 +117,8 @@ impl MatcherAdapter {
 pub struct MatcherTransactions {
     pending: Option<Pending>,
     replacement_disabled: bool,
+    recovery_nonce: Option<u64>,
+    previous_recovery_nonce: Option<u64>,
 }
 impl MatcherTransactions {
     /// Propose synchronously using only the caller's category-aware alias result.
@@ -292,6 +314,63 @@ impl MatcherTransactions {
         );
         true
     }
+    /// Bind fresh authenticated Bridge nonce; does not clear committed holds.
+    /// Matching remains disabled until verified global Reset(reason8).
+    pub fn await_reconciliation(&mut self, matcher: &mut Matcher, nonce: u64) -> bool {
+        if nonce == 0
+            || self.previous_recovery_nonce == Some(nonce)
+            || self.recovery_nonce == Some(nonce)
+        {
+            return false;
+        }
+        self.invalidate_speculation(matcher);
+        self.replacement_disabled = true;
+        self.recovery_nonce = Some(nonce);
+        true
+    }
+    /// Arm same-nonce lifecycle recovery only for a healthy reconciled session.
+    /// Uncertainty still requires fresh authenticated reconnect; holds stay live
+    /// until a subsequent Bridge-verified global reason8.
+    pub fn await_lifecycle_reconciliation(
+        &mut self,
+        matcher: &mut Matcher,
+        scope: Scope,
+        body: &super::wire::Body,
+    ) -> bool {
+        if !matches!(body, super::wire::Body::Reset(3))
+            || scope.generation != 0
+            || self.replacement_disabled
+            || self.pending.is_some()
+            || self.previous_recovery_nonce != Some(scope.nonce)
+        {
+            return false;
+        }
+        self.invalidate_speculation(matcher);
+        self.replacement_disabled = true;
+        self.recovery_nonce = Some(scope.nonce);
+        true
+    }
+    /// Accept only Bridge-verified global reason8 for the bound fresh nonce.
+    /// Native attests quiescent physical/output holds and no synthetic uncertainty.
+    /// This is the ONLY recovery operation that clears holds/re-enables matching.
+    pub fn reconciled(
+        &mut self,
+        matcher: &mut Matcher,
+        scope: Scope,
+        body: &super::wire::Body,
+    ) -> bool {
+        if !matches!(body, super::wire::Body::Reset(8))
+            || scope.generation != 0
+            || self.recovery_nonce != Some(scope.nonce)
+        {
+            return false;
+        }
+        matcher.reset();
+        self.pending = None;
+        self.replacement_disabled = false;
+        self.previous_recovery_nonce = self.recovery_nonce.take();
+        true
+    }
     /// Native retirement is reported only after native output reconciliation.
     /// Clear this generation's matcher ownership, never unrelated devices.
     /// A pending proposal for that generation stays uncertain/disabled.
@@ -322,6 +401,7 @@ impl MatcherTransactions {
     /// reenable on reconnect, focus change, or a later acknowledgment.
     pub fn disconnected(&mut self, matcher: &mut Matcher) {
         self.invalidate_speculation(matcher);
+        self.recovery_nonce = None;
         self.replacement_disabled = true;
     }
 }

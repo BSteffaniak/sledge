@@ -482,3 +482,80 @@ fn wrong_release_outcome_preserves_consumed_hold_and_disables_future_proposals()
         Verdict::Swallow
     ));
 }
+
+#[test]
+fn only_fresh_nonce_global_reconciliation_reenables_and_clears_old_holds() {
+    let mut a = adapter(Action::SendKey {
+        key: KeyCode::KeyB,
+        mods: Modifiers::empty(),
+    });
+    let old = scope();
+    a.propose(old, &event(1), Some("app"), Instant::now())
+        .unwrap();
+    a.on_delivery(old, &report(ResultKind::Replaced));
+    a.disconnected();
+    assert!(a.await_reconciliation(8));
+    let mut fresh = old;
+    fresh.nonce = 8;
+    fresh.generation = 0;
+    assert!(!a.reconciled(fresh, &super::super::wire::Body::Reset(0)));
+    assert!(
+        a.propose(old, &event(1), Some("app"), Instant::now())
+            .is_err()
+    );
+    let mut stale = fresh;
+    stale.nonce = 7;
+    assert!(!a.reconciled(stale, &super::super::wire::Body::Reset(8)));
+    assert!(a.reconciled(fresh, &super::super::wire::Body::Reset(8)));
+    assert!(!a.reconciled(fresh, &super::super::wire::Body::Reset(8)));
+    fresh.generation = 1;
+    assert_eq!(
+        a.propose(fresh, &event(1), Some("app"), Instant::now())
+            .unwrap(),
+        Decision::Replace {
+            key: 48,
+            modifiers: 0
+        }
+    );
+    assert!(!a.await_reconciliation(8));
+}
+
+#[test]
+fn same_connection_lifecycle_boundary_preserves_hold_until_proof_and_cannot_cure_uncertainty() {
+    let mut a = adapter(Action::SendKey {
+        key: KeyCode::KeyB,
+        mods: Modifiers::empty(),
+    });
+    let mut scope = scope();
+    scope.generation = 0;
+    assert!(a.await_reconciliation(scope.nonce));
+    assert!(a.reconciled(scope, &super::super::wire::Body::Reset(8)));
+    scope.generation = 1;
+    a.propose(scope, &event(1), Some("app"), Instant::now())
+        .unwrap();
+    assert!(a.on_delivery(scope, &report(ResultKind::Replaced)));
+    scope.generation = 0;
+    assert!(!a.await_lifecycle_reconciliation(scope, &super::super::wire::Body::Reset(2)));
+    assert!(a.await_lifecycle_reconciliation(scope, &super::super::wire::Body::Reset(3)));
+    scope.generation = 1;
+    assert!(
+        a.propose(scope, &event(1), Some("app"), Instant::now())
+            .is_err()
+    );
+    scope.generation = 0;
+    assert!(a.reconciled(scope, &super::super::wire::Body::Reset(8)));
+    assert!(!a.reconciled(scope, &super::super::wire::Body::Reset(8)));
+    scope.generation = 1;
+    assert_eq!(
+        a.propose(scope, &event(1), Some("app"), Instant::now())
+            .unwrap(),
+        Decision::Replace {
+            key: 48,
+            modifiers: 0
+        }
+    );
+    assert!(a.on_delivery(scope, &DeliveryReport::Uncertain));
+    scope.generation = 0;
+    assert!(!a.await_lifecycle_reconciliation(scope, &super::super::wire::Body::Reset(3)));
+    assert!(!a.reconciled(scope, &super::super::wire::Body::Reset(8)));
+}

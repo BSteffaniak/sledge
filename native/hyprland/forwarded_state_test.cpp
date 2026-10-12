@@ -18,7 +18,17 @@ int main() {
     assert(keymap);
     auto* equivalent=xkb_keymap_new_from_names(context,&names,XKB_KEYMAP_COMPILE_NO_FLAGS);
     assert(equivalent && equivalent!=keymap && equivalentKeymap(keymap,equivalent));
+    // Media-first enumeration must not select aggregate XKB or deny an
+    // equivalent verified active typing map.
+    assert(!consumerKeymap(equivalent,true,true,true,false,false));
+    auto* selected=consumerKeymap(keymap,true,true,true,true,true);
+    assert(selected==keymap && equivalentKeymap(selected,equivalent));
+    assert(!consumerKeymap(keymap,false,true,true,true,true));
     assert(!equivalentKeymap(keymap,nullptr));
+    names.layout="de";
+    auto* incompatible=xkb_keymap_new_from_names(context,&names,XKB_KEYMAP_COMPILE_NO_FLAGS);
+    assert(incompatible && !equivalentKeymap(keymap,incompatible));
+    xkb_keymap_unref(incompatible);
     xkb_keymap_unref(equivalent);
     ForwardedKeyboardState state;
     Router router; Sink output;

@@ -7,6 +7,7 @@ struct MatchingHandler {
     adapter: MatcherAdapter,
     reports: Vec<DeliveryReport>,
     disconnected: bool,
+    fault: ResearchFault,
 }
 impl MatchingHandler {
     fn new() -> Self {
@@ -24,10 +25,14 @@ impl MatchingHandler {
             }]))),
             reports: vec![],
             disconnected: false,
+            fault: ResearchFault::None,
         }
     }
 }
 impl EventHandler for MatchingHandler {
+    fn research_fault(&mut self, _: Scope, _: &Event) -> ResearchFault {
+        self.fault
+    }
     fn propose(&mut self, scope: Scope, event: &Event) -> Decision {
         self.adapter
             .propose(scope, event, None, Instant::now())
@@ -313,4 +318,85 @@ fn lifecycle_release_allows_two_fresh_committed_replacements() {
         scope.sequence += 1;
     }
     assert!(!handler.disconnected);
+}
+
+#[test]
+fn selected_peer_faults_report_uncertain_and_never_replay() {
+    for fault in [
+        ResearchFault::DelayDecision(std::time::Duration::from_millis(20)),
+        ResearchFault::DropDecision,
+        ResearchFault::DisconnectBeforeDecision,
+        ResearchFault::DisconnectAfterDecision,
+    ] {
+        let (transport, peer) = super::tests::pair();
+        let mut bridge = super::tests::bridge(transport);
+        let mut handler = MatchingHandler::new();
+        handler.fault = fault;
+        let packet = super::tests::packet();
+        super::tests::raw(&peer, &packet.encode().unwrap());
+        assert!(
+            bridge
+                .research_step(&mut handler, packet.scope.deadline_ns)
+                .is_err()
+        );
+        assert_eq!(handler.reports, vec![DeliveryReport::Uncertain]);
+        assert!(handler.disconnected);
+        assert!(
+            handler
+                .adapter
+                .propose(packet.scope, &super::tests::event(), None, Instant::now())
+                .is_err()
+        );
+    }
+}
+#[test]
+fn explicit_reconnect_preserves_tombstones_and_uncertain_matcher_until_native_reconciliation() {
+    let (transport, peer) = super::tests::pair();
+    let mut bridge = super::tests::bridge(transport);
+    let mut handler = MatchingHandler::new();
+    bridge.retired.insert(42);
+    drop(peer);
+    assert!(
+        bridge
+            .research_step(&mut handler, monotonic_ns().unwrap() + MAX_WAIT_NS)
+            .is_err()
+    );
+    let identity = Identity {
+        capabilities: 0,
+        api_hash: "api".into(),
+        artifact: "artifact".into(),
+    };
+    for nonce in [7, 8, 7] {
+        let (transport, peer) = super::tests::pair();
+        let scope = Scope {
+            generation: 0,
+            lock_epoch: 0,
+            sequence: 0,
+            deadline_ns: 0,
+            nonce,
+        };
+        super::tests::raw(
+            &peer,
+            &Packet {
+                scope,
+                body: Body::Hello(identity.clone()),
+            }
+            .encode()
+            .unwrap(),
+        );
+        let result = bridge.reconnect(transport, &identity, monotonic_ns().unwrap() + MAX_WAIT_NS);
+        if nonce == 8 {
+            result.unwrap();
+            assert!(bridge.retired.contains(&42));
+            assert!(
+                handler
+                    .adapter
+                    .propose(scope, &super::tests::event(), None, Instant::now())
+                    .is_err()
+            );
+            bridge.transport.take();
+        } else {
+            assert!(result.is_err());
+        }
+    }
 }

@@ -73,7 +73,19 @@ Bodies (relative offsets; unused bytes zero):
   physical press ownership exists but duplicate seat key emission was suppressed.
   An original proposal's final outcome follows stock keybinding evaluation.
 - 7 Reset / 8 Retire, length8: u32 reason@0,reserved0@4. Reasons0connection,
-  1removal,2focus,3keymap,4overflow,5transport,6lock,7injection. Retire requires
+  1removal,2focus,3keymap,4overflow,5transport,6lock,7injection,
+  8reconciliation-complete (Reset only, generation0). Reason8 is an authenticated
+  fresh-nonce/current-epoch native proof boundary, never Hello/hash/generic reset.
+  Initial native admission may linearize after worker authentication and before
+  routing the first event: exact pre-event physical/Router/output quiescence,
+  unlocked, all devices accounted. Stock already updated the current physical
+  Down, so only that exact fresh transition is excluded; all other holds reject.
+  Queue reason8 before Event in the same ordered worker stream; correlated
+  Decision implies the peer consumed the preceding boundary. Unknown/unmapped
+  input revokes the connection; no generic reset re-enables matching. Each
+  authenticated reconnect uses a fresh nonce/monotonic worker generation and
+  the same pre-event boundary. Native ownership survives transport resets;
+  fatal/uncertain output blocks quiescence and is not automatically cleared. Retire requires
   nonzero generation; Reset0 invalidates all speculative transactions, nonzero
   invalidates that device's speculative scope. Neither erases committed physical
   press ownership. Retire additionally reconciles output and removes that device.

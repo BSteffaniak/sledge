@@ -6,6 +6,12 @@
 namespace sledge::hyprland {
 // Lifecycle only: serialization allocates. Keymaps created separately per device
 // can be equivalent; pointer identity is not a layout/admission qualification.
+// Select only the verified active typing consumer, never the first enumerated
+// media device. Lifecycle callers provide SDK/libinput qualification facts.
+inline xkb_keymap* consumerKeymap(xkb_keymap* active,bool physical,bool enabled,
+                                  bool allowed,bool hasA,bool hasShift) noexcept {
+    return physical && enabled && allowed && hasA && hasShift ? active : nullptr;
+}
 inline bool equivalentKeymap(xkb_keymap* first, xkb_keymap* second) {
     if (!first || !second) return false;
     if (first==second) return true;

@@ -33,6 +33,29 @@ inline bool decision(const WirePacket& event, const WirePacket& reply) noexcept 
     if (verdict != 2) return zero(reply,68,76);
     return get(reply,68,4)<768 && get(reply,72,4)<256;
 }
+enum class Opcode : unsigned { Event=3, Outcome=5, Reset=7, Retire=8, Lock=9 };
+struct Scope { uint64_t device,epoch,sequence,deadline,nonce; };
+inline void envelope(WirePacket& packet,Opcode opcode,unsigned length,Scope scope) noexcept {
+    packet={};packet[0]='S';packet[1]='H';packet[2]='P';packet[3]='1';
+    put(packet,4,2,1);put(packet,6,2,static_cast<unsigned>(opcode));put(packet,8,4,length);
+    put(packet,16,8,scope.device);put(packet,24,8,scope.epoch);put(packet,32,8,scope.sequence);
+    put(packet,40,8,scope.deadline);put(packet,48,8,scope.nonce);
+}
+inline bool control(WirePacket& packet,Opcode opcode,Scope scope,unsigned value) noexcept {
+    if (!scope.nonce || !scope.sequence || !scope.deadline ||
+        (opcode!=Opcode::Reset && opcode!=Opcode::Retire && opcode!=Opcode::Lock) ||
+        (opcode==Opcode::Lock && (value>2 || scope.device)) ||
+        (opcode==Opcode::Reset && (value>8 || (value==8 && scope.device))) ||
+        (opcode==Opcode::Retire && (value>7 || !scope.device))) return false;
+    envelope(packet,opcode,8,scope);put(packet,64,4,value);return true;
+}
+inline bool eventPacket(WirePacket& packet,Scope scope,unsigned key,unsigned state,
+                        unsigned time,unsigned mods,uint64_t focus) noexcept {
+    if (!scope.device || !scope.nonce || !scope.sequence || !scope.deadline || key>=768 || state>2 || mods>255) return false;
+    envelope(packet,Opcode::Event,32,scope);
+    put(packet,64,4,key);put(packet,68,4,state);put(packet,72,4,time);put(packet,76,4,mods);put(packet,80,8,focus);
+    return true;
+}
 inline bool hello(WirePacket& packet, uint64_t nonce, std::string_view hash, std::string_view artifact) noexcept {
     if (!nonce || hash.empty() || artifact.empty() || hash.size()>192 || artifact.size()>192) return false;
     // Our immutable ASCII identifiers are a strict UTF-8 subset, never daemon
