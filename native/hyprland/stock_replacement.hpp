@@ -26,6 +26,7 @@ public:
         for (unsigned i=0;i<names.size();++i) result+=",\""+std::string(names[i])+"\":"+std::to_string(rejected[i]);
         return result+"}";
     }
+    void invalidateFocusBindings() noexcept { bindings.fill({}); }
     OutputRecovery recovery;
     uint32_t observedCapabilities = 0;
     bool capabilitiesKnown = false;

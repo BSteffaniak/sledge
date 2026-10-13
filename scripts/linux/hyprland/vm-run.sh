@@ -51,6 +51,10 @@ if [[ -n ${SLEDGE_VM_PAYLOAD_SCRATCH:-} ]]; then
   fi
 fi
 # Namespace-local /tmp remains disposable; payload disk/state uses explicit scratch.
+mixed_opts=''
+if [[ -n ${SLEDGE_VM_PAYLOAD_SCRATCH:-} && -f $SLEDGE_VM_PAYLOAD_SCRATCH/root/sledge-payload/mixed-case ]]; then
+ mixed_opts='-device secondary-vga,id=display-a -device secondary-vga,id=display-b -device usb-kbd,bus=qualification-usb.0,id=mixed-usb,display=display-a -device virtio-keyboard-pci,id=mixed-virtio,display=display-b'
+fi
 timeout --signal=TERM --kill-after=3s 180s \
   bwrap --unshare-all --die-with-parent --new-session --clearenv \
   --ro-bind /nix/store /nix/store --ro-bind /sys /sys --proc /proc --dev /dev --tmpfs /tmp \
@@ -63,5 +67,5 @@ timeout --signal=TERM --kill-after=3s 180s \
     GBM_BACKENDS_PATH="${SLEDGE_VM_MESA:?use hyprland-vm-prepare}/lib/gbm" \
     LIBGL_DRIVERS_PATH="$SLEDGE_VM_MESA/lib/dri" \
     __EGL_VENDOR_LIBRARY_FILENAMES="$SLEDGE_VM_MESA/share/glvnd/egl_vendor.d/50_mesa.json" \
-    QEMU_OPTS="-machine accel=$accel -vga none -display egl-headless,rendernode=$node" \
+    QEMU_OPTS="-machine accel=$accel -vga none -display egl-headless,rendernode=$node $mixed_opts" \
     "${driver[@]}" "$vm"

@@ -10,6 +10,14 @@ use sledge_core::{
 };
 use std::time::Instant;
 
+/// Recovery progress, without exposing tokens or discarding ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryState {
+    Unbound,
+    AwaitingNativeProof,
+    FreshAdmissionRequired,
+    Ready,
+}
 /// A single outstanding opaque proposal; tokens never cross matcher instances.
 pub struct MatcherAdapter {
     matcher: Matcher,
@@ -337,7 +345,7 @@ impl MatcherTransactions {
         scope: Scope,
         body: &super::wire::Body,
     ) -> bool {
-        if !matches!(body, super::wire::Body::Reset(3))
+        if !matches!(body, super::wire::Body::Reset(2 | 3))
             || scope.generation != 0
             || self.replacement_disabled
             || self.pending.is_some()
@@ -386,6 +394,50 @@ impl MatcherTransactions {
             self.replacement_disabled = true;
         }
         matcher.reset_device(DeviceId(generation));
+    }
+    /// Validated already-unlocked epoch synchronization is speculation-only.
+    /// Exact enabled nonce/no pending proposal preserves matching and holds.
+    /// Uncertainty cannot be cured by an epoch synchronization packet.
+    pub fn observe_unlocked_epoch(&mut self, matcher: &mut Matcher, nonce: u64) {
+        if self.is_reconciled(nonce) && self.pending.is_none() {
+            matcher.invalidate_speculation();
+        } else {
+            self.observe_lock_boundary(matcher, nonce);
+        }
+    }
+    /// Validated lock/epoch controls may precede the first native reason8.
+    /// Preserve an exact already-armed proof wait; never cure uncertainty or
+    /// reset physical ownership. Enabled sessions require fresh admission.
+    pub fn observe_lock_boundary(&mut self, matcher: &mut Matcher, nonce: u64) {
+        if self.recovery_nonce == Some(nonce) && self.replacement_disabled && self.pending.is_none()
+        {
+            matcher.invalidate_speculation();
+        } else {
+            self.disconnected(matcher);
+        }
+    }
+    /// Bounded diagnostic distinguishing proof wait from transport uncertainty.
+    #[must_use]
+    pub const fn recovery_state(&self) -> RecoveryState {
+        if self.replacement_disabled {
+            if self.recovery_nonce.is_some() {
+                RecoveryState::AwaitingNativeProof
+            } else {
+                RecoveryState::FreshAdmissionRequired
+            }
+        } else if self.previous_recovery_nonce.is_some() {
+            RecoveryState::Ready
+        } else {
+            RecoveryState::Unbound
+        }
+    }
+    /// Only exact current-nonce native reconciliation enables matching.
+    #[must_use]
+    pub const fn is_reconciled(&self, nonce: u64) -> bool {
+        nonce != 0
+            && !self.replacement_disabled
+            && self.recovery_nonce.is_none()
+            && matches!(self.previous_recovery_nonce, Some(previous) if previous == nonce)
     }
     /// Uncertainty requires fresh admission, not an already armed reason8.
     /// This observation never clears matcher ownership.

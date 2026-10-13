@@ -114,11 +114,21 @@ public:
                     if (device.owners[key] == Owner::Forwarded) result |= modifier(key);
         return result;
     }
+    enum class BeginReject : unsigned { None, Device, Pending, Sequence, Locked, Fatal, Unmodeled, Key, State, Owned, Budget, Overflow };
+    BeginReject lastBeginReject=BeginReject::None;
+    static constexpr const char* beginRejectName(BeginReject reason) noexcept {
+        constexpr std::array<const char*,12> names{"none","device","pending","sequence","locked","fatal","unmodeled","key","state","owned","budget","overflow"};
+        return names[static_cast<unsigned>(reason)];
+    }
     std::optional<Ticket> begin(Event event, uint64_t now, uint64_t budgetNs) {
         auto* device = find(event.device);
-        if (!device || pending || sequence == UINT64_MAX || locked || fatal || !event.modeled || event.key >= keyCount || event.state != State::Down ||
-            device->owners[event.key] != Owner::None || budgetNs > 10'000'000 ||
-            now > UINT64_MAX - budgetNs) return std::nullopt;
+        lastBeginReject=!device ? BeginReject::Device : pending ? BeginReject::Pending :
+            sequence==UINT64_MAX ? BeginReject::Sequence : locked ? BeginReject::Locked :
+            fatal ? BeginReject::Fatal : !event.modeled ? BeginReject::Unmodeled :
+            event.key>=keyCount ? BeginReject::Key : event.state!=State::Down ? BeginReject::State :
+            device->owners[event.key]!=Owner::None ? BeginReject::Owned :
+            budgetNs>10'000'000 ? BeginReject::Budget : now>UINT64_MAX-budgetNs ? BeginReject::Overflow : BeginReject::None;
+        if (lastBeginReject!=BeginReject::None) return std::nullopt;
         pending = Ticket{event.device, epoch, focus, ++sequence, now + budgetNs, event.key};
         return pending;
     }
@@ -227,6 +237,7 @@ public:
     void revoke(Output& output) {
         pending.reset();
         ++epoch;
+        const auto beforeModifiers=forwardedModifiers();
         // Reconcile to the OLD focus before compositor changes to locker focus.
         std::array<bool, keyCount> released{};
         for (auto& device : devices)
@@ -238,7 +249,7 @@ public:
                 }
                 if (owner != Owner::None) owner = Owner::Quarantined;
             }
-        if (!output.reconcileModifiers(0)) fatal = true;
+        if (beforeModifiers && !output.reconcileModifiers(0)) fatal = true;
     }
     void lock(Output& output) { locked = true; revoke(output); }
     void unlockConfirmed() { ++epoch; ++focus; locked = false; }

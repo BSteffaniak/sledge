@@ -1,4 +1,4 @@
-//! Compile-pinned candidate admission. Normal builds embed no catalogue.
+//! Compile-pinned admission plus independent compile-pinned Supported acceptance.
 //! Scope markers are test-package guards, NOT sandbox/VM cryptographic proof.
 use super::session::{Qualification, VerifiedMetadata};
 use serde::Deserialize;
@@ -11,7 +11,7 @@ pub const FRESH_DOWN_SEND_KEY: u64 = 1;
 #[serde(deny_unknown_fields)]
 struct Policy {
     policy_revision: u64,
-    entries: Vec<Entry>,
+    entries: Vec<Admission>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,31 +20,101 @@ struct Entry {
     build_id: String,
     evidence_sha256: String,
     feature_mask: u64,
-    status: String,
     isolated_vm: bool,
     machine_id_sha256: String,
     boot_marker_path: PathBuf,
     boot_marker_sha256: String,
 }
+#[derive(Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum Admission {
+    Candidate(Entry),
+    Supported(SupportedEntry),
+}
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SupportedEntry {
+    descriptor_sha256: String,
+    build_id: String,
+    evidence_sha256: String,
+    qualification_revision: u64,
+    feature_mask: u64,
+    approval_revision: u64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Acceptance {
+    acceptance_revision: u64,
+    entries: Vec<SupportedEntry>,
+}
+impl Admission {
+    fn identity(&self) -> (&str, &str) {
+        match self {
+            Self::Candidate(e) => (&e.descriptor_sha256, &e.build_id),
+            Self::Supported(e) => (&e.descriptor_sha256, &e.build_id),
+        }
+    }
+    fn qualification(&self) -> Qualification {
+        match self {
+            Self::Candidate(_) => Qualification::Candidate,
+            Self::Supported(_) => Qualification::Supported,
+        }
+    }
+    fn feature_mask(&self) -> u64 {
+        match self {
+            Self::Candidate(e) => e.feature_mask,
+            Self::Supported(e) => e.feature_mask,
+        }
+    }
+    fn verify(&self) -> io::Result<()> {
+        match self {
+            Self::Candidate(e) => verify_scope(e),
+            Self::Supported(e) => verify_acceptance(
+                e,
+                include_bytes!(concat!(env!("OUT_DIR"), "/hyprland-acceptance.json")),
+                env!("SLEDGE_EMBEDDED_ACCEPTANCE_SHA256"),
+            ),
+        }
+    }
+}
+fn verify_acceptance(entry: &SupportedEntry, bytes: &[u8], pin: &str) -> io::Result<()> {
+    if bytes.is_empty() || bytes.len() > 65536 || !hex(pin) || digest(bytes) != pin {
+        return Err(denied("missing/mismatched compiled acceptance"));
+    }
+    let acceptance: Acceptance =
+        serde_json::from_slice(bytes).map_err(|_| denied("invalid acceptance schema"))?;
+    if acceptance.acceptance_revision != 1
+        || acceptance.entries.len() > 16
+        || acceptance.entries.iter().filter(|e| *e == entry).count() != 1
+    {
+        return Err(denied("supported binding not independently accepted"));
+    }
+    Ok(())
+}
 /// Opaque result from embedded policy + verified actual metadata + scope guard.
 pub struct AdmittedMetadata {
     pub(super) metadata: VerifiedMetadata,
     pub(super) feature_mask: u64,
+    qualification: Qualification,
 }
 impl AdmittedMetadata {
     #[must_use]
     pub const fn qualification(&self) -> Qualification {
-        Qualification::Candidate
+        self.qualification
     }
     #[must_use]
     pub const fn feature_mask(&self) -> u64 {
         self.feature_mask
     }
-    /// Candidates are never supported host registrations.
+    /// Only independently accepted Supported metadata qualifies host capture.
     /// # Errors
-    /// Always rejects Candidate; accepted policy remains disabled.
+    /// Rejects Candidate; normal builds contain no accepted registration.
     pub fn require_qualified(&self) -> io::Result<()> {
-        Err(denied("candidate is not supported host qualification"))
+        if self.qualification == Qualification::Supported {
+            Ok(())
+        } else {
+            Err(denied("candidate is not supported host qualification"))
+        }
     }
 }
 pub struct Catalogue;
@@ -57,7 +127,7 @@ impl Catalogue {
             &metadata.descriptor_digest,
             &metadata.descriptor().build_id,
         )?;
-        verify_scope(&entry)
+        entry.verify()
     }
     /// Admit using ONLY embedded policy. No runtime policy path or trusted bool.
     /// # Errors
@@ -75,10 +145,11 @@ impl Catalogue {
             &metadata.descriptor_digest,
             &metadata.descriptor().build_id,
         )?;
-        verify_scope(&entry)?;
+        entry.verify()?;
         Ok(AdmittedMetadata {
             metadata,
-            feature_mask: entry.feature_mask,
+            feature_mask: entry.feature_mask(),
+            qualification: entry.qualification(),
         })
     }
 }
@@ -94,35 +165,49 @@ fn hex(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn select(bytes: &[u8], pin: &str, descriptor: &str, build: &str) -> io::Result<Entry> {
+fn select(bytes: &[u8], pin: &str, descriptor: &str, build: &str) -> io::Result<Admission> {
     if bytes.is_empty() || bytes.len() > 65536 || !hex(pin) || digest(bytes) != pin {
         return Err(denied("missing/mismatched compile-pinned catalogue"));
     }
     let policy: Policy =
         serde_json::from_slice(bytes).map_err(|_| denied("invalid catalogue schema"))?;
-    if policy.policy_revision != 1 || policy.entries.len() > 16 {
+    if !matches!(policy.policy_revision, 1 | 2) || policy.entries.len() > 16 {
         return Err(denied("unsupported catalogue policy revision/budget"));
     }
     let mut entries = policy
         .entries
         .into_iter()
-        .filter(|e| e.descriptor_sha256 == descriptor && e.build_id == build);
+        .filter(|e| e.identity() == (descriptor, build));
     let entry = entries
         .next()
         .ok_or_else(|| denied("descriptor not in compiled catalogue"))?;
     if entries.next().is_some() {
         return Err(denied("ambiguous catalogue descriptor"));
     }
-    if entry.status != "candidate"
-        || !entry.isolated_vm
-        || entry.feature_mask != FRESH_DOWN_SEND_KEY
-        || !hex(&entry.descriptor_sha256)
-        || !hex(&entry.evidence_sha256)
-        || !hex(&entry.machine_id_sha256)
-        || !hex(&entry.boot_marker_sha256)
-        || !entry.boot_marker_path.is_absolute()
-    {
-        return Err(denied("unsupported candidate status/features/scope"));
+    match &entry {
+        Admission::Candidate(e) => {
+            if !e.isolated_vm
+                || e.feature_mask != FRESH_DOWN_SEND_KEY
+                || !hex(&e.descriptor_sha256)
+                || !hex(&e.evidence_sha256)
+                || !hex(&e.machine_id_sha256)
+                || !hex(&e.boot_marker_sha256)
+                || !e.boot_marker_path.is_absolute()
+            {
+                return Err(denied("unsupported candidate features/scope"));
+            }
+        }
+        Admission::Supported(e) => {
+            if policy.policy_revision != 2
+                || e.qualification_revision != 1
+                || e.feature_mask != FRESH_DOWN_SEND_KEY
+                || e.approval_revision == 0
+                || !hex(&e.descriptor_sha256)
+                || !hex(&e.evidence_sha256)
+            {
+                return Err(denied("unsupported supported revision/features"));
+            }
+        }
     }
     Ok(entry)
 }
@@ -158,6 +243,63 @@ fn verify_scope(e: &Entry) -> io::Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn supported_requires_separate_exact_pinned_acceptance() {
+        let d = "a".repeat(64);
+        let b = format!("sledge-stock-v1:{}", "b".repeat(64));
+        let binding = serde_json::json!({"descriptor_sha256":d,"build_id":b,"evidence_sha256":"c".repeat(64),"qualification_revision":1,"feature_mask":1,"approval_revision":9});
+        let mut entry = binding.clone();
+        entry["status"] = serde_json::json!("supported");
+        let policy = serde_json::json!({"policy_revision":2,"entries":[entry]});
+        let bytes = serde_json::to_vec(&policy).unwrap();
+        let admitted = select(&bytes, &digest(&bytes), &d, &b).unwrap();
+        let Admission::Supported(selected) = admitted else {
+            panic!("wrong variant")
+        };
+        assert!(verify_acceptance(&selected, b"", "").is_err());
+        let record = serde_json::json!({"acceptance_revision":1,"entries":[binding]});
+        let approval = serde_json::to_vec(&record).unwrap();
+        assert!(verify_acceptance(&selected, &approval, &digest(&approval)).is_ok());
+        assert!(verify_acceptance(&selected, &approval, &"0".repeat(64)).is_err());
+        for field in [
+            "descriptor_sha256",
+            "build_id",
+            "evidence_sha256",
+            "approval_revision",
+            "feature_mask",
+            "qualification_revision",
+        ] {
+            let mut bad = record.clone();
+            bad["entries"][0][field] = if matches!(
+                field,
+                "approval_revision" | "feature_mask" | "qualification_revision"
+            ) {
+                serde_json::json!(2)
+            } else {
+                serde_json::json!("f".repeat(64))
+            };
+            let approval = serde_json::to_vec(&bad).unwrap();
+            assert!(
+                verify_acceptance(&selected, &approval, &digest(&approval)).is_err(),
+                "{field}"
+            );
+        }
+        for (field, value) in [
+            ("isolated_vm", serde_json::json!(true)),
+            ("feature_mask", serde_json::json!(15)),
+            ("qualification_revision", serde_json::json!(2)),
+            ("approval_revision", serde_json::json!(0)),
+        ] {
+            let mut bad = policy.clone();
+            bad["entries"][0][field] = value;
+            let bytes = serde_json::to_vec(&bad).unwrap();
+            assert!(select(&bytes, &digest(&bytes), &d, &b).is_err());
+        }
+        let mut bad = policy;
+        bad["policy_revision"] = serde_json::json!(1);
+        let bytes = serde_json::to_vec(&bad).unwrap();
+        assert!(select(&bytes, &digest(&bytes), &d, &b).is_err());
+    }
+    #[test]
     fn catalogue_pins_exact_descriptor_revision_features_and_candidate_status() {
         let d = "a".repeat(64);
         let b = format!("sledge-stock-v1:{}", "b".repeat(64));
@@ -177,7 +319,7 @@ mod tests {
             assert!(select(&bytes, &digest(&bytes), &d, &b).is_err());
         }
         let mut bad = value;
-        bad["policy_revision"] = serde_json::json!(2);
+        bad["policy_revision"] = serde_json::json!(3);
         let bytes = serde_json::to_vec(&bad).unwrap();
         assert!(select(&bytes, &digest(&bytes), &d, &b).is_err());
     }

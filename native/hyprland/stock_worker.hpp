@@ -48,6 +48,7 @@ private:
         ++traceCount;
     }
     std::atomic<bool> transactionActive{false}, parked{false};
+    std::atomic<uint64_t> retirementGeneration{0},closedGeneration{0};
     std::atomic<bool> parkRequested{false};
     std::jthread thread;
     static bool wait(int fd, short events, uint64_t deadline) noexcept {
@@ -168,11 +169,22 @@ private:
         if (stop.stop_requested()) count(Reason::Stopped);
         ready.store(false,std::memory_order_release);
         close(fd);
+        closedGeneration.store(generation,std::memory_order_release);
     }
     void run(std::stop_token stop,const std::string& path,WirePacket hello) {
         const auto seed=wire::get(hello,48,8);
         for (uint64_t generation=1; !stop.stop_requested() && generation; ++generation) {
             if (parkRequested.load(std::memory_order_acquire)) {
+                // runConnection has returned: the old socket is closed and no
+                // transaction can still emit. Only an owner-verified drain
+                // barrier may settle receipts scoped to that generation.
+                const auto retired=retirementGeneration.load(std::memory_order_acquire);
+                if (retired && mailbox.idle() && !transactionActive.load(std::memory_order_acquire)) {
+                    auto read=readIndex.load(std::memory_order_relaxed);
+                    const auto write=writeIndex.load(std::memory_order_acquire);
+                    while (read!=write && notifications[read%notifications.size()].generation==retired) ++read;
+                    readIndex.store(read,std::memory_order_release);
+                }
                 if (mailbox.idle()) parked.store(true,std::memory_order_release);
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 --generation;continue;
@@ -213,8 +225,21 @@ public:
         return true;
     }
     void requestPark() noexcept { parkRequested.store(true,std::memory_order_release); }
+    // Caller must have disabled admission and proved physical/output ledgers
+    // released, with no uncertainty or mailbox obligation. This retires receipt
+    // delivery to a closed generation, NEVER acknowledges remote receipt.
+    bool retireGenerationForDrain(uint64_t generation,bool ownerVerifiedBarrier) noexcept {
+        if (!ownerVerifiedBarrier || !generation || generation!=this->generation() ||
+            !parkRequested.load(std::memory_order_acquire) || !mailbox.idle()) return false;
+        if (retirementGeneration.load(std::memory_order_acquire)==generation) return true;
+        retirementGeneration.store(generation,std::memory_order_release);
+        invalidate(); // close before queue retirement, also prevents reconnect
+        return true;
+    }
     bool idleParked() const noexcept {
-        return parked.load(std::memory_order_acquire) && mailbox.idle() &&
+        const auto retired=retirementGeneration.load(std::memory_order_acquire);
+        return (!retired || closedGeneration.load(std::memory_order_acquire)>=retired) &&
+            parked.load(std::memory_order_acquire) && mailbox.idle() &&
             !transactionActive.load(std::memory_order_acquire) &&
             readIndex.load(std::memory_order_acquire)==writeIndex.load(std::memory_order_acquire);
     }

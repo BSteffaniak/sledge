@@ -2,6 +2,8 @@
 // SLEDGE_STOCK_RESEARCH adds explicit isolated lock-quarantine fixture only.
 // Both advertise capabilities zero; no replacement or production admission.
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
+#include "timing_metrics.hpp"
+#include "enter_completion.hpp"
 #include "startup_output.hpp"
 #include "output_reconciliation.hpp"
 #include "drain_state.hpp"
@@ -11,10 +13,13 @@
 #define SLEDGE_STOCK_RESEARCH
 static_assert(sledge::hyprland::validBuildId(),"production package must supply canonical build ID");
 #endif
-#if defined(SLEDGE_STOCK_CANDIDATE) && !defined(SLEDGE_STOCK_PRODUCTION)
-#error "candidate requires production target"
+#if defined(SLEDGE_STOCK_CANDIDATE) && defined(SLEDGE_STOCK_QUALIFIED)
+#error "candidate and qualified targets are mutually exclusive"
 #endif
-#ifdef SLEDGE_STOCK_CANDIDATE
+#if (defined(SLEDGE_STOCK_CANDIDATE) || defined(SLEDGE_STOCK_QUALIFIED)) && !defined(SLEDGE_STOCK_PRODUCTION)
+#error "admitted target requires production"
+#endif
+#if defined(SLEDGE_STOCK_CANDIDATE) || defined(SLEDGE_STOCK_QUALIFIED)
 #include "candidate_gate.hpp"
 #endif
 #include "stock_worker.hpp"
@@ -49,6 +54,7 @@ struct PassiveOutput : Output {
     bool reconcileModifiers(uint8_t) override { return false; }
 };
 struct Adapter {
+    DurationMetrics callbackTiming,mailboxTiming,commitTiming;
     HANDLE ownerHandle;
     bool drainDispatcherInstalled=false;
     SP<CEventLoopTimer> registryTimer;
@@ -65,11 +71,15 @@ struct Adapter {
 #ifdef SLEDGE_STOCK_RESEARCH
     std::unique_ptr<ResearchRoute> research;
     StockReplacement replacement;
+    bool routerBootstrapPending=true;
+    std::array<uint64_t,11> eligibility{}; // modeled, consumer, proof, worker, map, ticket, event, reply
     bool replacementWire = false;
     enum class CloseSource : unsigned { NewKeyboard, DestroyKeyboard, Layout, ConsumerChanged, OutcomeQueue, UnknownInput, Count };
     std::array<uint64_t,static_cast<unsigned>(CloseSource::Count)> closeSources{};
     uint64_t compatibleLifecycle=0;
     bool startupOutputPending=true;
+    CWlSurface* enterSurface=nullptr;
+    EnterCompletion* enterCompletion=nullptr;
     bool startupReplay=false;
     bool lifecycleDirty=false;
     bool initialReconciled = false;
@@ -124,6 +134,8 @@ void reconcileStartupOutput() {
     adapter->startupReplay=false;
     adapter->startupOutputPending=!adapter->replacement.recoveryBindingQualified(research);
 }
+void beginLifecycle();
+void reconcileInitial(const IKeyboard* entering=nullptr,uint32_t enteringKey=keyCount);
 void installRegistryRetry() {
     adapter->research->forEachMap([](xkb_keymap* map) { (void)adapter->replacement.prepare(map); });
     adapter->registryTimer=makeShared<CEventLoopTimer>(std::chrono::milliseconds(50),
@@ -145,19 +157,20 @@ void installRegistryRetry() {
                 (void)adapter->research->selectConsumer(active);
                 (void)adapter->replacement.select(active->m_xkbKeymap);
             }
-            if (previous!=adapter->research->registeredCount) adapter->initialReconciled=false;
+            if (previous!=adapter->research->registeredCount) beginLifecycle();
             reconcileStartupOutput();
+            reconcileInitial();
             timer->updateTimeout(std::chrono::milliseconds(50));
         },nullptr);
     g_pEventLoopManager->addTimer(adapter->registryTimer);
 }
-bool nativeOutputReconciled(bool allowRetiredRecovery=false) {
+bool nativeOutputReconciled(bool allowRetiredRecovery=false,bool retiring=false) {
     const auto& research=*adapter->research;
     bool held=false;
     for (const auto key : research.forwarded.focusEnterKeys()) held=held || key;
-    return outputReconciled(adapter->stockLedger.empty(),research.consumerMapKnown(),held,
-        research.forwarded.depressed()!=0,!allowRetiredRecovery && adapter->replacement.recovery.pending()) &&
-        !adapter->lifecycleDirty && !adapter->startupOutputPending;
+    return outputBoundaryReady(outputReconciled(adapter->stockLedger.empty(),research.consumerMapKnown(),held,
+        research.forwarded.depressed()!=0,!allowRetiredRecovery && adapter->replacement.recovery.pending()),
+        adapter->lifecycleDirty,adapter->startupOutputPending,retiring);
 }
 void installDrainControls(HANDLE handle) {
     if (!HyprlandAPI::addDispatcherV2(handle,"sledge:drain",[](std::string argument) {
@@ -175,10 +188,11 @@ void installDrainControls(HANDLE handle) {
             if (!adapter->drain.detached()) {
                 if (!adapter->drain.active()) blocked="not_draining";
                 else if (!adapter->research->physicalQuiescent()) blocked="physical_or_output";
-                else if (!nativeOutputReconciled()) blocked="output_unreconciled";
+                else if (!nativeOutputReconciled(false,true)) blocked="output_unreconciled";
                 else if (!adapter->mailbox.idle()) blocked="mailbox";
                 else if (adapter->worker) {
                     adapter->worker->requestPark();
+                    (void)adapter->worker->retireGenerationForDrain(adapter->worker->generation(),true);
                     if (!adapter->worker->idleParked()) blocked="worker";
                 }
                 (void)adapter->drain.commit(std::string_view(blocked)=="none");
@@ -193,6 +207,26 @@ void installDrainControls(HANDLE handle) {
                 ",\"native_operational\":"+(!adapter->startupOutputPending && adapter->initialReconciled && adapter->worker && adapter->worker->connected() ? "true" : "false")+
                 ",\"replacement_capabilities_known\":"+(adapter->replacement.capabilitiesKnown ? "true" : "false")+
                 ",\"replacement_capabilities\":"+std::to_string(adapter->replacement.observedCapabilities)+
+                ",\"eligibility\":{\"modeled\":"+std::to_string(adapter->eligibility[0])+
+                ",\"consumer_mismatch\":"+std::to_string(adapter->eligibility[1])+
+                ",\"unreconciled\":"+std::to_string(adapter->eligibility[2])+
+                ",\"worker_not_ready\":"+std::to_string(adapter->eligibility[3])+
+                ",\"map_unknown\":"+std::to_string(adapter->eligibility[4])+
+                ",\"tickets\":"+std::to_string(adapter->eligibility[5])+
+                ",\"event_attempts\":"+std::to_string(adapter->eligibility[6])+
+                ",\"down_replies\":"+std::to_string(adapter->eligibility[7])+
+                ",\"draining\":"+std::to_string(adapter->eligibility[8])+
+                ",\"mode_closed\":"+std::to_string(adapter->eligibility[9])+
+                ",\"route_locked\":"+std::to_string(adapter->eligibility[10])+
+                ",\"begin_last_reject\":\""+Router::beginRejectName(adapter->research->router.lastBeginReject)+"\"}"+
+                ",\"boundary_last_block\":"+std::to_string(static_cast<unsigned>(adapter->research->admissionBlock(nullptr,keyCount)))+
+                ",\"output_recovery_pending\":"+(adapter->replacement.recovery.pending() ? "true" : "false")+
+                ",\"router_fatal\":"+(adapter->research->router.diagnostics().fatal ? "true" : "false")+
+                ",\"router_locked\":"+(adapter->research->router.diagnostics().locked ? "true" : "false")+
+                ",\"timing\":{\"unit\":\"ns\",\"bucket_upper_ns\":[100000,500000,1000000,2000000,5000000,9000000,10000000,20000000],\"ticket_budget_ns\":"+
+                std::to_string(ticketBudgetNs)+",\"commit_reserve_ns\":"+std::to_string(commitReserveNs)+
+                ",\"callback\":"+adapter->callbackTiming.json()+",\"mailbox\":"+adapter->mailboxTiming.json()+
+                ",\"commit\":"+adapter->commitTiming.json()+"}"+
                 ",\"replacement_preflight\":"+adapter->replacement.preflightStatus()+"}";
         }});
     if (!adapter->statusCommand) throw std::runtime_error("cannot register drain status");
@@ -215,6 +249,23 @@ bool ensureConnectionBinding() {
         adapter->research->router.disconnect(adapter->research->output);
     }
     return true;
+}
+void reconcileInitial(const IKeyboard* entering,uint32_t enteringKey) {
+    if (adapter->drain.active() || !adapter->replacementWire) return;
+    auto& research=*adapter->research;
+    research.syncUnlock(PROTO::sessionLock->isLocked());
+    initialBoundary(adapter->initialReconciled,[] { return ensureConnectionBinding(); },
+        [&] {
+            const bool proof=nativeOutputReconciled() &&
+                adapter->replacement.recoveryBindingQualified(research) && research.physicalQuiescent(entering,enteringKey);
+            return proof && bootstrapRouter(research.router,adapter->routerBootstrapPending,proof,!research.phase.routeLocked());
+        },
+        [&] {
+            const bool queued=lifecycle(nullptr,7,0,8);
+            if (queued) ++research.boundaryQueued;
+            else ++research.boundaryQueueFailed;
+            return queued;
+        });
 }
 void closeStream(Adapter::CloseSource source) {
     ++adapter->closeSources[static_cast<unsigned>(source)];
@@ -326,6 +377,7 @@ void focusedIdentity(WirePacket& packet) {
 void inputKey(CInputManager* self, const IKeyboard::SKeyEvent& event, SP<IKeyboard> keyboard) {
     if (adapter->drain.detached()) { reinterpret_cast<void (*)(CInputManager*,const IKeyboard::SKeyEvent&,SP<IKeyboard>)>(adapter->hooks.original(StockHooks::InputKey))(self,event,keyboard); return; }
 
+    ScopedDuration callbackDuration(adapter->callbackTiming,monotonicNs()+ticketBudgetNs);
 #ifdef SLEDGE_STOCK_RESEARCH
     auto* research=adapter->research.get();
     if (research && !research->current) {
@@ -335,18 +387,31 @@ void inputKey(CInputManager* self, const IKeyboard::SKeyEvent& event, SP<IKeyboa
         }
         (void)ensureConnectionBinding();
         tryOutputRecovery();
-        if (adapter->drain.mayPropose() && adapter->replacementWire && !adapter->initialReconciled) {
-            if (!adapter->worker || !adapter->worker->connected()) ++research->boundaryNotReady;
-            else if (nativeOutputReconciled() && research->physicalQuiescent(keyboard.get(),event.state==WL_KEYBOARD_KEY_STATE_PRESSED ? event.keycode : keyCount)) {
-                adapter->initialReconciled=lifecycle(nullptr,7,0,8);
-                if (adapter->initialReconciled) ++research->boundaryQueued;
-                else ++research->boundaryQueueFailed;
-            }
-        }
         const auto preConsumer=g_pSeatManager->m_keyboard.lock();
-        if (preConsumer!=keyboard && adapter->initialReconciled) beginLifecycle();
+        const auto diagnostics=research->router.diagnostics();
+        const bool consistent=preConsumer && keyboard &&
+            preConsumer->m_modifiersState.latched==research->forwarded.latched() &&
+            preConsumer->m_modifiersState.locked==research->forwarded.locked() &&
+            preConsumer->m_modifiersState.group==research->forwarded.group() &&
+            keyboard->m_modifiersState.latched==research->forwarded.latched() &&
+            keyboard->m_modifiersState.locked==research->forwarded.locked() &&
+            keyboard->m_modifiersState.group==research->forwarded.group();
+        const ConsumerSelectionProof selection{
+            adapter->initialReconciled,adapter->worker && adapter->worker->connected(),
+            research->sameConsumerMap(preConsumer,keyboard),adapter->replacement.recoveryBindingQualified(*research),
+            consistent,diagnostics.pending || research->current.has_value(),
+            diagnostics.locked || research->phase.routeLocked(),
+            diagnostics.fatal || research->revoking || adapter->lifecycleDirty || adapter->startupOutputPending ||
+                adapter->replacement.recovery.pending()};
+        if (preConsumer!=keyboard && adapter->replacement.preparedFor(keyboard->m_xkbKeymap) &&
+            research->selectConsumer(keyboard) && adapter->replacement.select(keyboard->m_xkbKeymap)) {
+            if (!selection.retainsAdmission()) beginLifecycle();
+            g_pSeatManager->setKeyboard(keyboard);
+        }
+        reconcileInitial(keyboard.get(),event.state==WL_KEYBOARD_KEY_STATE_PRESSED ? event.keycode : keyCount);
         auto modeled=research->event(keyboard,event.keycode,event.state==WL_KEYBOARD_KEY_STATE_PRESSED);
         if (modeled) {
+            ++adapter->eligibility[0];
             // Replacement can precede stock setKeyboard; project the target
             // consumer's prepared map before modifier preflight, never allocate.
             if (adapter->replacement.preparedFor(keyboard->m_xkbKeymap)) {
@@ -364,9 +429,16 @@ void inputKey(CInputManager* self, const IKeyboard::SKeyEvent& event, SP<IKeyboa
             Adapter::TransactionOutput transaction(*adapter);
             const auto activeConsumer=g_pSeatManager->m_keyboard.lock();
             const bool consumerAlreadySelected=activeConsumer==keyboard;
+            if (!adapter->drain.mayPropose()) ++adapter->eligibility[8];
+            if (!adapter->replacementWire) ++adapter->eligibility[9];
+            if (research->phase.routeLocked()) ++adapter->eligibility[10];
+            if (!consumerAlreadySelected) ++adapter->eligibility[1];
+            if (!adapter->initialReconciled) ++adapter->eligibility[2];
+            if (!adapter->worker || !adapter->worker->connected()) ++adapter->eligibility[3];
+            if (!research->consumerMapKnown()) ++adapter->eligibility[4];
             if (adapter->drain.mayPropose() && consumerAlreadySelected && adapter->replacementWire && adapter->worker && adapter->worker->connected() && adapter->initialReconciled && research->consumerMapKnown() && !research->phase.routeLocked()) {
-                ticket=modeled->state==State::Down ? research->router.begin(*modeled,monotonicNs(),10'000'000) :
-                    research->router.settlement(*modeled,monotonicNs(),10'000'000);
+                ticket=modeled->state==State::Down ? research->router.begin(*modeled,monotonicNs(),ticketBudgetNs) :
+                    research->router.settlement(*modeled,monotonicNs(),ticketBudgetNs);
                 if (ticket) {
                     if (ticket->epoch!=adapter->wireEpoch) {
                         WirePacket epochAdvance{};
@@ -377,19 +449,27 @@ void inputKey(CInputManager* self, const IKeyboard::SKeyEvent& event, SP<IKeyboa
                     }
                 }
                 if (ticket) {
+                    ++adapter->eligibility[5];
                     auto& packet=adapter->eventPacket;
                     (void)wire::eventPacket(packet,{ticket->device,ticket->epoch,++adapter->wireSequence,ticket->deadline,adapter->nonce},
                         modeled->key,static_cast<unsigned>(modeled->state),event.timeMs,research->router.forwardedModifiers(),ticket->focus);
                     focusedIdentity(packet);
                     WirePacket answer{};
                     // Reserve 1ms of the aggregate budget for compositor commit.
-                    if (adapter->mailbox.decide(packet,ticket->deadline-1'000'000,answer) && wire::decision(packet,answer))
+                    ++adapter->eligibility[6];
+                    const auto waitStart=monotonicNs();
+                    if (adapter->mailbox.decide(packet,ticket->deadline-commitReserveNs,answer) && wire::decision(packet,answer))
                         if (modeled->state==State::Down)
                             reply=Decision{*ticket,static_cast<Verdict>(wire::get(answer,64,4)),static_cast<uint32_t>(wire::get(answer,68,4)),static_cast<uint8_t>(wire::get(answer,72,4))};
+                    adapter->mailboxTiming.record(waitStart,monotonicNs(),ticket->deadline-commitReserveNs);
+                    if (reply) ++adapter->eligibility[7];
                     adapter->replacement.deadline=ticket->deadline;
                 }
             }
-            research->proposal=research->router.route(*modeled,ticket,reply,monotonicNs(),adapter->replacementWire ? static_cast<Output&>(transaction) : static_cast<Output&>(research->output));
+            {
+                ScopedDuration commitDuration(adapter->commitTiming,ticket ? ticket->deadline : 0);
+                research->proposal=research->router.route(*modeled,ticket,reply,monotonicNs(),adapter->replacementWire ? static_cast<Output&>(transaction) : static_cast<Output&>(research->output));
+            }
             // Consumed/quarantined repeats/up never enter stock. StockConsumed
             // still enters the original keybind path for release/timer cleanup.
             const bool quarantinedCleanup=modeled->state==State::Up && research->proposal.outcome==Outcome::Quarantined;
@@ -496,7 +576,8 @@ void focus(CSeatManager* self, SP<CWLSurfaceResource> surface) {
 #ifdef SLEDGE_STOCK_RESEARCH
     if (adapter->research) {
         adapter->research->syncUnlock(PROTO::sessionLock->isLocked());
-        adapter->research->router.focusChanged();
+        invalidateFocusProof(adapter->research->router,adapter->initialReconciled);
+        adapter->replacement.invalidateFocusBindings();
         lifecycle(nullptr,7,0,2);
     }
 #endif
@@ -557,10 +638,26 @@ void capabilities(CWLSeatProtocol* self,uint32_t caps) {
     adapter->replacement.observedCapabilities=caps;
     adapter->replacement.capabilitiesKnown=true;
 }
+void protocolEnter(CWlKeyboard* self,uint32_t serial,CWlSurface* surface,wl_array* keys) {
+    if (adapter->drain.detached()) { reinterpret_cast<void (*)(CWlKeyboard*,uint32_t,CWlSurface*,wl_array*)>(adapter->research->hooks.original(9))(self,serial,surface,keys);return; }
+    const bool valid=self && self->resource() && surface && surface->resource() && keys &&
+        surface==adapter->enterSurface && self->client()==surface->client();
+    reinterpret_cast<void (*)(CWlKeyboard*,uint32_t,CWlSurface*,wl_array*)>(adapter->research->hooks.original(9))(self,serial,surface,keys);
+    if (adapter->enterCompletion) adapter->enterCompletion->completed(valid);
+}
 void enter(CWLKeyboardResource* self, SP<CWLSurfaceResource> surface, wl_array* original) {
     if (adapter->drain.detached()) { reinterpret_cast<void (*)(CWLKeyboardResource*,SP<CWLSurfaceResource>,wl_array*)>(adapter->research->hooks.original(0))(self,surface,original); return; }
 
-    adapter->replacement.entered(self,surface);
+    EnterCompletion completion;
+    auto* previousCompletion=adapter->enterCompletion;
+    auto* previousSurface=adapter->enterSurface;
+    adapter->enterSurface=surface ? surface->getResource().get() : nullptr;
+    adapter->enterCompletion=&completion;
+    const auto finish=[&] {
+        adapter->enterCompletion=previousCompletion;
+        adapter->enterSurface=previousSurface;
+        if (completion.observed()) adapter->replacement.entered(self,surface);
+    };
     if (original && original->size%sizeof(uint32_t)==0 && original->data) {
         const auto* keys=static_cast<const uint32_t*>(original->data);
         for (std::size_t i=0;i<original->size/sizeof(uint32_t);++i) adapter->stockLedger.seatRoute(keys[i],true);
@@ -572,6 +669,7 @@ void enter(CWLKeyboardResource* self, SP<CWLSurfaceResource> surface, wl_array* 
         // Before admission preserve stock's actual native keys on real focus
         // transitions. No consumed ownership exists in this startup state.
         reinterpret_cast<void (*)(CWLKeyboardResource*,SP<CWLSurfaceResource>,wl_array*)>(research->hooks.original(0))(self,surface,original);
+        finish();
         return;
     }
     std::array<uint32_t,keyCount> keys{}; unsigned count=0;
@@ -580,6 +678,7 @@ void enter(CWLKeyboardResource* self, SP<CWLSurfaceResource> surface, wl_array* 
     wl_array filtered{count*sizeof(uint32_t),keys.size()*sizeof(uint32_t),keys.data()};
     (void)original;
     reinterpret_cast<void (*)(CWLKeyboardResource*,SP<CWLSurfaceResource>,wl_array*)>(research->hooks.original(0))(self,surface,&filtered);
+    finish();
 }
 void resourceMods(CWLKeyboardResource* self, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
     if (adapter->drain.detached()) { reinterpret_cast<void (*)(CWLKeyboardResource*,uint32_t,uint32_t,uint32_t,uint32_t)>(adapter->research->hooks.original(1))(self,depressed,latched,locked,group); return; }
@@ -676,8 +775,12 @@ APICALL EXPORT void PLUGIN_EXIT() {
     adapter.reset();
 }
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
+#if defined(SLEDGE_STOCK_CANDIDATE) || defined(SLEDGE_STOCK_QUALIFIED)
 #ifdef SLEDGE_STOCK_CANDIDATE
     verifyCandidate(__hyprland_api_get_client_hash());
+#else
+    verifyQualified(__hyprland_api_get_client_hash());
+#endif
     const auto* candidateEndpoint=std::getenv("SLEDGE_HYPRLAND_PASSIVE_SOCKET");
     if (!candidateEndpoint || !*candidateEndpoint) throw std::runtime_error("candidate requires explicit daemon endpoint");
 #endif
@@ -720,10 +823,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                 else if (std::string_view(failure)=="down") adapter->replacement.failAfter=2;
                 else throw std::runtime_error("unknown replacement failure fixture");
             }
-            adapter->research->hooks.install(handle,{reinterpret_cast<void*>(&enter),reinterpret_cast<void*>(&resourceMods),reinterpret_cast<void*>(&keybind),reinterpret_cast<void*>(&capabilities),reinterpret_cast<void*>(&newKeyboard),reinterpret_cast<void*>(&destroyKeyboard),reinterpret_cast<void*>(&setKeyboardLayout),reinterpret_cast<void*>(&keyboardResourceDestroyed),reinterpret_cast<void*>(&selectKeyboard)});
+            adapter->research->hooks.install(handle,{reinterpret_cast<void*>(&enter),reinterpret_cast<void*>(&resourceMods),reinterpret_cast<void*>(&keybind),reinterpret_cast<void*>(&capabilities),reinterpret_cast<void*>(&newKeyboard),reinterpret_cast<void*>(&destroyKeyboard),reinterpret_cast<void*>(&setKeyboardLayout),reinterpret_cast<void*>(&keyboardResourceDestroyed),reinterpret_cast<void*>(&selectKeyboard),reinterpret_cast<void*>(&protocolEnter)});
         }
 #else
-#ifdef SLEDGE_STOCK_CANDIDATE
+#if defined(SLEDGE_STOCK_CANDIDATE) || defined(SLEDGE_STOCK_QUALIFIED)
         adapter->replacementWire=true;
 #endif
         adapter->research=std::make_unique<ResearchRoute>(adapter->hooks);
@@ -737,9 +840,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         auto activeKeyboard=g_pSeatManager->m_keyboard.lock();
         if (!activeKeyboard || !adapter->replacement.setKeymap(activeKeyboard->m_xkbKeymap))
             throw std::runtime_error("production keymap allocation failed");
-        adapter->research->hooks.install(handle,{reinterpret_cast<void*>(&enter),reinterpret_cast<void*>(&resourceMods),reinterpret_cast<void*>(&keybind),reinterpret_cast<void*>(&capabilities),reinterpret_cast<void*>(&newKeyboard),reinterpret_cast<void*>(&destroyKeyboard),reinterpret_cast<void*>(&setKeyboardLayout),reinterpret_cast<void*>(&keyboardResourceDestroyed),reinterpret_cast<void*>(&selectKeyboard)});
+        adapter->research->hooks.install(handle,{reinterpret_cast<void*>(&enter),reinterpret_cast<void*>(&resourceMods),reinterpret_cast<void*>(&keybind),reinterpret_cast<void*>(&capabilities),reinterpret_cast<void*>(&newKeyboard),reinterpret_cast<void*>(&destroyKeyboard),reinterpret_cast<void*>(&setKeyboardLayout),reinterpret_cast<void*>(&keyboardResourceDestroyed),reinterpret_cast<void*>(&selectKeyboard),reinterpret_cast<void*>(&protocolEnter)});
 #endif // !SLEDGE_STOCK_PRODUCTION
         if (adapter->research) {
+            adapter->research->output.recovery=&adapter->replacement.recovery;
             refreshStockOutput([] { g_pInputManager->updateCapabilities(); },
                 [] { reconcileStartupOutput(); });
         }

@@ -42,6 +42,122 @@ fn report(result: ResultKind) -> DeliveryReport {
     })
 }
 #[test]
+fn focus_boundary_preserves_hold_and_waits_exact_nonce_proof() {
+    let mut a = adapter(Action::SendKey {
+        key: KeyCode::KeyB,
+        mods: Modifiers::empty(),
+    });
+    let mut global = scope();
+    global.generation = 0;
+    assert!(a.await_reconciliation(global.nonce));
+    assert!(a.reconciled(global, &super::super::wire::Body::Reset(8)));
+    a.propose(scope(), &event(1), Some("app"), Instant::now())
+        .unwrap();
+    assert!(a.on_delivery(scope(), &report(ResultKind::Replaced)));
+    let mut stale = global;
+    stale.nonce += 1;
+    assert!(!a.await_lifecycle_reconciliation(stale, &super::super::wire::Body::Reset(2)));
+    assert!(a.await_lifecycle_reconciliation(global, &super::super::wire::Body::Reset(2)));
+    assert!(!a.transactions.is_reconciled(global.nonce));
+    assert!(!a.transactions.needs_reconciliation());
+    assert!(matches!(
+        a.matcher.dispatch_device(
+            DeviceId(1),
+            KeyEvent {
+                code: KeyCode::KeyA,
+                kind: EventKind::KeyDown,
+                mods: Modifiers::empty()
+            },
+            None,
+            Instant::now()
+        ),
+        Verdict::Swallow
+    ));
+    assert!(!a.reconciled(stale, &super::super::wire::Body::Reset(8)));
+    assert!(a.reconciled(global, &super::super::wire::Body::Reset(8)));
+    a.propose(scope(), &event(1), Some("app"), Instant::now())
+        .unwrap();
+    assert!(!a.await_lifecycle_reconciliation(global, &super::super::wire::Body::Reset(2)));
+    a.invalidate_speculation();
+    assert!(a.transactions.needs_reconciliation());
+    assert!(!a.reconciled(global, &super::super::wire::Body::Reset(8)));
+}
+#[test]
+fn unlocked_epoch_keeps_ready_holds_but_never_cures_pending_uncertainty() {
+    let mut a = adapter(Action::SendKey {
+        key: KeyCode::KeyB,
+        mods: Modifiers::empty(),
+    });
+    let mut global = scope();
+    global.generation = 0;
+    assert!(a.await_reconciliation(global.nonce));
+    assert!(a.reconciled(global, &super::super::wire::Body::Reset(8)));
+    a.transactions
+        .observe_unlocked_epoch(&mut a.matcher, global.nonce);
+    assert!(a.transactions.is_reconciled(global.nonce));
+    let down = scope();
+    a.propose(down, &event(1), Some("app"), Instant::now())
+        .unwrap();
+    assert!(a.on_delivery(down, &report(ResultKind::Replaced)));
+    a.transactions
+        .observe_unlocked_epoch(&mut a.matcher, global.nonce);
+    assert!(a.transactions.is_reconciled(global.nonce));
+    assert_eq!(
+        a.propose(down, &event(1), Some("app"), Instant::now())
+            .unwrap(),
+        Decision::Swallow
+    );
+    a.transactions
+        .observe_lock_boundary(&mut a.matcher, global.nonce);
+    a.transactions
+        .observe_unlocked_epoch(&mut a.matcher, global.nonce);
+    assert!(a.transactions.needs_reconciliation());
+    assert!(!a.transactions.is_reconciled(global.nonce));
+    assert!(a.await_reconciliation(8));
+    global.nonce = 8;
+    assert!(a.reconciled(global, &super::super::wire::Body::Reset(8)));
+    let mut fresh = down;
+    fresh.nonce = 8;
+    a.propose(fresh, &event(1), Some("app"), Instant::now())
+        .unwrap();
+    a.transactions.observe_unlocked_epoch(&mut a.matcher, 8);
+    assert!(a.transactions.needs_reconciliation());
+    assert!(!a.on_delivery(fresh, &report(ResultKind::Replaced)));
+}
+#[test]
+fn initial_epoch_lock_preserves_armed_proof_but_not_uncertainty() {
+    let mut a = adapter(Action::SendKey {
+        key: KeyCode::KeyB,
+        mods: Modifiers::empty(),
+    });
+    assert!(a.await_reconciliation(7));
+    a.transactions.observe_lock_boundary(&mut a.matcher, 7);
+    assert_eq!(
+        a.transactions.recovery_state(),
+        RecoveryState::AwaitingNativeProof
+    );
+    assert!(!a.transactions.needs_reconciliation());
+    for reason in [0, 2, 3, 5] {
+        let mut global = scope();
+        global.generation = 0;
+        a.await_lifecycle_reconciliation(global, &super::super::wire::Body::Reset(reason));
+        a.invalidate_speculation();
+        assert!(!a.transactions.needs_reconciliation());
+        assert!(!a.transactions.is_reconciled(7));
+    }
+    let mut global = scope();
+    global.generation = 0;
+    assert!(a.reconciled(global, &super::super::wire::Body::Reset(8)));
+    assert!(a.transactions.is_reconciled(7));
+    a.transactions.observe_lock_boundary(&mut a.matcher, 7);
+    assert!(a.transactions.needs_reconciliation());
+    assert!(!a.transactions.is_reconciled(7));
+    assert!(!a.reconciled(global, &super::super::wire::Body::Reset(8)));
+    assert!(a.await_reconciliation(8));
+    a.transactions.observe_lock_boundary(&mut a.matcher, 7); // stale nonce cannot preserve proof
+    assert!(a.transactions.needs_reconciliation());
+}
+#[test]
 fn reload_late_ack_requests_fresh_reconciliation_without_clearing_hold() {
     let mut a = adapter(Action::SendKey {
         key: KeyCode::KeyB,
@@ -588,7 +704,7 @@ fn same_connection_lifecycle_boundary_preserves_hold_until_proof_and_cannot_cure
         .unwrap();
     assert!(a.on_delivery(scope, &report(ResultKind::Replaced)));
     scope.generation = 0;
-    assert!(!a.await_lifecycle_reconciliation(scope, &super::super::wire::Body::Reset(2)));
+    assert!(!a.await_lifecycle_reconciliation(scope, &super::super::wire::Body::Reset(0)));
     assert!(a.await_lifecycle_reconciliation(scope, &super::super::wire::Body::Reset(3)));
     scope.generation = 1;
     assert!(

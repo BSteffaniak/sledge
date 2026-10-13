@@ -159,6 +159,54 @@ void delayedHello() {
     server.join();close(listener);
     assert(unlink(path.c_str())==0 && rmdir(directory)==0);
 }
+void disconnectedDrain() {
+    char directory[]="/tmp/sledge-worker-drain-XXXXXX";
+    assert(mkdtemp(directory));assert(chmod(directory,0700)==0);
+    const auto path=std::string(directory)+"/peer.sock";
+    const auto listener=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC,0);assert(listener>=0);
+    sockaddr_un address{};address.sun_family=AF_UNIX;
+    std::memcpy(address.sun_path,path.c_str(),path.size()+1);
+    assert(bind(listener,reinterpret_cast<sockaddr*>(&address),sizeof(address))==0);
+    assert(chmod(path.c_str(),0600)==0);assert(listen(listener,1)==0);
+    std::atomic<bool> received{false},finished{false};
+    std::thread server([&] {
+        pollfd incoming{listener,POLLIN,0};assert(poll(&incoming,1,3000)>0);
+        const auto client=accept4(listener,nullptr,nullptr,SOCK_CLOEXEC);assert(client>=0);
+        WirePacket packet{};assert(recv(client,packet.data(),512,MSG_TRUNC)==512);
+        wire::put(packet,6,2,2);assert(send(client,packet.data(),512,MSG_NOSIGNAL)==512);
+        assert(recv(client,packet.data(),512,MSG_TRUNC)==512);received.store(true);
+        while (!finished.load()) std::this_thread::yield();
+        close(client);
+    });
+    DecisionMailbox mailbox;
+    WirePacket hello{};assert(wire::hello(hello,100,"sdk-hash","closure+digest"));
+    {
+        StockWorker worker(mailbox,path,hello);
+        const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+        while (!worker.connected() && std::chrono::steady_clock::now()<limit) std::this_thread::yield();
+        assert(worker.connected());
+        WirePacket event=hello;
+        for (unsigned i=64;i<512;++i) event[i]=0;
+        wire::put(event,6,2,3);wire::put(event,8,4,32);
+        wire::put(event,16,8,1);wire::put(event,24,8,1);wire::put(event,32,8,1);
+        wire::put(event,40,8,monotonicNs()+9'000'000);
+        std::thread caller([&] { WirePacket reply{};(void)mailbox.decide(event,wire::get(event,40,8),reply); });
+        while (!received.load() && std::chrono::steady_clock::now()<limit) std::this_thread::yield();
+        assert(received.load());
+        auto receipt=event;wire::put(receipt,6,2,5);wire::put(receipt,8,4,24);
+        assert(worker.notify(receipt));
+        worker.requestPark();
+        assert(!worker.retireGenerationForDrain(worker.generation(),false));
+        assert(!worker.retireGenerationForDrain(worker.generation()+1,true));
+        caller.join(); // timed-out transaction; queued receipt never sent
+        while (worker.connected() && std::chrono::steady_clock::now()<limit) std::this_thread::yield();
+        assert(!worker.connected() && mailbox.idle() && !worker.idleParked());
+        assert(worker.retireGenerationForDrain(worker.generation(),true));
+        while (!worker.idleParked() && std::chrono::steady_clock::now()<limit) std::this_thread::yield();
+        assert(worker.idleParked());finished.store(true);
+    }
+    server.join();close(listener);assert(unlink(path.c_str())==0);assert(rmdir(directory)==0);
+}
 void reconnect() {
     char directory[]="/hdd/sledge-wave6-worker-XXXXXX";
     assert(mkdtemp(directory));
@@ -225,4 +273,4 @@ void reconnect() {
     assert(unlink(path.c_str())==0);assert(rmdir(directory)==0);
 }
 }
-int main() { framing(); connection(); delayedHello(); reconnect(); }
+int main() { framing(); connection(); delayedHello(); reconnect(); disconnectedDrain(); }

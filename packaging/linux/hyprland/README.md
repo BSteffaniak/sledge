@@ -24,6 +24,21 @@ Use only the isolated runner and manifested transfer documented in
 requires a new descriptor/catalogue and daemon build, followed by behavioral
 requalification. Research-mode test results do not qualify this build.
 
+## Stock compositor lifecycle
+
+The backend targets unmodified Hyprland. Load the plugin before starting
+applications so it observes their actual keyboard-enter events. Loading into an
+already-focused client can remain `waiting_for_focus`: stock Hyprland's public
+API does not expose the exact existing keyboard binding needed for safe replay.
+A genuine subsequent enter can establish it; loading alone never grants
+operational status.
+
+Focus, device and lock transitions invalidate admission. Replacement resumes
+only after authenticated reconciliation for the current connection and epoch;
+input arriving while recovery is pending passes through stock handling. Status
+separates configured registration, supported qualification and current operational
+health. Successful candidate tests do not create a supported catalogue entry.
+
 ## Unload controller
 
 `drain-unload.py` requires explicit absolute `hyprctl`/plugin paths and an explicit

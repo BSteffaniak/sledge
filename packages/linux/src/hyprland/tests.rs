@@ -266,6 +266,65 @@ fn lock_advances_epoch_and_retire_never_reuses_generation() {
     assert_eq!(handler.resets, 2);
 }
 #[test]
+fn validated_unlocked_epoch_is_distinct_from_real_unlock() {
+    struct Controls {
+        sync: usize,
+        reset: usize,
+    }
+    impl EventHandler for Controls {
+        fn propose(&mut self, _: Scope, _: &Event) -> Decision {
+            Decision::Pass
+        }
+        fn delivery(&mut self, _: Scope, _: &Event, _: Decision, _: DeliveryReport) {}
+        fn reset(&mut self, _: Scope, _: &Body) {
+            self.reset += 1;
+        }
+        fn unlocked_epoch(&mut self, _: Scope, _: &Body) {
+            self.sync += 1;
+        }
+        fn disconnected(&mut self) {}
+    }
+    let (transport, peer) = pair();
+    let mut bridge = bridge(transport);
+    let mut h = Controls { sync: 0, reset: 0 };
+    let mut s = scope();
+    s.generation = 0;
+    for state in [0, 1, 0] {
+        s.sequence += 1;
+        s.lock_epoch = bridge.epoch + 1;
+        s.deadline_ns = monotonic_ns().unwrap() + MAX_WAIT_NS;
+        raw(
+            &peer,
+            &Packet {
+                scope: s,
+                body: Body::Lock { state, reason: 0 },
+            }
+            .encode()
+            .unwrap(),
+        );
+        bridge.step(&mut h, s.deadline_ns).unwrap();
+    }
+    assert_eq!(h.sync, 1);
+    assert_eq!(h.reset, 2);
+    // Invalid same epoch is rejected before any semantic callback.
+    s.sequence += 1;
+    raw(
+        &peer,
+        &Packet {
+            scope: s,
+            body: Body::Lock {
+                state: 0,
+                reason: 0,
+            },
+        }
+        .encode()
+        .unwrap(),
+    );
+    assert!(bridge.step(&mut h, s.deadline_ns).is_err());
+    assert_eq!(h.sync, 1);
+    assert_eq!(h.reset, 2);
+}
+#[test]
 fn local_reconciliation_request_closes_transport_preserving_history() {
     let (transport, peer) = pair();
     let mut bridge = bridge(transport);
@@ -493,8 +552,8 @@ fn reconciliation_control_is_global_once_current_epoch_and_not_locked() {
 }
 
 #[test]
-fn lifecycle_keymap_rearms_reason8_but_focus_and_duplicates_do_not() {
-    for reason in [2, 3] {
+fn focus_and_keymap_rearm_reason8_but_other_resets_and_duplicates_do_not() {
+    for reason in [0, 2, 3] {
         let (transport, peer) = pair();
         let mut bridge = bridge(transport);
         let mut handler = Handler::default();
@@ -512,7 +571,7 @@ fn lifecycle_keymap_rearms_reason8_but_focus_and_duplicates_do_not() {
                 .unwrap(),
             );
             let result = bridge.research_step(&mut handler, scope.deadline_ns);
-            if scope.sequence == 3 && reason == 2 {
+            if scope.sequence == 3 && reason == 0 {
                 assert!(
                     result
                         .unwrap_err()
@@ -524,7 +583,7 @@ fn lifecycle_keymap_rearms_reason8_but_focus_and_duplicates_do_not() {
             }
             scope.sequence += 1;
         }
-        if reason == 3 {
+        if matches!(reason, 2 | 3) {
             raw(
                 &peer,
                 &Packet {

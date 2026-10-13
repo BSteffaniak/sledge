@@ -115,6 +115,27 @@ def step(qmp, name):
     elif name == "capability-remove":
         qmp.command("device_del", {"id": "capability-keyboard"})
         time.sleep(1)
+    elif name == "candidate-mixed-hold":
+        devices = qmp.command("qom-list", {"path": "/machine/peripheral"})
+        for name, kind in (("mixed-usb", "usb-kbd"), ("mixed-virtio", "virtio-keyboard-pci")):
+            if not any(d.get("name") == name and d.get("type") == f"child<{kind}>" for d in devices):
+                raise RuntimeError(f"missing physical mixed route {name}")
+        schema = qmp.command("query-qmp-schema")
+        print("QMP_MIXED_SCHEMA", json.dumps([s for s in schema if s.get("name") == "input-send-event"]), flush=True)
+        qmp.key("alt", True, "display-a")
+    elif name == "candidate-mixed-a":
+        qmp.pair("a", "display-b")
+    elif name == "candidate-mixed-up":
+        qmp.key("alt", False, "display-a")
+    elif name == "candidate-stress":
+        for _ in range(100):
+            qmp.pair("a")
+    elif name == "candidate-repeat":
+        qmp.key("a", True)
+        time.sleep(1.2)
+        qmp.key("a", False)
+    elif name == "candidate-caps":
+        qmp.pair("caps_lock")
     elif name == "replacement-alt":
         qmp.key("alt", True)
         qmp.pair("a")
@@ -146,7 +167,9 @@ def step(qmp, name):
 
 
 def connect(path, child):
-    deadline = time.monotonic() + 40
+    # Store-image creation precedes QEMU; bound readiness within the outer 180s
+    # run budget instead of assuming the image always materializes within 40s.
+    deadline = time.monotonic() + 100
     while time.monotonic() < deadline:
         if child.poll() is not None:
             raise RuntimeError("VM exited before control sockets")

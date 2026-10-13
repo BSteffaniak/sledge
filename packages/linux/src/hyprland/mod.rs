@@ -69,6 +69,11 @@ pub trait EventHandler {
     fn delivery(&mut self, scope: Scope, event: &Event, decision: Decision, report: DeliveryReport);
     /// Invalidate only speculative matcher proposals. Do not erase native holds.
     fn reset(&mut self, scope: Scope, body: &Body);
+    /// Validated epoch advance while already unlocked, not an unlock transition.
+    /// Default remains conservative for consumers without specialized handling.
+    fn unlocked_epoch(&mut self, scope: Scope, body: &Body) {
+        self.reset(scope, body);
+    }
     /// Disable future replacement and request explicit native reconciliation.
     fn disconnected(&mut self);
 }
@@ -328,11 +333,12 @@ impl Bridge {
         deadline_ns: u64,
         research: bool,
     ) -> io::Result<()> {
+        let unlocked_epoch = !self.locked && matches!(packet.body, Body::Lock { state: 0, .. });
         self.validate(&packet)?;
         match &packet.body {
             Body::Event(event) => self.event(handler, &packet, event, deadline_ns, research),
             Body::Reset(_) | Body::Retire(_) | Body::Lock { .. } => {
-                if matches!(packet.body, Body::Reset(3)) && packet.scope.generation == 0 {
+                if matches!(packet.body, Body::Reset(2 | 3)) && packet.scope.generation == 0 {
                     self.awaiting_reconciliation = true;
                 }
                 if matches!(packet.body, Body::Reset(8)) {
@@ -362,7 +368,11 @@ impl Bridge {
                 {
                     return Err(wire::invalid());
                 }
-                handler.reset(packet.scope, &packet.body);
+                if unlocked_epoch {
+                    handler.unlocked_epoch(packet.scope, &packet.body);
+                } else {
+                    handler.reset(packet.scope, &packet.body);
+                }
                 Ok(())
             }
             _ => Err(wire::invalid()),

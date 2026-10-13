@@ -43,6 +43,19 @@ inline constexpr bool sha256Pin(std::string_view pin) noexcept {
     for (auto c : pin) if (!((c>='0' && c<='9') || (c>='a' && c<='f'))) return false;
     return true;
 }
+#ifdef SLEDGE_STOCK_QUALIFIED
+// Qualification is a trusted build/package decision, never a runtime/env grant.
+// Same-UID peer credentials are user-process trust, not binary attestation or a
+// credential/root grant. Daemon independently binds descriptor and mapped inode.
+inline void verifyQualified(std::string_view sdk) {
+    static_assert(sha256Pin(SLEDGE_STOCK_ELF_SHA256));
+    static_assert(sha256Pin(SLEDGE_STOCK_BUILD_ID));
+    static_assert(SLEDGE_STOCK_QUALIFICATION_REVISION==1);
+    static_assert(SLEDGE_STOCK_FEATURE_MASK==1);
+    if (sdk!=SLEDGE_STOCK_SDK_API_HASH || startupDigest("/proc/self/exe")!=SLEDGE_STOCK_ELF_SHA256)
+        throw std::runtime_error("qualified ELF/SDK mismatch; hooks not installed");
+}
+#endif
 #ifdef SLEDGE_STOCK_CANDIDATE
 inline void verifyCandidate(std::string_view sdk) {
     static_assert(sha256Pin(SLEDGE_STOCK_ELF_SHA256));

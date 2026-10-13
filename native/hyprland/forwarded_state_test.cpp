@@ -38,6 +38,24 @@ int main() {
     assert(router.add(1) && router.add(2)); router.unlockConfirmed();
     assert(!state.synchronize(router));
     assert(state.setKeymap(keymap));
+    {
+        Router mixed;assert(mixed.add(10) && mixed.add(20));mixed.unlockConfirmed();
+        const Event alt{10,56,State::Down};
+        const auto down=mixed.route(alt,{},{},1,output);mixed.originalOutcome(alt,down,true);
+        const xkb_rule_names sameNames{nullptr,nullptr,"us",nullptr,nullptr};
+        auto* second=xkb_keymap_new_from_names(context,&sameNames,XKB_KEYMAP_COMPILE_NO_FLAGS);
+        assert(second && equivalentKeymap(keymap,second));
+        ForwardedKeyboardState projected;
+        assert(projected.setKeymap(keymap) && projected.prepare(second) && projected.synchronize(mixed));
+        const auto mask=projected.depressed();assert(mask!=0);
+        assert(projected.select(second) && projected.synchronize(mixed));
+        assert(projected.depressed()==mask && projected.focusEnterKeys()[56]);
+        assert(projected.select(keymap) && projected.synchronize(mixed) && projected.depressed()==mask);
+        const Event up{10,56,State::Up};
+        const auto released=mixed.route(up,{},{},2,output);mixed.originalOutcome(up,released,true);
+        assert(projected.synchronize(mixed) && projected.depressed()==0);
+        xkb_keymap_unref(second);
+    }
     Event shift{1,42,State::Down};
     auto proposal = router.route(shift,{},{},1,output);
     router.originalOutcome(shift,proposal,false);

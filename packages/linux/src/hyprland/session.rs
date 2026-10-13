@@ -30,6 +30,7 @@ pub struct InstalledDescriptor {
 pub enum Qualification {
     Unqualified,
     Candidate,
+    Supported,
 }
 /// Constructible only by local file/process verification; fields are not grants.
 pub struct VerifiedMetadata {
@@ -190,6 +191,15 @@ fn process_start(peer: Peer) -> io::Result<u64> {
     }
     let stat = bounded_read(&process.join("stat"), 4096)?;
     let stat = std::str::from_utf8(&stat).map_err(|_| denied("invalid process stat"))?;
+    let end = stat
+        .rfind(')')
+        .ok_or_else(|| denied("invalid process stat"))?;
+    if matches!(
+        stat[end + 1..].split_whitespace().next(),
+        Some("Z" | "X" | "x")
+    ) {
+        return Err(denied("compositor process exited"));
+    }
     parse_start(stat)
 }
 fn parse_start(stat: &str) -> io::Result<u64> {
@@ -248,11 +258,42 @@ fn verify_files_and_process(d: &InstalledDescriptor, peer: Peer) -> io::Result<(
 }
 /// Metadata-verified passive session. Real production startup must first call
 /// require_qualified; currently fails closed. Passive never invokes proposals.
+/// Authenticated transport state, not capture qualification or consumer receipt.
+#[derive(Clone, Copy, Debug)]
+pub struct SessionHealth {
+    pub connected: bool,
+    pub awaiting_reconciliation: bool,
+    pub locked: bool,
+    pub nonce: u64,
+    peer: Peer,
+    start_time: u64,
+}
+impl SessionHealth {
+    /// Cheap PID/UID/starttime check; never hashes artifacts or polls desktop.
+    #[must_use]
+    pub fn process_is_current(&self) -> bool {
+        process_start(self.peer).is_ok_and(|start| start == self.start_time)
+    }
+    /// Hello alone is insufficient. Caller supplies exact matcher nonce proof.
+    #[must_use]
+    pub fn operational(&self, matcher_reconciled: bool) -> bool {
+        self.connected
+            && !self.awaiting_reconciliation
+            && !self.locked
+            && matcher_reconciled
+            && self.process_is_current()
+    }
+    pub fn invalidate(&mut self) {
+        self.connected = false;
+        self.awaiting_reconciliation = true;
+    }
+}
 pub struct Session {
     bridge: Bridge,
     metadata: VerifiedMetadata,
     matcher_bound: bool,
     active: bool,
+    qualification: Qualification,
 }
 impl Session {
     /// Admit diagnostic session, not capture. Caller can inspect qualification.
@@ -280,9 +321,10 @@ impl Session {
             metadata,
             matcher_bound: false,
             active: false,
+            qualification: Qualification::Unqualified,
         })
     }
-    /// Explicit compiled-catalogue candidate admission, never host qualification.
+    /// Explicit compiled-catalogue admission; Candidate is never host qualification.
     /// Same metadata/PID/UID/nonce/reconciliation path as supported session.
     /// # Errors
     /// Rejects metadata/Hello/peer failures; proposal feature mask must be 1.
@@ -295,18 +337,27 @@ impl Session {
             return Err(denied("unsupported admitted features"));
         }
         super::catalogue::Catalogue::recheck(&admitted.metadata)?;
+        let qualification = admitted.qualification();
         let mut session = Self::accept(listener, admitted.metadata, deadline)?;
+        session.qualification = qualification;
         session.active = true;
         Ok(session)
+    }
+    #[must_use]
+    pub fn health(&self) -> SessionHealth {
+        SessionHealth {
+            connected: self.bridge.transport.is_some(),
+            awaiting_reconciliation: self.bridge.awaiting_reconciliation,
+            locked: self.bridge.locked,
+            nonce: self.connection_nonce(),
+            peer: self.metadata.peer,
+            start_time: self.metadata.start_time,
+        }
     }
     /// Current compiled admission status; Candidate never means host support.
     #[must_use]
     pub const fn qualification(&self) -> Qualification {
-        if self.active {
-            Qualification::Candidate
-        } else {
-            Qualification::Unqualified
-        }
+        self.qualification
     }
     #[must_use]
     pub const fn feature_mask(&self) -> u64 {
@@ -459,6 +510,9 @@ impl<H: EventHandler> EventHandler for DownOnly<'_, H> {
     fn reset(&mut self, scope: super::wire::Scope, body: &super::wire::Body) {
         self.0.reset(scope, body);
     }
+    fn unlocked_epoch(&mut self, scope: super::wire::Scope, body: &super::wire::Body) {
+        self.0.unlocked_epoch(scope, body);
+    }
     fn disconnected(&mut self) {
         self.0.disconnected();
     }
@@ -521,6 +575,7 @@ mod tests {
             metadata,
             matcher_bound: true,
             active: true,
+            qualification: Qualification::Candidate,
         };
         let mut scope = super::super::tests::scope();
         scope.generation = 0;
@@ -575,6 +630,33 @@ mod tests {
                 modifiers: 0
             })
         );
+    }
+    #[test]
+    fn health_requires_current_process_nonce_proof_and_live_unlocked_transport() {
+        let peer = Peer {
+            uid: nix::unistd::geteuid().as_raw(),
+            pid: i32::try_from(std::process::id()).unwrap(),
+        };
+        let mut health = SessionHealth {
+            connected: true,
+            awaiting_reconciliation: true,
+            locked: false,
+            nonce: 7,
+            peer,
+            start_time: process_start(peer).unwrap(),
+        };
+        assert!(!health.operational(true)); // Hello is never operational.
+        health.awaiting_reconciliation = false;
+        assert!(!health.operational(false));
+        assert!(health.operational(true));
+        health.locked = true;
+        assert!(!health.operational(true));
+        health.locked = false;
+        health.start_time += 1;
+        assert!(!health.operational(true)); // PID reused/exited cannot retain health.
+        health.start_time -= 1;
+        health.invalidate();
+        assert!(!health.operational(true));
     }
     #[test]
     fn stale_queued_hello_retries_fresh_peer_without_protocol_bypass() {

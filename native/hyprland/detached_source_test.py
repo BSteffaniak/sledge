@@ -3,7 +3,7 @@
 from pathlib import Path
 source = Path(__file__).with_name("stock_adapter.cpp").read_text()
 for name in ("inputKey", "seatKey", "seatMods", "focus", "imeKey", "imeMods", "lock",
-             "capabilities", "enter", "resourceMods", "keybind", "newKeyboard",
+             "capabilities", "protocolEnter", "enter", "resourceMods", "keybind", "newKeyboard",
              "destroyKeyboard", "setKeyboardLayout", "keyboardResourceDestroyed", "selectKeyboard"):
     start = source.index(("bool " if name == "keybind" else "void ") + name + "(")
     brace = source.index("{", start)

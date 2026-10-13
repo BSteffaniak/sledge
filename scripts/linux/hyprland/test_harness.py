@@ -47,6 +47,19 @@ class HarnessTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "store path"):
                 candidate_scope(root)
 
+    def test_candidate_startup_uses_natural_enter_and_separate_late_load(self):
+        source = (Path(__file__).parent / "candidate-payload-run.sh").read_text()
+        self.assertNotIn("dispatch focuswindow", source)
+        self.assertNotIn("step initial-reconcile", source)
+        self.assertNotIn("step capability-hotplug", source.split('if [[ $mode == matrix ]]; then')[0])
+        self.assertIn('if [[ -f /sledge-payload/hotplug-case ]]; then\n  step capability-hotplug', source)
+        self.assertLess(source.index('if [[ $mode == late-load ]]; then start_consumer; fi'),
+                        source.index('hyprctl plugin load "$plugin"'))
+        self.assertLess(source.index('hyprctl plugin load "$plugin"'),
+                        source.index('if [[ $mode == baseline ]]; then start_consumer; fi'))
+        self.assertIn('s["waiting_for_focus"] is True and s["native_operational"] is False', source)
+        self.assertIn("SLEDGE_INSTALLED_LATE_LOAD_WAITING_DRAIN_COMPLETED_NOT_BASELINE", source)
+
     def test_candidate_baseline_rejects_rejected_original_outcomes(self):
         from validate_candidate import validate
         report = '''SLEDGE_CANDIDATE_SCOPE_PRESERVED
@@ -61,6 +74,26 @@ native delivery outcome generation=2 epoch=7 sequence=7 nonce=123 key=30 state=1
 '''
         with self.assertRaisesRegex(ValueError, "replaced A-down"):
             validate(report)
+
+    def test_required_acceptance_branches_reject_missing_phases(self):
+        from validate_candidate import validate
+        report = '''SLEDGE_CANDIDATE_SCOPE_PRESERVED
+SLEDGE_CANDIDATE_STORE_TRANSFER_VERIFIED
+SLEDGE_INSTALLED_CANDIDATE_COMPLETED_QUALIFIED_FALSE
+SLEDGE_PAYLOAD_REPORT_END status=0 qualified=false
+{"hyprland_candidate_configured":true,"hyprland_capture_qualified":false,"hyprland_research_configured":false}
+EVIDENCE_FILE /tmp/candidate-daemon-events
+qualification=Candidate feature_mask=1
+native reconciliation epoch=7 sequence=6 nonce=123 accepted=true
+'''
+        for seq in (7, 9):
+            report += f'native delivery outcome generation=2 epoch=7 sequence={seq} nonce=123 key=30 state=1 focus_kind=1 report=Acknowledged(Outcome {{ result: Replaced,\n'
+        report += 'EVIDENCE_FILE /tmp/candidate-consumer-events\n'
+        for _ in range(2):
+            report += 'PHASE_BEGIN candidate-a\nkey: 56; state: 1\nkey: 56; state: 0\nPHASE_END candidate-a\n'
+        for branch in ('deadline', 'mixed-source'):
+            with self.assertRaisesRegex(ValueError, 'required .* missing or incorrect'):
+                validate(report + f'REQUIRED_CASE {branch}\n')
 
     def test_payload_manifest_rejects_tampering_extra_files_and_symlinks(self):
         import hashlib

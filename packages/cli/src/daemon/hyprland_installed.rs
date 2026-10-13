@@ -46,6 +46,10 @@ pub(super) struct InstalledListener {
     handler: Handler,
 }
 impl InstalledListener {
+    pub(super) fn qualification(&self) -> sledge_linux::hyprland::session::Qualification {
+        self.metadata.qualification()
+    }
+
     pub(super) fn bind(
         args: &RunArgs,
         metadata: AdmittedMetadata,
@@ -64,9 +68,19 @@ impl InstalledListener {
         })
     }
     pub(super) fn run(mut self, stopped: &AtomicBool) -> Result<()> {
-        tracing::warn!(qualification = ?self.metadata.qualification(),
+        if self.metadata.qualification()
+            == sledge_linux::hyprland::session::Qualification::Supported
+        {
+            self.metadata.require_qualified()?;
+            tracing::info!(
+                feature_mask = self.metadata.feature_mask(),
+                "independently accepted installed Hyprland registration; awaiting native proof"
+            );
+        } else {
+            tracing::warn!(qualification = ?self.metadata.qualification(),
             feature_mask = self.metadata.feature_mask(),
             "isolated Hyprland qualification candidate; NOT supported host capture");
+        }
         let mut session = Session::accept_admitted(
             &self.listener,
             self.metadata,
@@ -88,6 +102,7 @@ fn bind_matcher(session: &mut Session, handler: &Handler) -> Result<()> {
         session.bind_matcher(hyprland, matcher),
         "Hyprland nonce/matcher binding rejected"
     );
+    state.hyprland_health = Some(session.health());
     Ok(())
 }
 fn run_session(
@@ -98,9 +113,16 @@ fn run_session(
 ) -> Result<()> {
     while !stopped.load(Ordering::Acquire) {
         let step = session.step_if_ready(handler, monotonic_ns()? + 100_000_000);
-        let needs_reconciliation = handler.matching.lock().hyprland.needs_reconciliation();
+        let (needs_reconciliation, recovery) = {
+            let mut state = handler.matching.lock();
+            state.hyprland_health = Some(session.health());
+            (
+                state.hyprland.needs_reconciliation(),
+                state.hyprland.recovery_state(),
+            )
+        };
         if step.is_err() || needs_reconciliation {
-            tracing::warn!(needs_reconciliation, error = ?step.err(),
+            tracing::warn!(needs_reconciliation, ?recovery, error = ?step.err(),
                 "installed Hyprland settlement uncertain; fresh native reconciliation required");
             session.request_reconciliation(handler);
             reconnect(listener, session, handler, stopped)?;

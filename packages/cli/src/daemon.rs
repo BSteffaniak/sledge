@@ -41,6 +41,8 @@ struct MatchingState {
     hyprland: sledge_linux::hyprland::matcher::MatcherTransactions,
     #[cfg(target_os = "linux")]
     hyprland_down_only: bool,
+    #[cfg(target_os = "linux")]
+    hyprland_health: Option<sledge_linux::hyprland::session::SessionHealth>,
 }
 
 impl MatchingState {
@@ -52,6 +54,8 @@ impl MatchingState {
             hyprland: sledge_linux::hyprland::matcher::MatcherTransactions::default(),
             #[cfg(target_os = "linux")]
             hyprland_down_only: false,
+            #[cfg(target_os = "linux")]
+            hyprland_health: None,
         }
     }
 

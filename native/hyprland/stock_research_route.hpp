@@ -1,5 +1,6 @@
 #pragma once
 // Compiled only into explicit isolated research target; no production admission.
+#include "output_recovery.hpp"
 #include "stock_hooks.hpp"
 #include "physical_devices.hpp"
 #include "forwarded_keyboard_state.hpp"
@@ -19,14 +20,14 @@ namespace sledge::hyprland {
 // Exact extra signatures needed because setKeyboardFocus emits directly through
 // CWLKeyboardResource, and stock keybind admission is independent of seat output.
 class ResearchHooks {
-    HookTransaction<CFunctionHook,9> transaction;
-    std::array<CFunctionHook*,9> hooks{};
-    std::array<HookBytes,9> bytes{};
+    HookTransaction<CFunctionHook,10> transaction;
+    std::array<CFunctionHook*,10> hooks{};
+    std::array<HookBytes,10> bytes{};
 public:
     ~ResearchHooks() { reset(); }
-    void install(HANDLE owner, const std::array<void*,9>& destinations) {
-        const std::array<std::string,9> names{"sendEnter","sendMods","onKeyEvent","updateCapabilities","newKeyboard","destroyKeyboard","setKeyboardLayout","destroyResource","setKeyboard"};
-        const std::array<std::string,9> signatures{
+    void install(HANDLE owner, const std::array<void*,10>& destinations) {
+        const std::array<std::string,10> names{"sendEnter","sendMods","onKeyEvent","updateCapabilities","newKeyboard","destroyKeyboard","setKeyboardLayout","destroyResource","setKeyboard","sendEnter"};
+        const std::array<std::string,10> signatures{
             "CWLKeyboardResource::sendEnter(Hyprutils::Memory::CSharedPointer<CWLSurfaceResource>, wl_array*)",
             "CWLKeyboardResource::sendMods(unsigned int, unsigned int, unsigned int, unsigned int)",
             "CKeybindManager::onKeyEvent(std::any, Hyprutils::Memory::CSharedPointer<IKeyboard>)",
@@ -35,15 +36,17 @@ public:
             "CInputManager::destroyKeyboard(Hyprutils::Memory::CSharedPointer<IKeyboard>)",
             "CInputManager::setKeyboardLayout()",
             "CWLSeatProtocol::destroyResource(CWLKeyboardResource*)",
-            "CSeatManager::setKeyboard(Hyprutils::Memory::CSharedPointer<IKeyboard>)"};
-        const std::array<std::string,5> lifecycleSymbols{
+            "CSeatManager::setKeyboard(Hyprutils::Memory::CSharedPointer<IKeyboard>)",
+            "CWlKeyboard::sendEnter(unsigned int, CWlSurface*, wl_array*)"};
+        const std::array<std::string,6> lifecycleSymbols{
             "_ZN13CInputManager11newKeyboardEN9Hyprutils6Memory14CSharedPointerI9IKeyboardEE",
             "_ZN13CInputManager15destroyKeyboardEN9Hyprutils6Memory14CSharedPointerI9IKeyboardEE",
             "_ZN13CInputManager17setKeyboardLayoutEv",
             "_ZN15CWLSeatProtocol15destroyResourceEP19CWLKeyboardResource",
-            "_ZN12CSeatManager11setKeyboardEN9Hyprutils6Memory14CSharedPointerI9IKeyboardEE"};
-        std::array<void*,9> sources{};
-        for (unsigned i=0; i<9; ++i) {
+            "_ZN12CSeatManager11setKeyboardEN9Hyprutils6Memory14CSharedPointerI9IKeyboardEE",
+            "_ZN11CWlKeyboard9sendEnterEjP10CWlSurfaceP8wl_array"};
+        std::array<void*,10> sources{};
+        for (unsigned i=0; i<10; ++i) {
             for (const auto& match : HyprlandAPI::findFunctionsByName(owner,names[i])) {
                 // Stock pairs two nm outputs by line index. Match verified ELF
                 // names for overloaded lifecycle APIs, not that demangle pairing.
@@ -55,7 +58,7 @@ public:
             bytes[i].snapshot(sources[i]);
         }
         try {
-            for (unsigned i=0; i<9; ++i) {
+            for (unsigned i=0; i<10; ++i) {
                 hooks[i]=HyprlandAPI::createFunctionHook(owner,sources[i],destinations[i]);
                 if (!transaction.install(hooks[i]) || bytes[i].restored()) throw std::runtime_error("research hook installation failed");
             }
@@ -75,6 +78,19 @@ class ResearchOutput : public Output {
 public:
     WP<CInputMethodV2> ime;
     WP<CWLSeatResource> seat;
+    OutputRecovery* recovery=nullptr;
+    void uncertain() {
+        if (!recovery) return;
+        recovery->begin();
+        if (ime.lock()) { recovery->include(nullptr);return; }
+        const auto owner=seat.lock();
+        if (!owner) { recovery->include(nullptr);return; }
+        bool any=false;
+        for (const auto& weak : owner->m_keyboards) if (auto keyboard=weak.lock()) {
+            recovery->include(keyboard.get());any=true;
+        }
+        if (!any) recovery->include(nullptr);
+    }
     uint32_t time = 0;
     explicit ResearchOutput(StockHooks& stock) : hooks(stock) {}
     Delivery replace(uint32_t, uint8_t, uint8_t) override { return Delivery::RejectedNoOutput; }
@@ -85,6 +101,7 @@ public:
             for (const auto& weak : owner->m_keyboards)
                 if (auto keyboard=weak.lock()) keyboard->sendKey(time,key,WL_KEYBOARD_KEY_STATE_RELEASED);
         }
+        uncertain();
         return false; // actual wire observation required; SDK is void
     }
     bool reconcileModifiers(uint8_t) override {
@@ -94,6 +111,7 @@ public:
             for (const auto& weak : owner->m_keyboards)
                 if (auto keyboard=weak.lock()) keyboard->sendMods(0,0,0,0);
         }
+        uncertain();
         return false;
     }
 };
@@ -258,6 +276,19 @@ public:
         }
         ++unmappedEvents;
         return {};
+    }
+    bool registeredMap(SP<IKeyboard> keyboard) const noexcept {
+        if (!keyboard || keyboard->isVirtual() || !keyboard->m_enabled || !keyboard->m_allowed) return false;
+        for (const auto& slot : registered)
+            if (slot.generation && slot.keyboard.lock()==keyboard && slot.map==keyboard->m_xkbKeymap) return true;
+        return false;
+    }
+    bool sameConsumerMap(SP<IKeyboard> from,SP<IKeyboard> to) const noexcept {
+        // Use stock's already-serialized map: sendKeymap uses precisely this
+        // equality to skip resending/resetting the client's map. No XKB
+        // serialization, allocation, or pointer-identity shortcut in callbacks.
+        return mapsCompatible && projectionKnown && registeredMap(from) && registeredMap(to) &&
+            !from->m_xkbKeymapV1String.empty() && from->m_xkbKeymapV1String==to->m_xkbKeymapV1String;
     }
     bool selectConsumer(SP<IKeyboard> keyboard) noexcept {
         projectionKnown=false;

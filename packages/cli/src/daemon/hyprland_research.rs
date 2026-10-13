@@ -194,10 +194,21 @@ impl EventHandler for Handler {
     }
     fn reset(&mut self, scope: Scope, body: &Body) {
         let mut state = self.matching.lock();
+        if matches!(body, Body::Reset(2 | 3) | Body::Lock { .. }) {
+            if let Some(health) = &mut state.hyprland_health {
+                health.awaiting_reconciliation = true;
+            }
+        }
+        let installed_lock = matches!(body, Body::Lock { .. }) && state.hyprland_down_only;
         let MatchingState {
             matcher, hyprland, ..
         } = &mut *state;
-        if matches!(body, Body::Reset(3)) {
+        if installed_lock {
+            hyprland.observe_lock_boundary(matcher, scope.nonce);
+        }
+        tracing::debug!(nonce = scope.nonce, sequence = scope.sequence, epoch = scope.lock_epoch,
+            control = ?body, recovery = ?hyprland.recovery_state(), "Hyprland validated lifecycle control");
+        if matches!(body, Body::Reset(2 | 3)) {
             hyprland.await_lifecycle_reconciliation(matcher, scope, body);
         }
         let reconciled = hyprland.reconciled(matcher, scope, body);
@@ -217,8 +228,24 @@ impl EventHandler for Handler {
             hyprland.retire_device(matcher, scope.generation);
         }
     }
+    fn unlocked_epoch(&mut self, scope: Scope, body: &Body) {
+        let mut state = self.matching.lock();
+        if state.hyprland_down_only {
+            let MatchingState {
+                matcher, hyprland, ..
+            } = &mut *state;
+            hyprland.observe_unlocked_epoch(matcher, scope.nonce);
+            tracing::debug!(nonce=scope.nonce, epoch=scope.lock_epoch, recovery=?hyprland.recovery_state(), "Hyprland validated unlocked epoch synchronization");
+        } else {
+            drop(state);
+            self.reset(scope, body);
+        }
+    }
     fn disconnected(&mut self) {
         let mut state = self.matching.lock();
+        if let Some(health) = &mut state.hyprland_health {
+            health.invalidate();
+        }
         let MatchingState {
             matcher, hyprland, ..
         } = &mut *state;
@@ -288,6 +315,150 @@ when = { app_in = ["editor"] }
                 state: 1,
                 focus_epoch: 1,
             }),
+        );
+    }
+    #[test]
+    fn installed_unlocked_epoch_does_not_disable_first_fresh_down() {
+        let mut handler = handler();
+        let mut global = scope(1);
+        global.generation = 0;
+        {
+            let mut state = handler.matching.lock();
+            state.hyprland_down_only = true;
+            let MatchingState {
+                matcher, hyprland, ..
+            } = &mut *state;
+            assert!(hyprland.await_reconciliation(matcher, global.nonce));
+        }
+        handler.reset(global, &Body::Reset(8));
+        global.lock_epoch += 1;
+        global.sequence += 1;
+        handler.unlocked_epoch(
+            global,
+            &Body::Lock {
+                state: 0,
+                reason: 0,
+            },
+        );
+        assert!(handler.matching.lock().hyprland.is_reconciled(global.nonce));
+        let mut down = scope(3);
+        down.lock_epoch = global.lock_epoch;
+        assert_eq!(
+            handler.propose(down, &event(1, 1)),
+            Decision::Replace {
+                key: 48,
+                modifiers: 0
+            }
+        );
+        // An epoch update during pending delivery must retain F01 uncertainty.
+        handler.unlocked_epoch(
+            global,
+            &Body::Lock {
+                state: 0,
+                reason: 0,
+            },
+        );
+        assert!(handler.matching.lock().hyprland.needs_reconciliation());
+    }
+    #[test]
+    fn installed_initial_epoch_sync_and_resets_wait_without_reconnect() {
+        let mut handler = handler();
+        let mut global = scope(1);
+        global.generation = 0;
+        {
+            let mut state = handler.matching.lock();
+            state.hyprland_down_only = true;
+            let MatchingState {
+                matcher, hyprland, ..
+            } = &mut *state;
+            assert!(hyprland.await_reconciliation(matcher, global.nonce));
+        }
+        handler.reset(
+            global,
+            &Body::Lock {
+                state: 0,
+                reason: 0,
+            },
+        );
+        for reason in [0, 2, 3, 5] {
+            global.sequence += 1;
+            handler.reset(global, &Body::Reset(reason));
+            let state = handler.matching.lock();
+            assert!(!state.hyprland.needs_reconciliation());
+            assert!(!state.hyprland.is_reconciled(global.nonce));
+        }
+        // Idle is an observation only, not a reason to disconnect or grant.
+        assert!(!handler.matching.lock().hyprland.needs_reconciliation());
+        global.sequence += 1;
+        handler.reset(global, &Body::Reset(8));
+        assert!(handler.matching.lock().hyprland.is_reconciled(global.nonce));
+        global.sequence += 1;
+        handler.reset(
+            global,
+            &Body::Lock {
+                state: 1,
+                reason: 0,
+            },
+        );
+        assert!(handler.matching.lock().hyprland.needs_reconciliation());
+        assert!(!handler.matching.lock().hyprland.is_reconciled(global.nonce));
+    }
+    #[test]
+    fn reload_late_ack_is_not_operational_until_fresh_nonce_native_proof() {
+        let mut handler = handler();
+        let mut global = scope(1);
+        global.generation = 0;
+        {
+            let mut state = handler.matching.lock();
+            let MatchingState {
+                matcher, hyprland, ..
+            } = &mut *state;
+            assert!(hyprland.await_reconciliation(matcher, global.nonce));
+        }
+        assert!(!handler.matching.lock().hyprland.is_reconciled(global.nonce));
+        handler.reset(global, &Body::Reset(8));
+        assert!(handler.matching.lock().hyprland.is_reconciled(global.nonce));
+        let decision = handler.propose(scope(2), &event(1, 1));
+        let config=sledge_config::parse_str("[[binding]]\ntrigger = { key = \"KeyA\", mods = [] }\naction = { type = \"send_key\", key = \"KeyB\", mods = [] }\n").unwrap();
+        handler.matching.lock().replace(&config);
+        handler.delivery(
+            scope(2),
+            &event(1, 1),
+            decision,
+            DeliveryReport::Acknowledged(Outcome {
+                result: ResultKind::Replaced,
+                reason: 0,
+                key: 30,
+                state: 1,
+                focus_epoch: 1,
+            }),
+        );
+        assert!(handler.matching.lock().hyprland.needs_reconciliation());
+        assert!(!handler.matching.lock().hyprland.is_reconciled(global.nonce));
+        handler.disconnected();
+        global.nonce = 2;
+        {
+            let mut state = handler.matching.lock();
+            let MatchingState {
+                matcher, hyprland, ..
+            } = &mut *state;
+            assert!(hyprland.await_reconciliation(matcher, global.nonce));
+        }
+        let mut stale = global;
+        stale.nonce = 1;
+        handler.reset(stale, &Body::Reset(8));
+        assert!(!handler.matching.lock().hyprland.is_reconciled(2));
+        handler.reset(global, &Body::Reset(8));
+        assert!(handler.matching.lock().hyprland.is_reconciled(2));
+        assert!(!handler.matching.lock().hyprland.is_reconciled(1));
+        let mut fresh = scope(3);
+        fresh.nonce = 2;
+        assert_eq!(
+            handler.propose(fresh, &event(1, 1)),
+            Decision::Replace {
+                key: 48,
+                modifiers: 0
+            }
         );
     }
     #[test]

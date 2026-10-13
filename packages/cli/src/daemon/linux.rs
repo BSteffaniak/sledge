@@ -77,7 +77,13 @@ pub(super) fn run_linux(
             )
         })
         .transpose()?;
-    let candidate_configured = installed.is_some();
+    let qualification = installed
+        .as_ref()
+        .map(super::hyprland_installed::InstalledListener::qualification);
+    let candidate_configured =
+        qualification == Some(sledge_linux::hyprland::session::Qualification::Candidate);
+    let supported_configured =
+        qualification == Some(sledge_linux::hyprland::session::Qualification::Supported);
     let sink: Box<dyn EventSink> = Box::new(MatcherSink {
         matcher: matcher.clone(),
         backend: inject_backend,
@@ -85,6 +91,7 @@ pub(super) fn run_linux(
         focus: desktop_focus.clone(),
     });
     let last_reload_at = Arc::new(Mutex::new(None));
+    let status_matching = matcher.clone();
     let reload = reload_callback(
         matcher,
         rules_loaded.clone(),
@@ -104,6 +111,12 @@ pub(super) fn run_linux(
         check_permissions: Arc::new(|| None),
         capabilities: Arc::new(move || {
             let caps = snapshot.capabilities();
+            let matching = status_matching.lock();
+            let health = matching.hyprland_health;
+            let operational = health.is_some_and(|health| {
+                health.operational(matching.hyprland.is_reconciled(health.nonce))
+            });
+
             Some(serde_json::json!({
                 "broker_connected": caps.broker_connected,
                 "verified_session": caps.verified_session,
@@ -111,8 +124,14 @@ pub(super) fn run_linux(
                 "native_send_key": false,
                 "strict_lock_authority": false,
                 "hyprland_research_configured": research_configured,
-                "hyprland_capture_qualified": false,
+                "hyprland_capture_qualified": supported_configured,
                 "hyprland_candidate_configured": candidate_configured,
+                "hyprland_supported_configured": supported_configured,
+                "hyprland_operational": operational,
+                "hyprland_authenticated": health.is_some_and(|h| h.connected && h.process_is_current()),
+                "hyprland_awaiting_reconciliation": health.is_some_and(|h| h.awaiting_reconciliation),
+                "hyprland_locked": health.is_some_and(|h| h.locked),
+                "hyprland_connection_nonce": health.map(|h| h.nonce),
                 "reason": caps.reason,
             }))
         }),
