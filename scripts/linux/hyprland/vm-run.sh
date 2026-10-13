@@ -24,17 +24,41 @@ python3 "${SLEDGE_VM_IDENTITY:?runner admission validator required}" "$vm" "$SLE
 sha256sum "$SLEDGE_VM_QEMU" "$vm"
 driver=()
 if [[ -n ${SLEDGE_VM_DRIVER:-} ]]; then
-  [[ $SLEDGE_VM_DRIVER == /nix/store/* && -f $SLEDGE_VM_DRIVER ]] || exit 77
-  driver=(python3 "$SLEDGE_VM_DRIVER")
+  if [[ $SLEDGE_VM_DRIVER == /nix/store/* && -f $SLEDGE_VM_DRIVER ]]; then
+    driver=(python3 "$SLEDGE_VM_DRIVER")
+  elif [[ -n ${SLEDGE_VM_PAYLOAD_SCRATCH:-} && $SLEDGE_VM_DRIVER == "$SLEDGE_VM_PAYLOAD_SCRATCH/driver.py" && -f $SLEDGE_VM_DRIVER && ! -L $SLEDGE_VM_DRIVER ]]; then
+    sha256sum "$SLEDGE_VM_DRIVER"
+    driver=(python3 /scratch/driver.py)
+  else exit 77; fi
 fi
-# Namespace-local /tmp is the explicit disposable disk/state root.
+# Optional prepopulated payload root. Only a fresh dedicated /hdd scratch is bound.
+scratch=()
+kernel_params=''
+disk=/tmp/qualification.qcow2
+if [[ -n ${SLEDGE_VM_PAYLOAD_SCRATCH:-} ]]; then
+  [[ $SLEDGE_VM_PAYLOAD_SCRATCH == /hdd/* && ! -L $SLEDGE_VM_PAYLOAD_SCRATCH && -d $SLEDGE_VM_PAYLOAD_SCRATCH ]] || exit 77
+  [[ $(realpath "$SLEDGE_VM_PAYLOAD_SCRATCH") == "$SLEDGE_VM_PAYLOAD_SCRATCH" ]] || exit 77
+  python3 "$(dirname "$0")/payload_disk.py" --verify "$SLEDGE_VM_PAYLOAD_SCRATCH/root/sledge-payload"
+  [[ -f $SLEDGE_VM_PAYLOAD_SCRATCH/qualification.qcow2 && ! -L $SLEDGE_VM_PAYLOAD_SCRATCH/qualification.qcow2 ]] || exit 77
+  scratch=(--bind "$SLEDGE_VM_PAYLOAD_SCRATCH" /scratch)
+  disk=/scratch/qualification.qcow2
+  base_init=$(grep -oE 'init=/nix/store/[a-zA-Z0-9.+_-]+/init' "$vm" | head -1)
+  [[ -n $base_init ]] || exit 77
+  kernel_params="init=/payload-init.sh sledge.base_init=${base_init#init=} systemd.mask=hyprland-prerequisite.service systemd.mask=qualification-report.service"
+  if [[ -f $SLEDGE_VM_PAYLOAD_SCRATCH/root/sledge-payload/scope/machine-id ]]; then
+    [[ $(cat "$SLEDGE_VM_PAYLOAD_SCRATCH/root/sledge-payload/scope/machine-id") == 736c656467652d63616e646964617465 ]] || exit 77
+    kernel_params+=" systemd.machine_id=736c656467652d63616e646964617465"
+  fi
+fi
+# Namespace-local /tmp remains disposable; payload disk/state uses explicit scratch.
 timeout --signal=TERM --kill-after=3s 180s \
   bwrap --unshare-all --die-with-parent --new-session --clearenv \
   --ro-bind /nix/store /nix/store --ro-bind /sys /sys --proc /proc --dev /dev --tmpfs /tmp \
   --dir /dev/dri --dev-bind "$node" "$node" "${extra[@]}" \
-  --dir /home --dir /home/probe --chdir /tmp \
+  --dir /home --dir /home/probe "${scratch[@]}" --chdir /tmp \
   "$(command -v env)" -i PATH="$PATH" HOME=/home/probe TMPDIR=/tmp \
-    NIX_DISK_IMAGE=/tmp/qualification.qcow2 \
+    NIX_DISK_IMAGE="$disk" \
+    QEMU_KERNEL_PARAMS="$kernel_params" \
     XDG_RUNTIME_DIR=/tmp \
     GBM_BACKENDS_PATH="${SLEDGE_VM_MESA:?use hyprland-vm-prepare}/lib/gbm" \
     LIBGL_DRIVERS_PATH="$SLEDGE_VM_MESA/lib/dri" \

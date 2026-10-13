@@ -1,7 +1,9 @@
 //! Worker-side native event/actual-outcome bridge. Not an InputBackend and not
 //! capture qualification: callers must not enable stock hooks from this API.
+pub mod catalogue;
 pub mod listener;
 pub mod matcher;
+pub mod session;
 pub mod transport;
 pub mod wire;
 
@@ -115,6 +117,13 @@ impl Bridge {
     #[must_use]
     pub const fn connection_nonce(&self) -> u64 {
         self.nonce
+    }
+    /// Close locally uncertain transport; retain nonce/epoch/retirement history.
+    /// Recovery requires fresh admission and native reason8, not original replay.
+    pub fn request_reconciliation(&mut self, handler: &mut impl EventHandler) {
+        self.transport.take();
+        self.awaiting_reconciliation = true;
+        handler.disconnected();
     }
     /// Explicit reconnect to the same native generation namespace. Authenticate
     /// a fresh zero-capability Hello without clearing retirement history or
@@ -240,6 +249,33 @@ impl Bridge {
         handler: &mut impl EventHandler,
         idle_deadline_ns: u64,
     ) -> io::Result<bool> {
+        self.ready_mode(handler, idle_deadline_ns, true)
+    }
+    /// Compiled-catalogue session transaction entry. Admission and fault-free
+    /// handler wrapping are enforced by Session; no runtime activation flag.
+    fn admitted_step_if_ready(
+        &mut self,
+        handler: &mut impl EventHandler,
+        idle_deadline_ns: u64,
+    ) -> io::Result<bool> {
+        self.ready_mode(handler, idle_deadline_ns, true)
+    }
+    /// Passive idle poll; never proposes or runs research faults.
+    /// # Errors
+    /// Actual packet failures close the peer, idle expiry leaves it unchanged.
+    pub fn passive_step_if_ready(
+        &mut self,
+        handler: &mut impl EventHandler,
+        idle_deadline_ns: u64,
+    ) -> io::Result<bool> {
+        self.ready_mode(handler, idle_deadline_ns, false)
+    }
+    fn ready_mode(
+        &mut self,
+        handler: &mut impl EventHandler,
+        idle_deadline_ns: u64,
+        research: bool,
+    ) -> io::Result<bool> {
         let result = (|| {
             let Some(packet) = self
                 .transport
@@ -250,7 +286,7 @@ impl Bridge {
                 return Ok(false);
             };
             let deadline = packet.scope.deadline_ns;
-            self.process_packet(handler, packet, deadline, true)?;
+            self.process_packet(handler, packet, deadline, research)?;
             Ok(true)
         })();
         if result.is_err() {

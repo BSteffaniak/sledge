@@ -4,6 +4,10 @@
 #include <atomic>
 #include <cstdint>
 #include <time.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <cerrno>
 
 namespace sledge::hyprland {
 using WirePacket = std::array<uint8_t,512>;
@@ -13,13 +17,19 @@ inline uint64_t monotonicNs() noexcept {
     return static_cast<uint64_t>(now.tv_sec) * 1'000'000'000 + static_cast<uint64_t>(now.tv_nsec);
 }
 // One compositor producer / one socket worker. No pointers, heap, socket calls,
-// locks or ownership mutations on the callback side. A timed-out in-flight slot
+// locks or ownership mutations on the callback side. Linux futex sleep is
+// deadline-bounded, not a polling loop. A timed-out in-flight slot
 // cannot be reused until the worker acknowledges abandonment. Stop/join the
 // worker before destroying the mailbox. Polling cadence is a worker concern.
 class DecisionMailbox {
-    enum class Phase : uint8_t { Idle, Request, Processing, Reply, Abandoned };
+    enum class Phase : uint32_t { Idle, Request, Processing, Reply, Abandoned };
     static_assert(std::atomic<Phase>::is_always_lock_free);
-    std::atomic<Phase> phase{Phase::Idle};
+    alignas(4) std::atomic<Phase> phase{Phase::Idle};
+    static_assert(sizeof(phase)==sizeof(uint32_t));
+    static_assert(alignof(std::atomic<Phase>)>=alignof(uint32_t));
+    void wake() noexcept {
+        (void)syscall(SYS_futex,&phase,FUTEX_WAKE_PRIVATE,1,nullptr,nullptr,0);
+    }
     WirePacket request{}, reply{};
     uint64_t deadline = 0;
 public:
@@ -47,6 +57,18 @@ public:
                 // Worker may publish concurrently. CAS avoids overwriting Reply;
                 // loop then consumes it only if still before the deadline.
                 if (phase.compare_exchange_strong(current,Phase::Abandoned,std::memory_order_acq_rel)) return false;
+            } else {
+                const auto remaining=deadlineNs-now;
+                const timespec timeout{static_cast<time_t>(remaining/1'000'000'000),
+                    static_cast<long>(remaining%1'000'000'000)};
+                // Atomic value check in the kernel prevents a lost completion
+                // wake between load and sleep. EINTR/spurious wakes recheck the
+                // original deadline, never extend the transaction budget.
+                const auto result=syscall(SYS_futex,&phase,FUTEX_WAIT_PRIVATE,
+                    static_cast<uint32_t>(current),&timeout,nullptr,0);
+                if (result<0 && errno!=EAGAIN && errno!=EINTR && errno!=ETIMEDOUT) {
+                    if (phase.compare_exchange_strong(current,Phase::Abandoned,std::memory_order_acq_rel)) return false;
+                }
             }
         }
     }
@@ -60,11 +82,13 @@ public:
         deadlineNs = deadline;
         return true;
     }
+    bool idle() const noexcept { return phase.load(std::memory_order_acquire)==Phase::Idle; }
     void complete(const WirePacket& decision) noexcept {
         reply = decision;
         auto expected = Phase::Processing;
         if (!phase.compare_exchange_strong(expected,Phase::Reply,std::memory_order_release,std::memory_order_relaxed))
             phase.store(Phase::Idle,std::memory_order_release);
+        wake();
     }
 };
 } // namespace sledge::hyprland

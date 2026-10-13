@@ -23,6 +23,7 @@ use crate::logging;
 #[cfg(target_os = "linux")]
 mod desktop;
 #[cfg(target_os = "linux")]
+mod hyprland_installed;
 mod hyprland_research;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -38,6 +39,8 @@ struct MatchingState {
     aliases: HashMap<String, AppAlias>,
     #[cfg(target_os = "linux")]
     hyprland: sledge_linux::hyprland::matcher::MatcherTransactions,
+    #[cfg(target_os = "linux")]
+    hyprland_down_only: bool,
 }
 
 impl MatchingState {
@@ -47,6 +50,8 @@ impl MatchingState {
             aliases: config.app_aliases.clone(),
             #[cfg(target_os = "linux")]
             hyprland: sledge_linux::hyprland::matcher::MatcherTransactions::default(),
+            #[cfg(target_os = "linux")]
+            hyprland_down_only: false,
         }
     }
 
@@ -283,7 +288,13 @@ fn reload_callback(
     Arc::new(move || {
         let _reload = reload_lock.lock();
         let cfg = sledge_config::load_from_file(&config_path).map_err(|e| e.to_string())?;
-        matcher.lock().replace(&cfg);
+        let mut state = matcher.lock();
+        #[cfg(target_os = "linux")]
+        if state.hyprland_down_only {
+            hyprland_installed::validate_rules(&cfg).map_err(|e| e.to_string())?;
+        }
+        state.replace(&cfg);
+        drop(state);
         *rules_loaded.lock() = cfg.rules.len();
         *last_reload_at.lock() = Some(Instant::now());
         info!("config reloaded");

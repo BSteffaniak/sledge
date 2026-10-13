@@ -19,27 +19,31 @@ namespace sledge::hyprland {
 // Exact extra signatures needed because setKeyboardFocus emits directly through
 // CWLKeyboardResource, and stock keybind admission is independent of seat output.
 class ResearchHooks {
-    HookTransaction<CFunctionHook,7> transaction;
-    std::array<CFunctionHook*,7> hooks{};
-    std::array<HookBytes,7> bytes{};
+    HookTransaction<CFunctionHook,9> transaction;
+    std::array<CFunctionHook*,9> hooks{};
+    std::array<HookBytes,9> bytes{};
 public:
     ~ResearchHooks() { reset(); }
-    void install(HANDLE owner, const std::array<void*,7>& destinations) {
-        const std::array<std::string,7> names{"sendEnter","sendMods","onKeyEvent","updateCapabilities","newKeyboard","destroyKeyboard","setKeyboardLayout"};
-        const std::array<std::string,7> signatures{
+    void install(HANDLE owner, const std::array<void*,9>& destinations) {
+        const std::array<std::string,9> names{"sendEnter","sendMods","onKeyEvent","updateCapabilities","newKeyboard","destroyKeyboard","setKeyboardLayout","destroyResource","setKeyboard"};
+        const std::array<std::string,9> signatures{
             "CWLKeyboardResource::sendEnter(Hyprutils::Memory::CSharedPointer<CWLSurfaceResource>, wl_array*)",
             "CWLKeyboardResource::sendMods(unsigned int, unsigned int, unsigned int, unsigned int)",
             "CKeybindManager::onKeyEvent(std::any, Hyprutils::Memory::CSharedPointer<IKeyboard>)",
             "CWLSeatProtocol::updateCapabilities(unsigned int)",
             "CInputManager::newKeyboard(Hyprutils::Memory::CSharedPointer<IKeyboard>)",
             "CInputManager::destroyKeyboard(Hyprutils::Memory::CSharedPointer<IKeyboard>)",
-            "CInputManager::setKeyboardLayout()"};
-        const std::array<std::string,3> lifecycleSymbols{
+            "CInputManager::setKeyboardLayout()",
+            "CWLSeatProtocol::destroyResource(CWLKeyboardResource*)",
+            "CSeatManager::setKeyboard(Hyprutils::Memory::CSharedPointer<IKeyboard>)"};
+        const std::array<std::string,5> lifecycleSymbols{
             "_ZN13CInputManager11newKeyboardEN9Hyprutils6Memory14CSharedPointerI9IKeyboardEE",
             "_ZN13CInputManager15destroyKeyboardEN9Hyprutils6Memory14CSharedPointerI9IKeyboardEE",
-            "_ZN13CInputManager17setKeyboardLayoutEv"};
-        std::array<void*,7> sources{};
-        for (unsigned i=0; i<7; ++i) {
+            "_ZN13CInputManager17setKeyboardLayoutEv",
+            "_ZN15CWLSeatProtocol15destroyResourceEP19CWLKeyboardResource",
+            "_ZN12CSeatManager11setKeyboardEN9Hyprutils6Memory14CSharedPointerI9IKeyboardEE"};
+        std::array<void*,9> sources{};
+        for (unsigned i=0; i<9; ++i) {
             for (const auto& match : HyprlandAPI::findFunctionsByName(owner,names[i])) {
                 // Stock pairs two nm outputs by line index. Match verified ELF
                 // names for overloaded lifecycle APIs, not that demangle pairing.
@@ -51,7 +55,7 @@ public:
             bytes[i].snapshot(sources[i]);
         }
         try {
-            for (unsigned i=0; i<7; ++i) {
+            for (unsigned i=0; i<9; ++i) {
                 hooks[i]=HyprlandAPI::createFunctionHook(owner,sources[i],destinations[i]);
                 if (!transaction.install(hooks[i]) || bytes[i].restored()) throw std::runtime_error("research hook installation failed");
             }
@@ -113,6 +117,7 @@ public:
     std::array<uint64_t,static_cast<unsigned>(AdmissionBlock::Count)> admissionChecks{};
     uint64_t boundaryQueued=0, boundaryQueueFailed=0, boundaryNotReady=0;
     uint64_t mapRefreshDeferred=0, mapRefreshFailed=0, mapRefreshSucceeded=0;
+    bool projectionKnown=true;
     bool mapsCompatible = true;
     bool admitted = false;
     bool knownAdmission = false;
@@ -163,7 +168,7 @@ public:
         for (const auto& keyboard : g_pInputManager->m_keyboards) {
             if (!keyboard || !keyboard->m_enabled || !keyboard->m_allowed) continue;
             // Consumer-map compatibility is proved here, never by ORing masks.
-            if (keyboard->isVirtual() || !equivalentKeymap(active->m_xkbKeymap,keyboard->m_xkbKeymap)) return false;
+            if (keyboard->isVirtual() || !keyboard->m_xkbKeymap || !forwarded.prepare(keyboard->m_xkbKeymap)) return false;
             for (uint32_t key=0;key<keyCount;++key) if (keyboard->getPressed(key)) return false;
         }
         if (!forwarded.setKeymap(active->m_xkbKeymap)) return false;
@@ -197,7 +202,7 @@ public:
                 if (!slot.generation || slot.keyboard.lock()!=keyboard) continue;
                 existing=true;
                 if (slot.map!=keyboard->m_xkbKeymap && router.quiescent() &&
-                    equivalentKeymap(map,keyboard->m_xkbKeymap)) slot.map=keyboard->m_xkbKeymap;
+                    forwarded.prepare(keyboard->m_xkbKeymap)) slot.map=keyboard->m_xkbKeymap;
             }
             if (existing) continue;
             const auto aq=keyboard->aq();
@@ -208,7 +213,7 @@ public:
             // Account for every verified physical keyboard, including power/
             // media-only devices: excluding them here but demanding complete
             // registry coverage at reason8 made neutral VM admission impossible.
-            if (map && !equivalentKeymap(map,keyboard->m_xkbKeymap)) continue;
+            if (!forwarded.prepare(keyboard->m_xkbKeymap)) continue;
             bool held=false;
             for (uint32_t key=0;key<keyCount;++key) if (keyboard->getPressed(key)) held=true;
             if (held) {
@@ -228,7 +233,6 @@ public:
                 const auto id=devices.attach(keyboard.get(),true,false,translation,router);
                 if (!id) break;
                 ++registeredCount;
-                Debug::log(LOG,"SLEDGE_RESEARCH_REGISTER device={} generation={} name={} map={} physical=true",static_cast<void*>(keyboard.get()),id,keyboard->m_hlName,static_cast<void*>(keyboard->m_xkbKeymap));
                 slot.keyboard=keyboard; slot.map=keyboard->m_xkbKeymap; slot.generation=id;
                 break;
             }
@@ -255,20 +259,33 @@ public:
         ++unmappedEvents;
         return {};
     }
+    bool selectConsumer(SP<IKeyboard> keyboard) noexcept {
+        projectionKnown=false;
+        for (const auto& slot : registered) {
+            if (!slot.generation || slot.keyboard.lock()!=keyboard || slot.map!=keyboard->m_xkbKeymap) continue;
+            if (!forwarded.select(slot.map,keyboard->m_modifiersState.group)) return false;
+            projectionKnown=forwarded.synchronize(router,phase.routeLocked());
+            return projectionKnown;
+        }
+        return false;
+    }
+    template<class F> void forEachMap(F&& callback) {
+        for (const auto& slot : registered) if (slot.generation) callback(slot.map);
+    }
     bool consumerMapKnown() const {
-        if (!mapsCompatible) return false;
+        if (!mapsCompatible || !projectionKnown) return false;
         auto active=g_pSeatManager->m_keyboard.lock();
         if (!active) return false;
         for (const auto& slot : registered)
             if (slot.generation && slot.keyboard.lock()==active && slot.map==active->m_xkbKeymap) return true;
         return false;
     }
-    AdmissionBlock admissionBlock(const IKeyboard* entering,uint32_t enteringKey) const {
+    AdmissionBlock admissionBlock(const IKeyboard* entering,uint32_t enteringKey,bool retiredRecovery=false) const {
         if (!mapsCompatible) return AdmissionBlock::MapsIncompatible;
         auto active=g_pSeatManager->m_keyboard.lock();
         if (!active) return AdmissionBlock::NoConsumer;
         if (!consumerMapKnown()) return AdmissionBlock::ConsumerUnregistered;
-        if (!router.quiescent()) return AdmissionBlock::RouterBusy;
+        if (retiredRecovery ? !router.ownershipEmpty() : !router.quiescent()) return AdmissionBlock::RouterBusy;
         if (phase.routeLocked()) return AdmissionBlock::Locked;
         if (current) return AdmissionBlock::Nested;
         if (revoking) return AdmissionBlock::Revoking;

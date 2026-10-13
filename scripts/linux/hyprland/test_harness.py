@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from candidate_payload import candidate_scope, MACHINE_ID, BOOT_MARKER
+from payload_disk import verify_payload
 from runner_identity import admit
 from qmp_ready import probe
 from validate_guest import validate
@@ -17,6 +19,74 @@ from validate_qualification import require_ime_lock_exclusion, require_passive, 
 
 
 class HarnessTests(unittest.TestCase):
+    def test_candidate_payload_requires_exact_scope_and_store_path(self):
+        with tempfile.TemporaryDirectory(dir="/hdd") as directory:
+            root = Path(directory)
+            self.assertFalse(candidate_scope(root))
+            (root / "scope").mkdir()
+            (root / "scope/machine-id").write_bytes(MACHINE_ID)
+            (root / "scope/boot-marker").write_bytes(BOOT_MARKER)
+            (root / "store").mkdir()
+            (root / ("store/" + "a" * 32 + "-candidate")).mkdir()
+            self.assertTrue(candidate_scope(root))
+            malformed = (
+                b"736c656467652d63616e64696461746531\n",  # Regression: old 34-hex pin.
+                b"host-machine-id\n", MACHINE_ID.rstrip(b"\n"),
+                MACHINE_ID.upper(), b"0" * 32 + b"\n",
+            )
+            for value in malformed:
+                with self.subTest(machine_id=value):
+                    (root / "scope/machine-id").write_bytes(value)
+                    with self.assertRaisesRegex(ValueError, "requires 32"):
+                        candidate_scope(root)
+            (root / "scope/machine-id").write_bytes(b"1" * 32 + b"\n")
+            with self.assertRaisesRegex(ValueError, "scope bytes"):
+                candidate_scope(root)
+            (root / "scope/machine-id").write_bytes(MACHINE_ID)
+            (root / "store/not-a-store-path").mkdir()
+            with self.assertRaisesRegex(ValueError, "store path"):
+                candidate_scope(root)
+
+    def test_candidate_baseline_rejects_rejected_original_outcomes(self):
+        from validate_candidate import validate
+        report = '''SLEDGE_CANDIDATE_SCOPE_PRESERVED
+SLEDGE_CANDIDATE_STORE_TRANSFER_VERIFIED
+SLEDGE_INSTALLED_CANDIDATE_COMPLETED_QUALIFIED_FALSE
+SLEDGE_PAYLOAD_REPORT_END status=0 qualified=false
+{"hyprland_candidate_configured":true,"hyprland_capture_qualified":false,"hyprland_research_configured":false}
+EVIDENCE_FILE /tmp/candidate-daemon-events
+qualification=Candidate feature_mask=1
+native reconciliation epoch=7 sequence=6 nonce=123 accepted=true
+native delivery outcome generation=2 epoch=7 sequence=7 nonce=123 key=30 state=1 focus_kind=1 report=Acknowledged(Outcome { result: RejectedOriginalAdmitted,
+'''
+        with self.assertRaisesRegex(ValueError, "replaced A-down"):
+            validate(report)
+
+    def test_payload_manifest_rejects_tampering_extra_files_and_symlinks(self):
+        import hashlib
+        with tempfile.TemporaryDirectory(dir="/hdd") as directory:
+            root = Path(directory)
+            names = ("run.sh", "boot.sh", "sledge", "plugin.so")
+            for name in names:
+                (root / name).write_bytes(b"fixture")
+            manifest = "".join(f"{hashlib.sha256(b'fixture').hexdigest()}  {name}\n" for name in names)
+            (root / "manifest.sha256").write_text(manifest)
+            self.assertEqual(verify_payload(root), root)
+            (root / "run.sh").write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                verify_payload(root)
+            (root / "run.sh").write_bytes(b"fixture")
+            (root / "extra").symlink_to("sledge")
+            with self.assertRaisesRegex(ValueError, "symlinks"):
+                verify_payload(root)
+            (root / "extra").unlink()
+            (root / "extra").write_bytes(b"undeclared")
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                verify_payload(root)
+            (root / "manifest.sha256").write_text(manifest + "0" * 64 + "  ../escape\n")
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                verify_payload(root)
+
     def test_reporter_preserves_native_boundary_telemetry(self):
         source = (Path(__file__).resolve().parents[3] / "native/hyprland/stock-hook-investigation.nix").read_text()
         match = re.search(r"grep -E '([^']+)' \"\$log\"", source)

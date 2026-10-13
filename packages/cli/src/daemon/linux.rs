@@ -20,6 +20,16 @@ pub(super) fn run_linux(
     config_path: Arc<PathBuf>,
     reload_handle: logging::FilterReloadHandle,
 ) -> Result<()> {
+    // Metadata/catalogue verification is off the native callback and precedes
+    // desktop workers or socket admission. Candidate never implies host support.
+    let installed_metadata = super::hyprland_installed::prepare(args)?;
+    if installed_metadata.is_some() {
+        let config = sledge_config::load_from_file(&config_path)?;
+        super::hyprland_installed::validate_rules(&config)?;
+        let mut state = matcher.lock();
+        state.replace(&config);
+        state.hyprland_down_only = true;
+    }
     let desktop = super::desktop::start(args)?;
     let desktop_focus = desktop
         .as_ref()
@@ -57,6 +67,17 @@ pub(super) fn run_linux(
         sources.clone(),
     )?;
     let research_configured = research.is_some();
+    let installed = installed_metadata
+        .map(|metadata| {
+            super::hyprland_installed::InstalledListener::bind(
+                args,
+                metadata,
+                matcher.clone(),
+                sources.clone(),
+            )
+        })
+        .transpose()?;
+    let candidate_configured = installed.is_some();
     let sink: Box<dyn EventSink> = Box::new(MatcherSink {
         matcher: matcher.clone(),
         backend: inject_backend,
@@ -91,6 +112,7 @@ pub(super) fn run_linux(
                 "strict_lock_authority": false,
                 "hyprland_research_configured": research_configured,
                 "hyprland_capture_qualified": false,
+                "hyprland_candidate_configured": candidate_configured,
                 "reason": caps.reason,
             }))
         }),
@@ -119,9 +141,10 @@ pub(super) fn run_linux(
     let _watcher = crate::config_watcher::spawn((*config_path).clone(), reload);
     // The backend's fail-closed authorization remains authoritative. This CLI
     // does not open devices, connect a privileged broker, or invent permissions.
-    let result = match research {
-        Some(listener) => listener.run(&stopped),
-        None => backend.run(sink).map_err(anyhow::Error::from),
+    let result = match (installed, research) {
+        (Some(listener), _) => listener.run(&stopped),
+        (None, Some(listener)) => listener.run(&stopped),
+        (None, None) => backend.run(sink).map_err(anyhow::Error::from),
     };
     server.abort();
     runtime.shutdown_timeout(Duration::from_secs(5));

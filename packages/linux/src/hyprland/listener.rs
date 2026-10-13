@@ -88,8 +88,29 @@ impl Listener {
     /// failure terminates this admission; never loops accepting other peers.
     /// # Errors
     /// Reports aggregate deadline, wrong credentials and accept failures.
+    fn verify_endpoint(&self) -> io::Result<()> {
+        let parent = fstat(self.directory.as_raw_fd()).map_err(io::Error::from)?;
+        let endpoint = fstatat(
+            Some(self.directory.as_raw_fd()),
+            self.name.as_path(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .map_err(io::Error::from)?;
+        if parent.st_uid != self.uid
+            || parent.st_mode & 0o077 != 0
+            || endpoint.st_uid != self.uid
+            || endpoint.st_mode & 0o077 != 0
+            || endpoint.st_dev != self.device
+            || endpoint.st_ino != self.inode
+        {
+            return Err(denied());
+        }
+        Ok(())
+    }
     pub fn accept(&self, peer: Peer, deadline_ns: u64) -> io::Result<Transport> {
+        self.verify_endpoint()?;
         self.transport.wait_readable(deadline_ns)?;
+        self.verify_endpoint()?;
         let raw = accept4(
             self.transport.fd().as_raw_fd(),
             SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
@@ -98,6 +119,7 @@ impl Listener {
         // SAFETY: accept4 returned a new owned descriptor, transferred once.
         let transport = Transport::from_owned_fd(unsafe { OwnedFd::from_raw_fd(raw) });
         transport.authenticate(peer)?;
+        self.verify_endpoint()?;
         if super::transport::monotonic_ns()? >= deadline_ns {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,

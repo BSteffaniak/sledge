@@ -23,6 +23,22 @@ struct RecordingOutput : Output {
     bool reconcileModifiers(uint8_t sides) override { restored = sides; return true; }
 };
 Decision answer(const Ticket& ticket, Verdict verdict) { return {ticket, verdict, 31, 4}; }
+void emptyRetirement() {
+    struct NoRoute : Output {
+        unsigned writes=0;
+        Delivery replace(uint32_t,uint8_t,uint8_t) override { return Delivery::RejectedNoOutput; }
+        bool release(uint32_t) override { ++writes;return false; }
+        bool reconcileModifiers(uint8_t) override { ++writes;return false; }
+    } output;
+    Router router;check(router.add(1));router.unlockConfirmed();
+    router.retire(1,output);
+    check(output.writes==0 && router.quiescent() && !router.diagnostics().fatal);
+    check(router.add(2));
+    const Event down{2,30,State::Down};
+    (void)router.route(down,{},{},1,output);
+    router.retire(2,output);
+    check(output.writes==2 && router.diagnostics().fatal && !router.quiescent());
+}
 void ownership() {
     Router router; RecordingOutput output;
     check(router.add(1)); check(router.add(2)); check(!router.add(1));
@@ -235,11 +251,18 @@ void lifecycleSettlement() {
     check(router.route(down,ticket,answer(*ticket,Verdict::Replace),401,output).outcome==Outcome::PartialFatal);
     router.disconnect(output);
     check(router.settlement({1,30,State::Up},402,10'000'000).has_value());
+    check(!router.recoverRetiredOutput(false));
+    check(!router.recoverRetiredOutput(true)); // consumed physical hold blocks proof
     check(!router.route({1,30,State::Up},{},{},403,output).deliverClient);
     check(!router.targetHeld(30));
+    check(!router.quiescent() && router.ownershipEmpty());
+    check(!router.recoverRetiredOutput(false));
+    check(router.recoverRetiredOutput(true));
+    check(router.quiescent());
 }
 } // namespace
 int main() {
+    emptyRetirement();
     lifecycleSettlement();
     ownership(); replies(); replacement(); lockAndRetirement(); reviewedOutcomes(); fiveReviewRegressions(); mergedStockOutcome(); outputSequence();
     std::cout << "PASS routing: ownership, stale/deadline replies, merged releases, modifier restore contract, lock quarantine, retirement\n";

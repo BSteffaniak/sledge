@@ -115,6 +115,14 @@ def step(qmp, name):
     elif name == "capability-remove":
         qmp.command("device_del", {"id": "capability-keyboard"})
         time.sleep(1)
+    elif name == "replacement-alt":
+        qmp.key("alt", True)
+        qmp.pair("a")
+        qmp.key("alt", False)
+    elif name == "daemon-a-down":
+        qmp.key("a", True)
+    elif name == "daemon-a-up":
+        qmp.key("a", False)
     elif name == "replacement-a":
         qmp.pair("a")
     elif name == "replacement-extra":
@@ -174,6 +182,7 @@ def main():
                 text = line.decode().strip()
                 print(f"QMP_GUEST {text}", flush=True)
                 if text == "DONE":
+                    stream.write(b"OK\n")
                     completed = True
                     break
                 if not text.startswith("STEP "):

@@ -79,6 +79,40 @@
       in
       {
         packages = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          sledge =
+            (pkgs.makeRustPlatform {
+              cargo = rustToolchain;
+              rustc = rustToolchain;
+            }).buildRustPackage
+              {
+                pname = "sledge";
+                version = "0.0.1-alpha.0";
+                src = pkgs.lib.cleanSourceWith {
+                  src = ./.;
+                  filter =
+                    path: type:
+                    let
+                      name = builtins.baseNameOf path;
+                    in
+                    name != "target" && name != ".git" && type != "symlink";
+                };
+                cargoLock.lockFile = ./Cargo.lock;
+                cargoBuildFlags = [
+                  "-p"
+                  "sledge"
+                  "--bin"
+                  "sledge"
+                ];
+                cargoTestFlags = [
+                  "-p"
+                  "sledge"
+                ];
+                meta = {
+                  description = "Keyboard rule daemon (backend qualification is separate from packaging)";
+                  mainProgram = "sledge";
+                  platforms = pkgs.lib.platforms.linux;
+                };
+              };
           hyprland-sdk = sdk;
           # Stock build is the host derivation; patched build has a distinct ABI.
           hyprland-source-build = hyprlandPkgs.hyprland;

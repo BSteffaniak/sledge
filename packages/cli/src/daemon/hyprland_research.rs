@@ -124,9 +124,9 @@ impl ResearchListener {
     }
 }
 
-struct Handler {
-    matching: Arc<Mutex<MatchingState>>,
-    sources: Option<SourceQueue>,
+pub(super) struct Handler {
+    pub(super) matching: Arc<Mutex<MatchingState>>,
+    pub(super) sources: Option<SourceQueue>,
 }
 impl EventHandler for Handler {
     fn propose(&mut self, scope: Scope, event: &Event) -> Decision {
@@ -175,6 +175,17 @@ impl EventHandler for Handler {
         let MatchingState {
             matcher, hyprland, ..
         } = &mut *state;
+        tracing::debug!(
+            generation = scope.generation,
+            epoch = scope.lock_epoch,
+            sequence = scope.sequence,
+            nonce = scope.nonce,
+            key = event.key,
+            state = event.state,
+            focus_kind = event.focus_kind,
+            ?report,
+            "Hyprland native delivery outcome"
+        );
         if event.state == 1 {
             hyprland.on_delivery(matcher, scope, &report);
         } else {
@@ -189,7 +200,17 @@ impl EventHandler for Handler {
         if matches!(body, Body::Reset(3)) {
             hyprland.await_lifecycle_reconciliation(matcher, scope, body);
         }
-        if !hyprland.reconciled(matcher, scope, body) {
+        let reconciled = hyprland.reconciled(matcher, scope, body);
+        if matches!(body, Body::Reset(8)) {
+            tracing::debug!(
+                epoch = scope.lock_epoch,
+                sequence = scope.sequence,
+                nonce = scope.nonce,
+                accepted = reconciled,
+                "Hyprland native reconciliation"
+            );
+        }
+        if !reconciled {
             hyprland.invalidate_speculation(matcher);
         }
         if matches!(body, Body::Retire(_)) {

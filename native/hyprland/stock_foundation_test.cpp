@@ -1,3 +1,6 @@
+#include "drain_state.hpp"
+#include "startup_output.hpp"
+#include "output_recovery.hpp"
 #include "hook_transaction.hpp"
 #include "physical_devices.hpp"
 #include "identity_policy.hpp"
@@ -117,6 +120,36 @@ void phases() {
     assert(!phase.observe(false) && phase.routeLocked()); // rejected request stays uncertain
 }
 void recovery() {
+    DrainState drain;
+    assert(drain.mayPropose() && !drain.ready(true));
+    drain.request();assert(!drain.mayPropose() && drain.active());
+    assert(!drain.ready(false) && drain.ready(true));
+    drain.request();assert(!drain.mayPropose());
+    assert(!drain.ready(false)); // later input invalidates readiness, not drain intent
+    assert(!drain.commit(false) && !drain.detached());
+    assert(drain.commit(true) && drain.detached());
+    drain.request();assert(drain.detached() && !drain.mayPropose());
+    assert(drain.commit(false)); // durable after later physical input
+    StockPressedLedger ledger;
+    assert(ledger.empty());ledger.seatRoute(30,true);assert(!ledger.empty());
+    ledger.seatRoute(30,false);assert(ledger.empty());
+    ledger.seatRoute(768,true);assert(!ledger.empty());
+    OutputRecovery invalid;
+    invalid.begin();invalid.include(nullptr);invalid.entered();
+    assert(invalid.pending() && !invalid.routesRetired() && !invalid.eligible(true,true,true));
+    OutputRecovery proof;
+    int oldA=0,oldB=0;
+    proof.begin();proof.include(&oldA);proof.include(&oldB);
+    proof.entered();assert(!proof.eligible(true,true,true));
+    proof.retired(&oldA);proof.entered();assert(!proof.routesRetired());
+    proof.retired(&oldB);assert(proof.routesRetired());
+    assert(!proof.eligible(true,true,true)); // retirement requires later fresh binding
+    proof.entered();
+    assert(!proof.eligible(false,true,true));
+    assert(!proof.eligible(true,false,true));
+    assert(!proof.eligible(true,true,false));
+    assert(proof.eligible(true,true,true));
+    proof.completed();assert(!proof.eligible(true,true,true));
     uint64_t generation=0,nonce=0,sequence=0,epoch=0;
     assert(bindConnection(1,17,generation,nonce,sequence,epoch));
     // Focus emits four controls before any key callback.
@@ -170,6 +203,28 @@ void recovery() {
 }
 }
 int main() {
+    // Pre-existing focused resource: no natural post-load enter/caps event.
+    // Admission stays closed until authoritative stock callbacks are replayed.
+    bool caps=false,bound=false;unsigned order=0;
+    assert(!(caps && bound));
+    refreshStockOutput([&] { assert(order++==0);caps=true; },
+        [&] { assert(order++==1 && caps);bound=true; });
+    assert(order==2 && caps && bound);
+    // A missing stock enter must not fabricate a binding.
+    bound=false;
+    refreshStockOutput([&] { caps=true; },[] {});
+    assert(!bound);
+    assert(startupReplayAllowed(true,true,true,false));
+    assert(!startupReplayAllowed(false,true,true,false));
+    assert(!startupReplayAllowed(true,false,true,false));
+    assert(!startupReplayAllowed(true,true,false,false));
+    assert(!startupReplayAllowed(true,true,true,true));
+    // A held pre-existing client receives no replay/leave/release until drained.
+    unsigned emitted=0;
+    if (startupReplayAllowed(false,false,true,true)) ++emitted;
+    assert(emitted==0);
+    if (startupReplayAllowed(true,true,true,false)) ++emitted;
+    assert(emitted==1);
     hooks(); devices(); phases(); recovery();
     for (const auto identity : {"", "unknown", "386376400119dd46a767c9f8c8791fd22c7b6e61"}) {
         bool rejected = false;

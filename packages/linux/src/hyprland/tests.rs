@@ -266,6 +266,26 @@ fn lock_advances_epoch_and_retire_never_reuses_generation() {
     assert_eq!(handler.resets, 2);
 }
 #[test]
+fn local_reconciliation_request_closes_transport_preserving_history() {
+    let (transport, peer) = pair();
+    let mut bridge = bridge(transport);
+    bridge.retired.insert(42);
+    bridge.previous_nonces.insert(6);
+    let nonce = bridge.nonce;
+    let epoch = bridge.epoch;
+    let mut handler = Handler::default();
+    bridge.request_reconciliation(&mut handler);
+    assert!(bridge.transport.is_none());
+    assert!(handler.disconnected);
+    assert!(bridge.awaiting_reconciliation);
+    assert_eq!(bridge.nonce, nonce);
+    assert_eq!(bridge.epoch, epoch);
+    assert!(bridge.retired.contains(&42));
+    assert!(bridge.previous_nonces.contains(&6));
+    drop(peer);
+}
+
+#[test]
 fn hello_identity_exact_and_capabilities_zero() {
     let (t, peer) = pair();
     let peer = Transport::from_fd(peer);

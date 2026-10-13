@@ -17,6 +17,7 @@ nix = { version = "0.29", default-features = false, features = [
 ] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
 sledge_core = { workspace = true }
 thiserror = { workspace = true }
 tokio = { version = "1", default-features = false, features = [

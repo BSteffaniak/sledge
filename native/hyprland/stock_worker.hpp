@@ -47,6 +47,8 @@ private:
             static_cast<unsigned long long>(generation),hex.data());
         ++traceCount;
     }
+    std::atomic<bool> transactionActive{false}, parked{false};
+    std::atomic<bool> parkRequested{false};
     std::jthread thread;
     static bool wait(int fd, short events, uint64_t deadline) noexcept {
         const auto now=monotonicNs();
@@ -113,6 +115,12 @@ private:
         connectionGeneration.store(generation,std::memory_order_release);
         ready.store(true,std::memory_order_release);
         while (!stop.stop_requested() && !closeRequested.load(std::memory_order_acquire)) {
+            if (parkRequested.load(std::memory_order_acquire) &&
+                readIndex.load(std::memory_order_acquire)==writeIndex.load(std::memory_order_acquire) && mailbox.idle()) {
+                parked.store(true,std::memory_order_release);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
             const auto read=readIndex.load(std::memory_order_relaxed);
             if (read!=writeIndex.load(std::memory_order_acquire)) {
                 const auto notification=notifications[read%notifications.size()];
@@ -145,11 +153,13 @@ private:
                 }
                 continue;
             }
+            transactionActive.store(true,std::memory_order_release);
             trace(event,"event",generation);
             const bool accepted=wire::get(event,48,8)==wire::get(hello,48,8) &&
                 exchange(fd,event,reply,deadline) && wire::decision(event,reply);
             trace(reply,"reply",generation);
             mailbox.complete(accepted ? reply : WirePacket{});
+            transactionActive.store(false,std::memory_order_release);
             if (!accepted) {
                 count(wire::get(event,48,8)!=wire::get(hello,48,8) ? Reason::StaleEvent : Reason::DecisionFailed);
                 break;
@@ -162,6 +172,11 @@ private:
     void run(std::stop_token stop,const std::string& path,WirePacket hello) {
         const auto seed=wire::get(hello,48,8);
         for (uint64_t generation=1; !stop.stop_requested() && generation; ++generation) {
+            if (parkRequested.load(std::memory_order_acquire)) {
+                if (mailbox.idle()) parked.store(true,std::memory_order_release);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                --generation;continue;
+            }
             const auto nonce=seed+generation-1;
             if (!nonce) break; // never reuse after nonce wrap
             wire::put(hello,48,8,nonce);
@@ -174,7 +189,9 @@ private:
 public:
     StockWorker(DecisionMailbox& decisions, std::string endpoint, WirePacket hello) : mailbox(decisions),
         thread([this,endpoint=std::move(endpoint),hello](std::stop_token stop) {
+#ifndef SLEDGE_STOCK_PRODUCTION
             if (const auto* enabled=std::getenv("SLEDGE_STOCK_RESEARCH_WIRE_TRACE")) tracePackets=std::strcmp(enabled,"1")==0;
+#endif
             try { run(stop,endpoint,hello); } catch (...) { count(Reason::Exception);ready.store(false); }
         }) {}
     StockWorker(const StockWorker&) = delete;
@@ -186,7 +203,7 @@ public:
         closeRequested.store(true,std::memory_order_release);
     }
     bool notify(const WirePacket& packet) noexcept {
-        if (!connected()) return false;
+        if (!connected() || parkRequested.load(std::memory_order_acquire)) return false;
         const auto write=writeIndex.load(std::memory_order_relaxed);
         if (write-readIndex.load(std::memory_order_acquire)==notifications.size()) return false;
         const auto generation=connectionGeneration.load(std::memory_order_acquire);
@@ -194,6 +211,12 @@ public:
         notifications[write%notifications.size()]={packet,generation};
         writeIndex.store(write+1,std::memory_order_release);
         return true;
+    }
+    void requestPark() noexcept { parkRequested.store(true,std::memory_order_release); }
+    bool idleParked() const noexcept {
+        return parked.load(std::memory_order_acquire) && mailbox.idle() &&
+            !transactionActive.load(std::memory_order_acquire) &&
+            readIndex.load(std::memory_order_acquire)==writeIndex.load(std::memory_order_acquire);
     }
     uint64_t reasonCount(Reason reason) const noexcept {
         return reasons[static_cast<unsigned>(reason)].load(std::memory_order_relaxed);

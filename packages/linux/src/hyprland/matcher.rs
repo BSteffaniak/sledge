@@ -387,6 +387,12 @@ impl MatcherTransactions {
         }
         matcher.reset_device(DeviceId(generation));
     }
+    /// Uncertainty requires fresh admission, not an already armed reason8.
+    /// This observation never clears matcher ownership.
+    #[must_use]
+    pub const fn needs_reconciliation(&self) -> bool {
+        self.replacement_disabled && self.recovery_nonce.is_none()
+    }
     /// Invalidate focus/reconnect/keymap speculation without clearing physical
     /// matcher holds. A pending unacknowledged decision is uncertainty and keeps
     /// replacement disabled until explicit native reconciliation. An ordinary

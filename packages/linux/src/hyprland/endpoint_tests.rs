@@ -114,3 +114,42 @@ fn passive_listener_matches_native_client_zero_scope_hello() {
     drop(listener);
     assert!(!path.exists());
 }
+
+#[test]
+fn listener_rejects_permission_loss_and_endpoint_replacement_without_cleanup_damage() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("peer");
+    let listener = super::listener::Listener::bind(&path).unwrap();
+    let peer = transport::Peer {
+        uid: nix::unistd::geteuid().as_raw(),
+        pid: i32::try_from(std::process::id()).unwrap(),
+    };
+    std::fs::set_permissions(&fixture.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        listener
+            .accept(peer, monotonic_ns().unwrap() + 100_000_000)
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    std::fs::set_permissions(&fixture.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert_eq!(
+        listener
+            .accept(peer, monotonic_ns().unwrap() + 100_000_000)
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, "substituted").unwrap();
+    assert!(
+        listener
+            .accept(peer, monotonic_ns().unwrap() + 100_000_000)
+            .is_err()
+    );
+    drop(listener);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "substituted");
+}

@@ -72,6 +72,22 @@ pub struct RunArgs {
     #[command(flatten)]
     pub linux_hyprland_research: HyprlandResearchArgs,
 
+    /// Installed Hyprland backend registration. Unsupported or unqualified
+    /// artifacts are rejected before connecting; this is not a capture override.
+    #[cfg(target_os = "linux")]
+    #[arg(long, requires_all = ["linux_hyprland_pid", "linux_hyprland_socket"], conflicts_with_all = ["linux_broker_socket", "linux_hyprland_research_socket"])]
+    pub linux_hyprland_registration: Option<PathBuf>,
+
+    /// Private endpoint for an installed, compile-catalogued Hyprland backend.
+    #[cfg(target_os = "linux")]
+    #[arg(long, requires = "linux_hyprland_registration")]
+    pub linux_hyprland_socket: Option<PathBuf>,
+
+    /// Exact same-user compositor PID for the installed backend registration.
+    #[cfg(target_os = "linux")]
+    #[arg(long, requires = "linux_hyprland_registration", value_parser = clap::value_parser!(i32).range(1..))]
+    pub linux_hyprland_pid: Option<i32>,
+
     /// Explicit source-only input method overlay.
     #[cfg(target_os = "linux")]
     #[arg(long, value_enum, requires = "linux_desktop")]

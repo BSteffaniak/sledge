@@ -42,6 +42,59 @@ fn report(result: ResultKind) -> DeliveryReport {
     })
 }
 #[test]
+fn reload_late_ack_requests_fresh_reconciliation_without_clearing_hold() {
+    let mut a = adapter(Action::SendKey {
+        key: KeyCode::KeyB,
+        mods: Modifiers::empty(),
+    });
+    let old = scope();
+    assert!(!a.transactions.needs_reconciliation());
+    a.propose(old, &event(1), Some("app"), Instant::now())
+        .unwrap();
+    a.invalidate_speculation();
+    assert!(!a.on_delivery(old, &report(ResultKind::Replaced)));
+    assert!(a.transactions.needs_reconciliation());
+    // Lost settlement remains conservatively consumed until physical proof.
+    assert!(matches!(
+        a.matcher.dispatch_device(
+            DeviceId(old.generation),
+            KeyEvent {
+                code: KeyCode::KeyA,
+                kind: EventKind::KeyDown,
+                mods: Modifiers::empty()
+            },
+            Some("app"),
+            Instant::now()
+        ),
+        Verdict::Swallow
+    ));
+    a.disconnected();
+    assert!(a.transactions.needs_reconciliation());
+    assert!(a.await_reconciliation(8));
+    assert!(!a.transactions.needs_reconciliation());
+    let mut fresh = old;
+    fresh.nonce = 8;
+    fresh.generation = 0;
+    assert!(a.reconciled(fresh, &super::super::wire::Body::Reset(8)));
+    fresh.generation = 1;
+    assert_eq!(
+        a.propose(fresh, &event(1), Some("app"), Instant::now())
+            .unwrap(),
+        Decision::Replace {
+            key: 48,
+            modifiers: 0
+        }
+    );
+    assert!(a.on_delivery(fresh, &report(ResultKind::Replaced)));
+    assert!(!a.transactions.needs_reconciliation());
+    // Normal reload without an in-flight token needs no reconnect.
+    a.invalidate_speculation();
+    assert!(!a.transactions.needs_reconciliation());
+    assert!(!a.on_delivery(fresh, &report(ResultKind::OriginalAdmitted)));
+    assert!(!a.transactions.needs_reconciliation());
+}
+
+#[test]
 fn actual_rejection_restores_repeat_original_and_token_is_one_shot() {
     let mut a = adapter(Action::SendKey {
         key: KeyCode::KeyB,

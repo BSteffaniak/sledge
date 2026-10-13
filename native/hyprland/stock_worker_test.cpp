@@ -116,6 +116,11 @@ void connection() {
             assert(worker.notify(outcome));
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        worker.requestPark();
+        const auto parkDeadline=std::chrono::steady_clock::now()+std::chrono::seconds(1);
+        while (!worker.idleParked() && std::chrono::steady_clock::now()<parkDeadline) std::this_thread::yield();
+        assert(worker.idleParked());
+        assert(!worker.notify(boundary));
         worker.invalidate();
         assert(!worker.connected() && worker.reasonCount(StockWorker::Reason::RequestedClose)==1);
     }

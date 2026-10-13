@@ -1,0 +1,16 @@
+[daemon]
+log_level = "debug"
+
+[app_aliases.native_fixture.linux_ids]
+wayland = "wev"
+
+[app_aliases.x_fixture.linux_ids]
+x11_class = "SledgeFixtureX11"
+
+[app_aliases.wrong_fixture.linux_ids]
+wayland = "sledge-deliberately-wrong"
+x11_class = "sledge-deliberately-wrong"
+
+[[binding]]
+trigger = { key = "KeyA", mods = [] }
+action = { type = "send_key", key = "KeyB", mods = [] }

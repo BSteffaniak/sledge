@@ -67,10 +67,38 @@ class Router {
 public:
     uint64_t lockEpoch() const noexcept { return epoch; }
     uint64_t focusEpoch() const noexcept { return focus; }
-    bool quiescent() const noexcept {
+    struct Diagnostics {
+        uint64_t owners=0,forwarded=0,consumed=0,quarantined=0,stockConsumed=0,locker=0;
+        uint64_t firstDevice=0;uint32_t firstKey=keyCount;
+        bool fatal=false,pending=false,locked=false;
+    };
+    Diagnostics diagnostics() const noexcept {
+        Diagnostics result{};result.fatal=fatal;result.pending=pending.has_value();result.locked=locked;
+        for (const auto& device : devices) for (uint32_t key=0;key<keyCount;++key) {
+            const auto owner=device.owners[key];if (owner==Owner::None) continue;
+            if (!result.owners) { result.firstDevice=device.id;result.firstKey=key; }
+            ++result.owners;
+            switch (owner) {
+                case Owner::Forwarded: ++result.forwarded;break;
+                case Owner::Consumed: ++result.consumed;break;
+                case Owner::Quarantined: ++result.quarantined;break;
+                case Owner::StockConsumed: ++result.stockConsumed;break;
+                case Owner::LockerOwned: ++result.locker;break;
+                case Owner::None: break;
+            }
+        }
+        return result;
+    }
+    bool ownershipEmpty() const noexcept {
         for (const auto& device : devices)
             for (const auto owner : device.owners) if (owner!=Owner::None) return false;
-        return !pending && !fatal;
+        return !pending;
+    }
+    bool quiescent() const noexcept { return ownershipEmpty() && !fatal; }
+    bool recoverRetiredOutput(bool exactRetirementProof) noexcept {
+        if (!fatal || !exactRetirementProof || !ownershipEmpty() || locked) return false;
+        fatal=false;++epoch;++focus;
+        return true;
     }
     bool add(uint64_t id) {
         if (id == 0 || id <= lastGeneration || find(id)) return false;
@@ -220,10 +248,18 @@ public:
         if (!device) return;
         ++epoch;
         pending.reset();
+        const auto beforeModifiers=forwardedModifiers();
+        bool releasedOutput=false;
         for (uint32_t key = 0; key < keyCount; ++key)
-            if (device->owners[key] == Owner::Forwarded && !otherForwarded(id, key) && !output.release(key)) fatal = true;
+            if (device->owners[key] == Owner::Forwarded && !otherForwarded(id, key)) {
+                releasedOutput=true;
+                if (!output.release(key)) fatal = true;
+            }
         *device = Device{};
-        if (!output.reconcileModifiers(forwardedModifiers())) fatal = true;
+        // Retirement without any client-held key is not an output transaction.
+        // In particular pre-focus hotplug must not manufacture uncertainty.
+        if ((releasedOutput || beforeModifiers!=forwardedModifiers()) &&
+            !output.reconcileModifiers(forwardedModifiers())) fatal = true;
     }
 };
 } // namespace sledge::hyprland
