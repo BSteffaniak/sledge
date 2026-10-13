@@ -129,6 +129,15 @@ pub(super) struct Handler {
     pub(super) sources: Option<SourceQueue>,
 }
 impl EventHandler for Handler {
+    fn causal_trace(&mut self, t: sledge_linux::hyprland::causal::CausalTrace) {
+        tracing::debug!(nonce=t.scope.nonce, epoch=t.scope.lock_epoch, sequence=t.scope.sequence,
+            generation=t.scope.generation, deadline_ns=t.scope.deadline_ns,
+            received_ns=?t.received_ns, decision_send_start_ns=?t.decision_send_start_ns,
+            decision_send_return_ns=?t.decision_send_return_ns, decision_sent_ns=?t.decision_sent_ns,
+            outcome_received_ns=?t.outcome_received_ns, terminal_ns=?t.terminal_ns,
+            terminal=?t.terminal, "Hyprland causal transaction");
+    }
+
     fn propose(&mut self, scope: Scope, event: &Event) -> Decision {
         // Never block a native deadline behind config reload parsing/publication.
         let Some(mut state) = self.matching.try_lock() else {

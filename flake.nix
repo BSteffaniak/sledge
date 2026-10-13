@@ -17,7 +17,12 @@
       flake-utils,
       rust-overlay,
     }:
-    flake-utils.lib.eachDefaultSystem (
+    {
+      nixosModules.sledgeHyprland = import ./packaging/linux/hyprland/module.nix;
+      lib.mkQualifiedHyprland = import ./packaging/linux/hyprland/qualified.nix;
+      lib.prepareQualifiedHyprlandArtifacts = import ./packaging/linux/hyprland/artifacts.nix;
+    }
+    // flake-utils.lib.eachDefaultSystem (
       system:
       let
         overlays = [ (import rust-overlay) ];

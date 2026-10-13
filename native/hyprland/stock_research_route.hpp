@@ -277,6 +277,8 @@ public:
         ++unmappedEvents;
         return {};
     }
+    // Read-only slot view for bounded query-time map observations.
+    const auto& mapObservationSlots() const noexcept { return registered; }
     bool registeredMap(SP<IKeyboard> keyboard) const noexcept {
         if (!keyboard || keyboard->isVirtual() || !keyboard->m_enabled || !keyboard->m_allowed) return false;
         for (const auto& slot : registered)

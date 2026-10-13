@@ -34,6 +34,23 @@ class QMP:
                 raise RuntimeError("malformed QMP response")
             return response["return"]
 
+    def pipelined_pairs(self, count=100):
+        if count != 100:
+            raise ValueError("qualification pipeline is exactly 100 pairs")
+        for sequence in range(count * 2):
+            request = {"execute": "input-send-event", "id": sequence, "arguments": {
+                "events": [{"type": "key", "data": {"down": sequence % 2 == 0,
+                            "key": {"type": "qcode", "data": "a"}}}]}}
+            self.stream.write((json.dumps(request) + "\n").encode())
+        pending = set(range(count * 2))
+        while pending:
+            response = self.receive()
+            if "event" in response:
+                continue
+            if "error" in response or "return" not in response or response.get("id") not in pending:
+                raise RuntimeError(f"invalid pipelined input receipt: {response}")
+            pending.remove(response["id"])
+
     def key(self, code, down, device=None):
         arguments = {"events": [{"type": "key", "data": {
             "down": down, "key": {"type": "qcode", "data": code}}}]}
@@ -123,10 +140,14 @@ def step(qmp, name):
         schema = qmp.command("query-qmp-schema")
         print("QMP_MIXED_SCHEMA", json.dumps([s for s in schema if s.get("name") == "input-send-event"]), flush=True)
         qmp.key("alt", True, "display-a")
+    elif name == "candidate-mixed-y":
+        qmp.pair("y", "display-b")
     elif name == "candidate-mixed-a":
         qmp.pair("a", "display-b")
     elif name == "candidate-mixed-up":
         qmp.key("alt", False, "display-a")
+    elif name == "candidate-pipelined":
+        qmp.pipelined_pairs()
     elif name == "candidate-stress":
         for _ in range(100):
             qmp.pair("a")
@@ -212,7 +233,7 @@ def main():
                     raise RuntimeError(f"unexpected guest control: {text}")
                 step(qmp, text[5:])
                 stream.write(b"OK\n")
-            status = child.wait(timeout=30)
+            status = child.wait(timeout=100)
             if not completed:
                 raise RuntimeError("guest fixture did not complete")
             return status

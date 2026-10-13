@@ -1,4 +1,5 @@
 #pragma once
+#include "causal_timing.hpp"
 #include "stock_wire.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +30,14 @@ public:
 private:
     std::array<std::atomic<uint64_t>,static_cast<unsigned>(Reason::Count)> reasons{};
     void count(Reason reason) noexcept { reasons[static_cast<unsigned>(reason)].fetch_add(1,std::memory_order_relaxed); }
+    CausalTiming* timing=nullptr;
+    void observe(CausalTiming::Phase phase,const WirePacket& packet,uint64_t generation,bool ok=true) noexcept {
+        if (timing) timing->record(phase,packet,generation,ok);
+    }
+    bool observedSend(int fd,const WirePacket& packet,uint64_t generation,CausalTiming::Phase start) noexcept {
+        observe(start,packet,generation);
+        return send(fd,packet.data(),packet.size(),MSG_NOSIGNAL)==512;
+    }
     DecisionMailbox& mailbox;
     std::atomic<bool> ready{false};
     std::atomic<bool> acknowledged{false}, closeRequested{false};
@@ -131,9 +140,13 @@ private:
                     continue;
                 }
                 const auto deadline=wire::get(packet,40,8);
-                if (!wait(fd,POLLOUT,deadline) || send(fd,packet.data(),packet.size(),MSG_NOSIGNAL)!=512) {
+                if (!wait(fd,POLLOUT,deadline) ||
+                    !(wire::get(packet,6,2)==5 ? observedSend(fd,packet,generation,CausalTiming::Phase::OutcomeSendStart) :
+                      send(fd,packet.data(),packet.size(),MSG_NOSIGNAL)==512)) {
+                    if (wire::get(packet,6,2)==5) observe(CausalTiming::Phase::OutcomeSend,packet,generation,false);
                     count(Reason::NotifyFailed);break;
                 }
+                if (wire::get(packet,6,2)==5) observe(CausalTiming::Phase::OutcomeSend,packet,generation);
                 trace(packet,"notify",generation);
                 readIndex.store(read+1,std::memory_order_release);
                 continue;
@@ -156,9 +169,15 @@ private:
             }
             transactionActive.store(true,std::memory_order_release);
             trace(event,"event",generation);
-            const bool accepted=wire::get(event,48,8)==wire::get(hello,48,8) &&
-                exchange(fd,event,reply,deadline) && wire::decision(event,reply);
+            const bool sent=wire::get(event,48,8)==wire::get(hello,48,8) &&
+                wait(fd,POLLOUT,deadline) && observedSend(fd,event,generation,CausalTiming::Phase::EventSendStart);
+            observe(CausalTiming::Phase::EventSend,event,generation,sent);
+            const bool received=sent && wait(fd,POLLIN,deadline) && recv(fd,reply.data(),reply.size(),MSG_TRUNC)==512;
+            const auto receiveAt=monotonicNs();
+            const bool accepted=received && receiveAt<deadline && wire::decision(event,reply);
+            if (timing) timing->record(CausalTiming::Phase::DecisionReceive,event,generation,received,receiveAt);
             trace(reply,"reply",generation);
+            observe(CausalTiming::Phase::MailboxPublish,event,generation,accepted);
             mailbox.complete(accepted ? reply : WirePacket{});
             transactionActive.store(false,std::memory_order_release);
             if (!accepted) {
@@ -199,7 +218,7 @@ private:
         }
     }
 public:
-    StockWorker(DecisionMailbox& decisions, std::string endpoint, WirePacket hello) : mailbox(decisions),
+    StockWorker(DecisionMailbox& decisions, std::string endpoint, WirePacket hello,CausalTiming* observations=nullptr) : timing(observations),mailbox(decisions),
         thread([this,endpoint=std::move(endpoint),hello](std::stop_token stop) {
 #ifndef SLEDGE_STOCK_PRODUCTION
             if (const auto* enabled=std::getenv("SLEDGE_STOCK_RESEARCH_WIRE_TRACE")) tracePackets=std::strcmp(enabled,"1")==0;
@@ -215,11 +234,16 @@ public:
         closeRequested.store(true,std::memory_order_release);
     }
     bool notify(const WirePacket& packet) noexcept {
-        if (!connected() || parkRequested.load(std::memory_order_acquire)) return false;
-        const auto write=writeIndex.load(std::memory_order_relaxed);
-        if (write-readIndex.load(std::memory_order_acquire)==notifications.size()) return false;
         const auto generation=connectionGeneration.load(std::memory_order_acquire);
-        if (wire::get(packet,48,8)!=connectionNonce.load(std::memory_order_acquire)) return false;
+        const auto rejected=[&] {
+            if (wire::get(packet,6,2)==5) observe(CausalTiming::Phase::OutcomeEnqueue,packet,generation,false);
+            return false;
+        };
+        if (!connected() || parkRequested.load(std::memory_order_acquire)) return rejected();
+        const auto write=writeIndex.load(std::memory_order_relaxed);
+        if (write-readIndex.load(std::memory_order_acquire)==notifications.size()) return rejected();
+        if (wire::get(packet,48,8)!=connectionNonce.load(std::memory_order_acquire)) return rejected();
+        if (wire::get(packet,6,2)==5) observe(CausalTiming::Phase::OutcomeEnqueue,packet,generation);
         notifications[write%notifications.size()]={packet,generation};
         writeIndex.store(write+1,std::memory_order_release);
         return true;

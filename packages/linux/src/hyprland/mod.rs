@@ -1,6 +1,7 @@
 //! Worker-side native event/actual-outcome bridge. Not an InputBackend and not
 //! capture qualification: callers must not enable stock hooks from this API.
 pub mod catalogue;
+pub mod causal;
 pub mod listener;
 pub mod matcher;
 pub mod session;
@@ -62,6 +63,8 @@ impl DeliveryReport {
 /// Physical output ownership and reconciliation remain native responsibilities.
 pub trait EventHandler {
     fn propose(&mut self, scope: Scope, event: &Event) -> Decision;
+    /// One bounded record after transaction settlement; no logging in deadline window.
+    fn causal_trace(&mut self, _trace: causal::CausalTrace) {}
     /// Isolated research only, one selected proposal. Default has no fault.
     fn research_fault(&mut self, _scope: Scope, _event: &Event) -> ResearchFault {
         ResearchFault::None
@@ -333,10 +336,22 @@ impl Bridge {
         deadline_ns: u64,
         research: bool,
     ) -> io::Result<()> {
+        let received_ns = monotonic_ns().ok();
         let unlocked_epoch = !self.locked && matches!(packet.body, Body::Lock { state: 0, .. });
-        self.validate(&packet)?;
+        if let Err(error) = self.validate(&packet) {
+            if matches!(packet.body, Body::Event(_)) {
+                let mut trace = causal::CausalTrace::received(packet.scope);
+                trace.received_ns = received_ns;
+                trace.terminal = causal::CausalTerminal::Rejected;
+                trace.terminal_ns = monotonic_ns().ok();
+                handler.causal_trace(trace);
+            }
+            return Err(error);
+        }
         match &packet.body {
-            Body::Event(event) => self.event(handler, &packet, event, deadline_ns, research),
+            Body::Event(event) => {
+                self.event(handler, &packet, event, deadline_ns, research, received_ns)
+            }
             Body::Reset(_) | Body::Retire(_) | Body::Lock { .. } => {
                 if matches!(packet.body, Body::Reset(2 | 3)) && packet.scope.generation == 0 {
                     self.awaiting_reconciliation = true;
@@ -418,6 +433,26 @@ impl Bridge {
         event: &Event,
         deadline_ns: u64,
         research: bool,
+        received_ns: Option<u64>,
+    ) -> io::Result<()> {
+        let mut trace = causal::CausalTrace::received(packet.scope);
+        trace.received_ns = received_ns;
+        let result = self.event_traced(handler, packet, event, deadline_ns, research, &mut trace);
+        if result.is_err() {
+            trace.terminal = causal::CausalTerminal::Uncertain;
+        }
+        trace.terminal_ns = monotonic_ns().ok();
+        handler.causal_trace(trace);
+        result
+    }
+    fn event_traced(
+        &self,
+        handler: &mut impl EventHandler,
+        packet: &Packet,
+        event: &Event,
+        deadline_ns: u64,
+        research: bool,
+        trace: &mut causal::CausalTrace,
     ) -> io::Result<()> {
         // Capture remains unqualified. Do not dispatch to a stateful matcher.
         let decision = if research && !self.locked && event.state == 1 {
@@ -436,16 +471,20 @@ impl Bridge {
             return Err(error);
         }
         let transport = self.transport.as_ref().ok_or_else(wire::invalid)?;
-        if let Err(error) = transport.send(
+        trace.decision_send_start_ns = monotonic_ns().ok();
+        let sent = transport.send(
             &Packet {
                 scope: packet.scope,
                 body: Body::Decision(decision),
             },
             deadline,
-        ) {
+        );
+        trace.decision_send_return_ns = monotonic_ns().ok();
+        if let Err(error) = sent {
             handler.delivery(packet.scope, event, decision, DeliveryReport::Uncertain);
             return Err(error);
         }
+        trace.decision_sent_ns = trace.decision_send_return_ns;
         if matches!(fault, ResearchFault::DisconnectAfterDecision) {
             handler.delivery(packet.scope, event, decision, DeliveryReport::Uncertain);
             return Err(io::Error::new(
@@ -454,6 +493,7 @@ impl Bridge {
             ));
         }
         let result = transport.receive(deadline).and_then(|ack| {
+            trace.outcome_received_ns = monotonic_ns().ok();
             let Body::Outcome(outcome) = ack.body else {
                 return Err(wire::invalid());
             };
@@ -474,6 +514,9 @@ impl Bridge {
         let report = result.as_ref().map_or(DeliveryReport::Uncertain, |o| {
             DeliveryReport::Acknowledged(o.clone())
         });
+        if matches!(report, DeliveryReport::Acknowledged(_)) {
+            trace.terminal = causal::CausalTerminal::Acknowledged;
+        }
         handler.delivery(packet.scope, event, decision, report);
         if result
             .as_ref()

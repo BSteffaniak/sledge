@@ -52,7 +52,7 @@ if [[ -n ${SLEDGE_VM_PAYLOAD_SCRATCH:-} ]]; then
 fi
 # Namespace-local /tmp remains disposable; payload disk/state uses explicit scratch.
 mixed_opts=''
-if [[ -n ${SLEDGE_VM_PAYLOAD_SCRATCH:-} && -f $SLEDGE_VM_PAYLOAD_SCRATCH/root/sledge-payload/mixed-case ]]; then
+if [[ -n ${SLEDGE_VM_PAYLOAD_SCRATCH:-} ]] && { [[ -f $SLEDGE_VM_PAYLOAD_SCRATCH/root/sledge-payload/mixed-case ]] || [[ -f $SLEDGE_VM_PAYLOAD_SCRATCH/root/sledge-payload/different-map-case ]]; }; then
  mixed_opts='-device secondary-vga,id=display-a -device secondary-vga,id=display-b -device usb-kbd,bus=qualification-usb.0,id=mixed-usb,display=display-a -device virtio-keyboard-pci,id=mixed-virtio,display=display-b'
 fi
 timeout --signal=TERM --kill-after=3s 180s \

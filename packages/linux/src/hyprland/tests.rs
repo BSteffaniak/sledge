@@ -266,6 +266,105 @@ fn lock_advances_epoch_and_retire_never_reuses_generation() {
     assert_eq!(handler.resets, 2);
 }
 #[test]
+fn causal_trace_orders_ack_and_reports_uncertainty_without_focus() {
+    struct Traces(Vec<super::causal::CausalTrace>);
+    impl EventHandler for Traces {
+        fn propose(&mut self, _: Scope, _: &Event) -> Decision {
+            Decision::Pass
+        }
+        fn delivery(&mut self, _: Scope, _: &Event, _: Decision, _: DeliveryReport) {}
+        fn reset(&mut self, _: Scope, _: &Body) {}
+        fn disconnected(&mut self) {}
+        fn causal_trace(&mut self, t: super::causal::CausalTrace) {
+            self.0.push(t);
+        }
+    }
+    for acknowledged in [true, false] {
+        let (transport, peer) = pair();
+        let mut bridge = bridge(transport);
+        let packet = packet();
+        raw(&peer, &packet.encode().unwrap());
+        if acknowledged {
+            raw(
+                &peer,
+                &Packet {
+                    scope: packet.scope,
+                    body: Body::Outcome(Outcome {
+                        result: ResultKind::OriginalAdmitted,
+                        reason: 0,
+                        key: 30,
+                        state: 1,
+                        focus_epoch: 9,
+                    }),
+                }
+                .encode()
+                .unwrap(),
+            );
+        }
+        let mut h = Traces(Vec::new());
+        let result = bridge.step(&mut h, packet.scope.deadline_ns);
+        assert_eq!(result.is_ok(), acknowledged);
+        assert_eq!(h.0.len(), 1);
+        let t = h.0[0];
+        assert_eq!(t.scope, packet.scope);
+        assert!(t.received_ns.unwrap() <= t.decision_send_start_ns.unwrap());
+        assert!(t.decision_send_start_ns.unwrap() <= t.decision_send_return_ns.unwrap());
+        assert_eq!(t.decision_sent_ns, t.decision_send_return_ns);
+        assert!(t.decision_sent_ns.unwrap() <= t.terminal_ns.unwrap());
+        assert_eq!(t.outcome_received_ns.is_some(), acknowledged);
+        assert_eq!(
+            t.terminal,
+            if acknowledged {
+                super::causal::CausalTerminal::Acknowledged
+            } else {
+                super::causal::CausalTerminal::Uncertain
+            }
+        );
+    }
+}
+#[test]
+fn causal_failed_send_records_start_and_return_without_receipt() {
+    struct FailSend {
+        peer: Option<OwnedFd>,
+        trace: Option<super::causal::CausalTrace>,
+    }
+    impl EventHandler for FailSend {
+        fn propose(&mut self, _: Scope, _: &Event) -> Decision {
+            self.peer.take();
+            Decision::Pass
+        }
+        fn delivery(&mut self, _: Scope, _: &Event, _: Decision, _: DeliveryReport) {}
+        fn reset(&mut self, _: Scope, _: &Body) {}
+        fn disconnected(&mut self) {}
+        fn causal_trace(&mut self, t: super::causal::CausalTrace) {
+            self.trace = Some(t);
+        }
+    }
+    let (transport, peer) = pair();
+    let mut bridge = bridge(transport);
+    let packet = packet();
+    raw(&peer, &packet.encode().unwrap());
+    let mut h = FailSend {
+        peer: Some(peer),
+        trace: None,
+    };
+    assert!(
+        bridge
+            .research_step(&mut h, packet.scope.deadline_ns)
+            .is_err()
+    );
+    let t = h.trace.unwrap();
+    assert!(t.decision_send_start_ns.unwrap() <= t.decision_send_return_ns.unwrap());
+    assert!(t.decision_send_return_ns.unwrap() <= t.terminal_ns.unwrap());
+    assert_eq!(t.decision_sent_ns, None);
+    assert_eq!(t.outcome_received_ns, None);
+    assert_eq!(t.terminal, super::causal::CausalTerminal::Uncertain);
+    // A remote receiver can be scheduled during a sender's syscall interval.
+    // Its time must be compared with start, not constrained after return.
+    let (start, receive, returned) = (100_u64, 110_u64, 120_u64);
+    assert!(receive >= start && receive < returned);
+}
+#[test]
 fn validated_unlocked_epoch_is_distinct_from_real_unlock() {
     struct Controls {
         sync: usize,

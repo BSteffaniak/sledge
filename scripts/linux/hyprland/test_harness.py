@@ -75,6 +75,108 @@ native delivery outcome generation=2 epoch=7 sequence=7 nonce=123 key=30 state=1
         with self.assertRaisesRegex(ValueError, "replaced A-down"):
             validate(report)
 
+    def test_map_collector_rejects_drift_and_incomplete_digests(self):
+        from collect_maps import collect
+        def page(command):
+            offset = int(command.split()[-1])
+            return {"version": 1, "live": True, "offset": offset, "next_offset": offset + 1,
+                    "done": offset == 15, "nonce": 1, "connection_generation": 2,
+                    "ownership_epoch": 3, "selected_generation": 4, "generation": 4 if offset == 0 else 0,
+                    "present": offset == 0, "selected": offset == 0, "binding_valid": offset == 0,
+                    "name": "keyboard" if offset == 0 else "", "name_length_bytes": 8 if offset == 0 else 0,
+                    "name_truncated": False, "stored_map": {"status": "complete" if offset == 0 else "absent",
+                    "length_bytes": 10 if offset == 0 else 0, "sha256": 'a' * 64 if offset == 0 else None}}
+        self.assertTrue(collect(lambda cmd: json.dumps(page(cmd)))['complete'])
+        for field, value in [('nonce', 9), ('connection_generation', 9), ('ownership_epoch', 9), ('selected_generation', 9)]:
+            def drift(command):
+                item = page(command)
+                if item['offset'] == 1: item[field] = value
+                return json.dumps(item)
+            self.assertFalse(collect(drift)['complete'])
+        for raw in ('null', '{', 'x' * 8192):
+            self.assertFalse(collect(lambda _: raw)['complete'])
+        def missing(command):
+            item = page(command); item['stored_map']['sha256'] = None
+            return json.dumps(item)
+        self.assertFalse(collect(missing)['complete'])
+
+    def test_prehook_reader_refuses_non_guest_scope(self):
+        from prehook_bytes import OFFSETS, snapshot
+        self.assertEqual(len(OFFSETS), 10)
+        self.assertEqual(len(set(OFFSETS)), 10)
+        with patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/not-the-guest"}):
+            with self.assertRaisesRegex(ValueError, 'guest scope'):
+                snapshot(1)
+
+    def test_send_intervals_allow_receive_before_return_not_before_start(self):
+        from validate_causal import PHASES, check_intervals
+        times = [10, 20, 40, 60, 70, 80, 90, 100, 120]
+        phases = {p: {"at_ns": t, "ok": True} for p, t in zip(PHASES, times)}
+        stamps = (30, 45, 65, 110, 130)
+        self.assertEqual(check_intervals(phases, stamps), [(0, 10), (0, 15), (0, 10)])
+        for bad in ((19, 45, 65, 110, 130), (30, 61, 65, 110, 130),
+                    (30, 45, 65, 99, 130), (0, 45, 65, 110, 130)):
+            with self.assertRaises(ValueError):
+                check_intervals(phases, bad)
+        phases['event_send']['ok'] = False
+        with self.assertRaises(ValueError):
+            check_intervals(phases, stamps)
+
+    def test_causal_collector_pins_cut_and_rejects_partial_pages(self):
+        from collect_causal import collect
+        def page(cursor, end=13):
+            stop = min(cursor + 12, end)
+            return {"version": 1, "unit": "ns", "capacity": 2048,
+                    "snapshot_start": 0, "snapshot_end": end, "cursor": cursor,
+                    "next_cursor": stop, "observed_end": end + 2, "overwritten": 0,
+                    "dropped": 0, "done": stop == end, "page_complete": True,
+                    "missing_ids": [], "records": [{"id": i} for i in range(cursor + 1, stop + 1)]}
+        commands = []
+        def invoke(command):
+            commands.append(command)
+            return json.dumps(page(0 if len(commands) == 1 else 12))
+        result = collect(invoke)
+        self.assertTrue(result['complete'])
+        self.assertEqual(len(result['records']), 13)
+        self.assertEqual(commands, ['sledge:causal-timing', 'sledge:causal-timing 0 13 12 12'])
+        for field, value in [('missing_ids', [1]), ('dropped', 1), ('overwritten', 1),
+                             ('done', True), ('next_cursor', 14), ('cursor', 1), ('version', 2)]:
+            bad = page(0); bad[field] = value
+            self.assertFalse(collect(lambda _: json.dumps(bad))['complete'])
+        for raw in ('{', 'x' * 8192, 'null'):
+            self.assertFalse(collect(lambda _: raw)['complete'])
+
+    def test_causal_validation_rejects_missing_and_malformed_status(self):
+        from validate_causal import validate_causal
+        for text in ('', '{"version":1,', '{"version":1,"causal_timing":{}}'):
+            with self.assertRaises(ValueError):
+                validate_causal(text)
+        ring = {"version": 1, "unit": "ns", "capacity": 2048, "attempted": 0,
+                "overwritten": 0, "dropped": 1, "records": []}
+        with self.assertRaisesRegex(ValueError, 'ring incomplete'):
+            validate_causal(json.dumps({"version": 1, "causal_timing": ring}, separators=(',', ':')))
+        ring['dropped'] = 0
+        with self.assertRaisesRegex(ValueError, 'Rust causal records missing'):
+            validate_causal(json.dumps({"version": 1, "causal_timing": ring}, separators=(',', ':')))
+
+    def test_pipelined_input_has_exact_bounded_receipts(self):
+        import io
+        qmp = QMP.__new__(QMP)
+        qmp.stream = io.BytesIO()
+        receipts = iter([{"event": "RESET"}] + [{"id": i, "return": {}} for i in range(200)])
+        qmp.receive = lambda: next(receipts)
+        qmp.pipelined_pairs()
+        requests = [json.loads(line) for line in qmp.stream.getvalue().splitlines()]
+        self.assertEqual(len(requests), 200)
+        self.assertEqual([r["id"] for r in requests], list(range(200)))
+        self.assertEqual([r["arguments"]["events"][0]["data"]["down"] for r in requests], [True, False] * 100)
+        with self.assertRaises(ValueError):
+            qmp.pipelined_pairs(101)
+        for receipt in ({"id": 999, "return": {}}, {"id": 0, "error": {}}, {"id": 0}):
+            qmp.receive = lambda receipt=receipt: receipt
+            with self.assertRaises(RuntimeError):
+                qmp.pipelined_pairs()
+
     def test_required_acceptance_branches_reject_missing_phases(self):
         from validate_candidate import validate
         report = '''SLEDGE_CANDIDATE_SCOPE_PRESERVED
@@ -91,8 +193,8 @@ native reconciliation epoch=7 sequence=6 nonce=123 accepted=true
         report += 'EVIDENCE_FILE /tmp/candidate-consumer-events\n'
         for _ in range(2):
             report += 'PHASE_BEGIN candidate-a\nkey: 56; state: 1\nkey: 56; state: 0\nPHASE_END candidate-a\n'
-        for branch in ('deadline', 'mixed-source'):
-            with self.assertRaisesRegex(ValueError, 'required .* missing or incorrect'):
+        for branch in ('deadline', 'mixed-source', 'pipelined', 'different-map'):
+            with self.assertRaisesRegex(ValueError, 'required .* missing or incorrect|map observations missing'):
                 validate(report + f'REQUIRED_CASE {branch}\n')
 
     def test_payload_manifest_rejects_tampering_extra_files_and_symlinks(self):

@@ -53,5 +53,80 @@ Controller checks (no compositor contact):
 python3 packaging/linux/hyprland/test_drain_unload.py
 ```
 
+## Exact-build qualified factory (no default acceptance)
+
+Two-stage review avoids a hash-dependent artifact loop:
+1. `flake.lib.prepareQualifiedHyprlandArtifacts` / `artifacts.nix` takes only
+   compositor path/SHA and SDK string (plus explicitly selected pinned pkgs).
+   It builds the unaccepted qualified-mode plugin and exports `prospective`:
+   final installed registration bytes and `identity.json` with final plugin,
+   descriptor, source/build and SDK/compiler identities. It creates no catalogue,
+   approval, accepted evidence or daemon grant.
+2. External review/tests consume that exact artifact and supply evidence and an
+   independent acceptance record. `mkQualifiedHyprland` reconstructs the identical
+   plugin derivation (expected hashes/review are NOT its inputs), verifies the
+   **post-fixup installed** SO bytes, and uses those exact prospective descriptor
+   bytes before creating admission catalogue/daemon. Stripping/RPATH fixups remain
+   normal stdenv behavior and cannot escape the final digest check.
+
+Artifact preparation requires no plugin/descriptor hash guess; no fixed-point
+search or provisional fake accepted record is needed. Artifact build/VM testing
+is still required; evaluation-only checks do not establish release readiness.
+
+`flake.lib.mkQualifiedHyprland` / `qualified.nix` require externally accepted
+`contract`, immutable `evidence` and independent `acceptance` inputs. No supplied
+example is an accepted record. Contract fields:
+
+- `qualification_revision=1`, `feature_mask=1`, positive `approval_revision`;
+- SHA256 `compositor_sha256`, `plugin_sha256`, `descriptor_sha256`,
+  `evidence_sha256`, `acceptance_sha256`, `source_hash`, `build_id`;
+- exact `compositor_path`, `sdk_drv`, `compiler_drv`, `sdk_api_hash`.
+
+Source hash is SHA256 of the named `sledge-qualified-native` store source path;
+`build_id` hashes its source/SDK/compiler/revision/features JSON contract. Factory
+asserts closure identity and checks actual compiled plugin, compositor, descriptor
+and evidence digests. The independent acceptance file uses the library's strict
+`acceptance_revision=1` binding schema. Packaging is a trusted review boundary,
+not cryptographic proof against a malicious builder. SDK `unknown_...` is only
+corroborating: no broad version/ABI compatibility is inferred from it.
+
+Feature1 is fresh-Down send_key only, not taps/source actions. Existing normal
+package remains catalogue-free. Qualified-mode binary is a distinct artifact:
+its final descriptor/evidence must be independently reviewed and tested, not
+copied from candidate results without accepting the mode-specific artifact.
+
+### Explicit startup barrier
+
+Opt-in `nixosModules.sledgeHyprland` installs startup/drain tools only; it does
+**not** create a misleading graphical-session service or change compositor/app
+startup. Caller supplies the factory result in `programs.sledgeHyprland.package`.
+Integrate `sledge-hyprland-startup` synchronously at compositor startup, before
+other apps: supply explicit stock hyprctl, instance, PID, config, private adapter
+and IPC paths, and `--first-app /absolute/real/application ...`. The compositor
+must already carry `SLEDGE_HYPRLAND_PASSIVE_SOCKET` matching that endpoint.
+Plugin loads before the real first app; its natural enter establishes authority.
+Only accepted Supported **and** operational daemon status releases the barrier.
+Caller must arrange the remaining applications to wait for its successful exit.
+Parallel `exec-once` lines do not establish this ordering.
+
+There is intentionally no autonomous systemd unit: no generic user-unit ordering
+can promise plugin-before-apps, and failed ExecStop normally proceeds to process
+termination, violating retention on failed drain. Startup failure leaves loaded
+plugin/daemon intact and reports failure. Explicit drain controller waits for
+irreversible detach before unload; timeout never force-unloads or kills daemon.
+After successful unload, an administrator may stop the daemon normally. No stale
+socket deletion/restart policy is implied.
+
+### Causal diagnostics
+
+Debug `Hyprland causal transaction` records nonce/generation/epoch/sequence and
+original deadline plus optional monotonic receive/send/outcome/terminal times.
+One bounded record is emitted after settlement; no focus/credentials or wire
+extension. Missing clock readings remain null. Correlate with native timing;
+logging may perturb later scheduling and is not performance qualification.
+
+Evaluation/controller tests (no services or accepted build):
+`test_eval.nix`, `python3 -B test_startup.py`, `python3 -B test_drain_unload.py`.
+
 Host deployment remains gated on final production-path safety/behavior evidence
 and separate approval to change the active desktop.

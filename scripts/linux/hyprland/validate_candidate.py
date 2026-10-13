@@ -21,6 +21,33 @@ def validate(text):
         for probe in ("wrong-pid", "plugin_sha256", "build_id", "sdk_api_hash", "plugin_path"):
             require(f"IDENTITY_REJECT probe={probe} exit=1" in text,
                     f"identity rejection missing: {probe}")
+    if "REQUIRED_CASE causal" in text:
+        from validate_causal import validate_causal
+        validate_causal(text)
+    if "REQUIRED_CASE different-map" in text:
+        from collect_maps import collect
+        collections = [json.loads(line) for line in text.splitlines() if line.startswith('{"kind":"map_collection"')]
+        require(len(collections) == 3, "different/restored/entered map observations missing")
+        reset_before = re.search(r'MAP_RESET8_BEFORE_UP (\d+)', text)
+        reset_after = re.search(r'MAP_RESET8_BEFORE_B (\d+)', text)
+        require(reset_before and reset_after and int(reset_after[1]) > int(reset_before[1]) and
+                text.index(reset_before[0]) < text.index('PHASE_BEGIN map-real-up') < text.index(reset_after[0]) < text.index('PHASE_BEGIN map-released-replacement'),
+                'released Reset8 proof before replacement missing')
+        hashes = []
+        for collection in collections:
+            pages = iter(collection.get('pages', []))
+            try:
+                verified = collect(lambda _: json.dumps(next(pages)))
+            except StopIteration as error:
+                raise ValueError('map observation pages missing') from error
+            require(collection.get('complete') is True and verified['complete'], 'map observations partial')
+            devices = {p['name']: p for p in verified['pages'] if p['present']}
+            require(all(name in devices for name in ('qemu-qemu-usb-keyboard', 'qemu-virtio-keyboard-1')),
+                    'targeted device map identities missing')
+            hashes.append(tuple(devices[name]['stored_map']['sha256'] for name in
+                                ('qemu-qemu-usb-keyboard', 'qemu-virtio-keyboard-1')))
+        require(hashes[0][0] != hashes[0][1] and hashes[1][0] == hashes[1][1] and hashes[2][0] == hashes[2][1],
+                'serialized maps must differ then restore compatible bytes')
     files = evidence_files(text)
     peer = files.get("/tmp/candidate-daemon-events", "")
     require("qualification=Candidate feature_mask=1" in peer, "candidate admission absent")
@@ -34,20 +61,30 @@ def validate(text):
     require(len(samples) == 2 and all(native_keys(s) == [("56", "1"), ("56", "0")] for s in samples),
             "consumer requires balanced B pairs, no original A")
     for label, expected in (
+        ("pipelined-100", [("56", "1"), ("56", "0")] * 100),
         ("stress-100", [("56", "1"), ("56", "0")] * 100),
         ("deadline-expired", [("38", "1"), ("38", "0")]),
         ("deadline-recovered", [("56", "1"), ("56", "0")]),
         ("pending-stop", [("38", "1"), ("38", "0")]),
+        ("map-held-alt", [("64", "1")]),
+        ("map-held-original", [("38", "1"), ("38", "0")]),
+        ("map-held-layout-probe", [("29", "1"), ("29", "0")]),
+        ("map-real-up", [("64", "0")]),
+        ("map-released-replacement", [("56", "1"), ("56", "0")]),
         ("mixed-alt-down", [("64", "1")]),
         ("mixed-replacement", [("56", "1"), ("56", "0")]),
         ("mixed-alt-up", [("64", "0")]),
     ):
         sample = phases(files.get("/tmp/candidate-consumer-events", ""), label)
         required = ("REQUIRED_CASE deadline" in text and label.startswith(("stress", "deadline", "pending"))) or (
-            "REQUIRED_CASE mixed-source" in text and label.startswith("mixed"))
+            "REQUIRED_CASE mixed-source" in text and label.startswith("mixed")) or (
+            "REQUIRED_CASE pipelined" in text and label == "pipelined-100") or (
+            "REQUIRED_CASE different-map" in text and label.startswith("map-"))
         if sample or required:
             require(len(sample) == 1 and native_keys(sample[0]) == expected,
                     f"required {label} balanced output missing or incorrect")
+        if label == "map-held-layout-probe" and sample:
+            require("sym: z" in sample[0], "German map behavioral probe missing")
         if label == "mixed-replacement" and sample:
             require(re.findall(r"depressed: ([0-9a-f]{8})", sample[0]) == ["00000000", "00000008"],
                     "mixed replacement must clear then restore physical Alt")

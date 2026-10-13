@@ -36,12 +36,14 @@ public:
     DecisionMailbox() = default;
     DecisionMailbox(const DecisionMailbox&) = delete;
     DecisionMailbox& operator=(const DecisionMailbox&) = delete;
-    bool decide(const WirePacket& event, uint64_t deadlineNs, WirePacket& decision) noexcept {
+    bool decide(const WirePacket& event, uint64_t deadlineNs, WirePacket& decision,
+                void (*published)(void*,const WirePacket&) noexcept=nullptr,void* context=nullptr) noexcept {
         const auto start = monotonicNs();
         if (!start || deadlineNs <= start || deadlineNs - start > 10'000'000 ||
             phase.load(std::memory_order_acquire) != Phase::Idle) return false;
         request = event;
         deadline = deadlineNs;
+        if (published) published(context,event);
         phase.store(Phase::Request,std::memory_order_release);
         for (;;) {
             auto current = phase.load(std::memory_order_acquire);

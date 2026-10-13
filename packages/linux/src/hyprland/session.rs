@@ -513,6 +513,9 @@ impl<H: EventHandler> EventHandler for DownOnly<'_, H> {
     fn unlocked_epoch(&mut self, scope: super::wire::Scope, body: &super::wire::Body) {
         self.0.unlocked_epoch(scope, body);
     }
+    fn causal_trace(&mut self, trace: super::causal::CausalTrace) {
+        self.0.causal_trace(trace);
+    }
     fn disconnected(&mut self) {
         self.0.disconnected();
     }

@@ -2,6 +2,10 @@
 // SLEDGE_STOCK_RESEARCH adds explicit isolated lock-quarantine fixture only.
 // Both advertise capabilities zero; no replacement or production admission.
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
+#if defined(SLEDGE_STOCK_RESEARCH) || defined(SLEDGE_STOCK_PRODUCTION)
+#include "map_observation.hpp"
+#endif
+#include "causal_timing.hpp"
 #include "timing_metrics.hpp"
 #include "enter_completion.hpp"
 #include "startup_output.hpp"
@@ -54,13 +58,14 @@ struct PassiveOutput : Output {
     bool reconcileModifiers(uint8_t) override { return false; }
 };
 struct Adapter {
+    CausalTiming causalTiming;
     DurationMetrics callbackTiming,mailboxTiming,commitTiming;
     HANDLE ownerHandle;
     bool drainDispatcherInstalled=false;
     SP<CEventLoopTimer> registryTimer;
     StockPressedLedger stockLedger;
     DrainState drain;
-    SP<SHyprCtlCommand> statusCommand;
+    SP<SHyprCtlCommand> statusCommand,causalCommand,mapsCommand;
     StockHooks hooks;
     Router router;
     PhysicalDevices devices;
@@ -227,9 +232,41 @@ void installDrainControls(HANDLE handle) {
                 std::to_string(ticketBudgetNs)+",\"commit_reserve_ns\":"+std::to_string(commitReserveNs)+
                 ",\"callback\":"+adapter->callbackTiming.json()+",\"mailbox\":"+adapter->mailboxTiming.json()+
                 ",\"commit\":"+adapter->commitTiming.json()+"}"+
+                ",\"causal_timing\":"+adapter->causalTiming.metadata()+
                 ",\"replacement_preflight\":"+adapter->replacement.preflightStatus()+"}";
         }});
     if (!adapter->statusCommand) throw std::runtime_error("cannot register drain status");
+    adapter->causalCommand=HyprlandAPI::registerHyprCtlCommand(handle,SHyprCtlCommand{
+        "sledge:causal-timing",false,[](eHyprCtlOutputFormat,std::string arguments) {
+            return adapter->causalTiming.query(arguments);
+        }});
+    if (!adapter->causalCommand) throw std::runtime_error("cannot register causal timing pages");
+    adapter->mapsCommand=HyprlandAPI::registerHyprCtlCommand(handle,SHyprCtlCommand{
+        "sledge:maps",false,[](eHyprCtlOutputFormat,std::string arguments) {
+            unsigned offset=0;
+            if (!mapOffset(arguments,offset)) return std::string("{\"error\":\"expected sledge:maps OFFSET (0..15)\"}");
+            const auto& route=*adapter->research;
+            const auto& slot=route.mapObservationSlots()[offset];
+            const auto keyboard=slot.keyboard.lock();
+            const auto selected=g_pSeatManager->m_keyboard.lock();
+            uint64_t selectedGeneration=0;
+            for (const auto& entry : route.mapObservationSlots())
+                if (entry.generation && entry.keyboard.lock()==selected) selectedGeneration=entry.generation;
+            const bool present=slot.generation && keyboard;
+            const std::string_view name=keyboard ? std::string_view(keyboard->m_hlName) : std::string_view{};
+            const std::string_view bytes=keyboard ? std::string_view(keyboard->m_xkbKeymapV1String) : std::string_view{};
+            return std::string("{\"version\":1,\"live\":true,\"offset\":")+std::to_string(offset)+
+                ",\"next_offset\":"+std::to_string(offset+1)+",\"done\":"+(offset==15 ? "true" : "false")+
+                ",\"nonce\":"+std::to_string(adapter->nonce)+",\"connection_generation\":"+std::to_string(adapter->readyGeneration)+
+                ",\"ownership_epoch\":"+std::to_string(adapter->wireEpoch)+",\"selected_generation\":"+std::to_string(selectedGeneration)+
+                ",\"generation\":"+std::to_string(slot.generation)+",\"present\":"+(present ? "true" : "false")+
+                ",\"selected\":"+(present && keyboard==selected ? "true" : "false")+
+                ",\"binding_valid\":"+(present && route.registeredMap(keyboard) ? "true" : "false")+
+                ",\"name\":"+mapNameJson(name)+",\"name_length_bytes\":"+std::to_string(name.size())+
+                ",\"name_truncated\":"+(name.size()>128 ? "true" : "false")+
+                ",\"stored_map\":"+storedMapJson(bytes,present && keyboard->m_xkbKeymap)+"}";
+        }});
+    if (!adapter->mapsCommand) throw std::runtime_error("cannot register map observations");
 }
 bool lifecycle(void*,unsigned,uint64_t,unsigned);
 bool ensureConnectionBinding() {
@@ -458,7 +495,11 @@ void inputKey(CInputManager* self, const IKeyboard::SKeyEvent& event, SP<IKeyboa
                     // Reserve 1ms of the aggregate budget for compositor commit.
                     ++adapter->eligibility[6];
                     const auto waitStart=monotonicNs();
-                    if (adapter->mailbox.decide(packet,ticket->deadline-commitReserveNs,answer) && wire::decision(packet,answer))
+                    if (adapter->mailbox.decide(packet,ticket->deadline-commitReserveNs,answer,
+                        [](void* context,const WirePacket& queued) noexcept {
+                            auto* owner=static_cast<Adapter*>(context);
+                            owner->causalTiming.record(CausalTiming::Phase::EventEnqueue,queued,owner->readyGeneration);
+                        },adapter.get()) && wire::decision(packet,answer))
                         if (modeled->state==State::Down)
                             reply=Decision{*ticket,static_cast<Verdict>(wire::get(answer,64,4)),static_cast<uint32_t>(wire::get(answer,68,4)),static_cast<uint8_t>(wire::get(answer,72,4))};
                     adapter->mailboxTiming.record(waitStart,monotonicNs(),ticket->deadline-commitReserveNs);
@@ -504,6 +545,7 @@ void inputKey(CInputManager* self, const IKeyboard::SKeyEvent& event, SP<IKeyboa
             if (research->knownAdmission)
                 research->router.originalOutcome(*modeled,research->proposal,research->admitted);
             (void)research->forwarded.synchronize(research->router,research->phase.routeLocked());
+            if (ticket) adapter->causalTiming.record(CausalTiming::Phase::RouteComplete,adapter->eventPacket,adapter->readyGeneration);
             if (ticket && adapter->worker) {
                 auto outcome=adapter->eventPacket;
                 for (unsigned i=64;i<512;++i) outcome[i]=0;
@@ -729,6 +771,14 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() { return HYPRLAND_API_VERSION; }
 APICALL EXPORT void PLUGIN_EXIT() {
     if (!adapter) return;
     if (adapter->registryTimer) { adapter->registryTimer->cancel();g_pEventLoopManager->removeTimer(adapter->registryTimer);adapter->registryTimer.reset(); }
+    if (adapter->mapsCommand) {
+        (void)HyprlandAPI::unregisterHyprCtlCommand(adapter->ownerHandle,adapter->mapsCommand);
+        adapter->mapsCommand.reset();
+    }
+    if (adapter->causalCommand) {
+        (void)HyprlandAPI::unregisterHyprCtlCommand(adapter->ownerHandle,adapter->causalCommand);
+        adapter->causalCommand.reset();
+    }
     if (adapter->statusCommand) {
         (void)HyprlandAPI::unregisterHyprCtlCommand(adapter->ownerHandle,adapter->statusCommand);
         adapter->statusCommand.reset();
@@ -860,9 +910,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
             const std::string_view artifact=SLEDGE_STOCK_ARTIFACT();
             if (!wire::hello(hello,nonce,__hyprland_api_get_hash(),artifact)) throw std::runtime_error("passive Hello identity too long");
 #ifdef SLEDGE_STOCK_RESEARCH
-            adapter->worker = std::make_unique<StockWorker>(adapter->mailbox,endpoint,hello);
+            adapter->worker = std::make_unique<StockWorker>(adapter->mailbox,endpoint,hello,&adapter->causalTiming);
 #else
-            adapter->worker = std::make_unique<StockWorker>(adapter->mailbox,endpoint,hello);
+            adapter->worker = std::make_unique<StockWorker>(adapter->mailbox,endpoint,hello,&adapter->causalTiming);
 #endif
         }
     } catch (...) { PLUGIN_EXIT(); throw; }

@@ -6,6 +6,7 @@ unset SLEDGE_STOCK_RESEARCH_MODE SLEDGE_STOCK_REPLACEMENT_FAULT
 export XDG_RUNTIME_DIR=/tmp/hyprland-prerequisite
 mkdir -m 700 "$XDG_RUNTIME_DIR" /tmp/sledge-daemon-runtime
 export SLEDGE_HYPRLAND_PASSIVE_SOCKET=/tmp/sledge-daemon-runtime/native.sock
+if [[ -f /sledge-payload/causal-case ]]; then echo REQUIRED_CASE causal; fi
 registration=$(cat /sledge-payload/candidate-registration-path)
 [[ $registration == /nix/store/*/registration.json && -f $registration && ! -L $registration ]]
 plugin=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["plugin_path"])' "$registration")
@@ -20,6 +21,11 @@ Hyprland --config /tmp/hyprland.conf > /tmp/compositor-output 2>&1 &
 child=$!
 daemon_pid='' consumer=''
 cleanup() {
+ # Capture complete bounded status verbatim; causal schema is owned by native/Rust.
+ if [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
+  echo EVIDENCE_FILE /tmp/candidate-final-native-status
+  timeout 2s hyprctl sledge:status || true
+ fi
  for log in /tmp/candidate-daemon-events /tmp/candidate-consumer-events; do
   if [[ -f $log ]]; then echo "EVIDENCE_FILE $log"; cat "$log"; fi
  done
@@ -60,6 +66,9 @@ if [[ -f /sledge-payload/negative-abi-case ]]; then
  exec 3<>/dev/ttyS1
  echo REQUIRED_CASE negative-abi
  for bad in wrong-sdk wrong-elf; do
+  if [[ -f /sledge-payload/prehook-case ]]; then
+   python3 /sledge-payload/prehook_bytes.py "$child" > "/tmp/$bad-before-bytes"
+  fi
   echo "PHASE_BEGIN $bad" >> /tmp/candidate-consumer-events
   set +e
   hyprctl plugin load "/sledge-payload/$bad.so" > "/tmp/$bad-load" 2>&1
@@ -72,6 +81,12 @@ if [[ -f /sledge-payload/negative-abi-case ]]; then
   cat "/tmp/$bad-plugins"
   if grep -q 'sledge-stock' "/tmp/$bad-plugins"; then exit 1; fi
   [[ ! -S $SLEDGE_HYPRLAND_PASSIVE_SOCKET ]]
+  if [[ -f /sledge-payload/prehook-case ]]; then
+   python3 /sledge-payload/prehook_bytes.py "$child" > "/tmp/$bad-after-bytes"
+   cmp "/tmp/$bad-before-bytes" "/tmp/$bad-after-bytes"
+   echo "PREHOOK_BYTES_EQUAL name=$bad"
+   cat "/tmp/$bad-after-bytes"
+  fi
   printf 'STEP replacement-a\n' >&3
   read -r reply <&3
   [[ $reply == OK ]]
@@ -186,16 +201,59 @@ if [[ $mode == matrix ]]; then
   step "$2"
   echo "NATIVE_PHASE_AFTER $1"
   hyprctl sledge:status
+  if [[ -f /sledge-payload/causal-case ]]; then
+   echo "EVIDENCE_FILE /tmp/candidate-causal-$1"
+   python3 /sledge-payload/collect_causal.py "$(command -v hyprctl)" || true
+  fi
   sleep 0.2
   echo "PHASE_END $1" >> /tmp/candidate-consumer-events
  }
  phase alt-held replacement-alt
+ if [[ -f /sledge-payload/different-map-case ]]; then
+  echo REQUIRED_CASE different-map
+  hyprctl -j devices > /tmp/different-map-devices-before
+  python3 -c 'import json;k=json.load(open("/tmp/different-map-devices-before"))["keyboards"];assert sum(d["name"]=="qemu-virtio-keyboard-1" for d in k)==1;assert sum(d["name"]=="qemu-qemu-usb-keyboard" for d in k)==1'
+  phase map-held-alt candidate-mixed-hold
+  hyprctl keyword 'device[qemu-virtio-keyboard-1]:kb_layout' de
+  hyprctl -j devices > /tmp/different-map-devices-after
+  cat /tmp/different-map-devices-after
+  python3 -c 'import json;k=json.load(open("/tmp/different-map-devices-after"))["keyboards"];assert next(d for d in k if d["name"]=="qemu-virtio-keyboard-1")["layout"]=="de";assert next(d for d in k if d["name"]=="qemu-qemu-usb-keyboard")["layout"]=="us"'
+  echo EVIDENCE_FILE /tmp/maps-different
+  python3 /sledge-payload/collect_maps.py "$(command -v hyprctl)"
+  phase map-held-original candidate-mixed-a
+  phase map-held-layout-probe candidate-mixed-y
+  map_reset_before=$(grep -c 'control=Reset(8)' /tmp/candidate-daemon-events || true)
+  echo "MAP_RESET8_BEFORE_UP $map_reset_before"
+  phase map-real-up candidate-mixed-up
+  hyprctl keyword 'device[qemu-virtio-keyboard-1]:kb_layout' us
+  echo EVIDENCE_FILE /tmp/maps-restored
+  python3 /sledge-payload/collect_maps.py "$(command -v hyprctl)"
+  kill "$consumer"
+  wait "$consumer" || true
+  start_consumer
+  for ((i=0;i<100;i++)); do
+   hyprctl sledge:status > /tmp/map-released-status
+   if python3 -c 'import json,sys;s=json.load(open("/tmp/map-released-status"));sys.exit(s["native_operational"] is not True)'; then break; fi
+   sleep 0.1
+  done
+  cat /tmp/map-released-status
+  map_reset_after=$(grep -c 'control=Reset(8)' /tmp/candidate-daemon-events || true)
+  echo "MAP_RESET8_BEFORE_B $map_reset_after"
+  [[ $map_reset_after -gt $map_reset_before ]]
+  echo EVIDENCE_FILE /tmp/maps-entered
+  python3 /sledge-payload/collect_maps.py "$(command -v hyprctl)"
+  phase map-released-replacement candidate-mixed-a
+ fi
  if [[ -f /sledge-payload/mixed-case ]]; then
   echo REQUIRED_CASE mixed-source
   hyprctl -j devices
   phase mixed-alt-down candidate-mixed-hold
   phase mixed-replacement candidate-mixed-a
   phase mixed-alt-up candidate-mixed-up
+ fi
+ if [[ -f /sledge-payload/pipelined-case ]]; then
+  echo REQUIRED_CASE pipelined
+  phase pipelined-100 candidate-pipelined
  fi
  if [[ -f /sledge-payload/deadline-case ]]; then
   echo REQUIRED_CASE deadline
@@ -381,6 +439,10 @@ if [[ $mode == matrix ]]; then
 fi
 /sledge-payload/lib/ld-linux-x86-64.so.2 --library-path /sledge-payload/lib /sledge-payload/sledge --socket /tmp/sledge-daemon-runtime/health.sock status
 hyprctl dispatch sledge:drain
+if [[ -f /sledge-payload/causal-case ]]; then
+ echo EVIDENCE_FILE /tmp/candidate-causal-final
+ python3 /sledge-payload/collect_causal.py "$(command -v hyprctl)" || true
+fi
 if [[ $mode == matrix ]]; then
  for ((i=0;i<100;i++)); do
   hyprctl sledge:status > /tmp/candidate-detached-status.json

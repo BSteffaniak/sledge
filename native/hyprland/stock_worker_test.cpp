@@ -88,9 +88,10 @@ void connection() {
         close(client);
     });
     DecisionMailbox mailbox; WirePacket hello{}, event{}, decision{};
+    CausalTiming timing;
     assert(wire::hello(hello,17,"sdk-hash","closure+digest"));
     {
-        StockWorker worker(mailbox,path,hello);
+        StockWorker worker(mailbox,path,hello,&timing);
         const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(1);
         while (!worker.connected() && std::chrono::steady_clock::now()<limit) std::this_thread::yield();
         assert(worker.connected());
@@ -120,6 +121,13 @@ void connection() {
         const auto parkDeadline=std::chrono::steady_clock::now()+std::chrono::seconds(1);
         while (!worker.idleParked() && std::chrono::steady_clock::now()<parkDeadline) std::this_thread::yield();
         assert(worker.idleParked());
+        std::array<unsigned,9> observed{};
+        for (unsigned i=0;i<CausalTiming::capacity;++i) {
+            CausalTiming::Record r;if (!timing.read(i,r)) continue;
+            assert(r.nonce==17 && r.generation==1 && r.connection==1 && r.ok);
+            ++observed[static_cast<unsigned>(r.phase)];
+        }
+        assert(observed[1]==3 && observed[2]==3 && observed[3]==3 && observed[5]==3 && observed[6]==3 && observed[7]==3 && observed[8]==3);
         assert(!worker.notify(boundary));
         worker.invalidate();
         assert(!worker.connected() && worker.reasonCount(StockWorker::Reason::RequestedClose)==1);
