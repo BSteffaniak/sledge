@@ -7,6 +7,15 @@ export XDG_RUNTIME_DIR=/tmp/hyprland-prerequisite
 mkdir -m 700 "$XDG_RUNTIME_DIR" /tmp/sledge-daemon-runtime
 export SLEDGE_HYPRLAND_PASSIVE_SOCKET=/tmp/sledge-daemon-runtime/native.sock
 if [[ -f /sledge-payload/causal-case ]]; then echo REQUIRED_CASE causal; fi
+for helper in drain-unload.py collect_causal.py collect_maps.py admission_barrier.py; do
+ [[ -f /sledge-payload/$helper ]] || { echo "FIXTURE_MISSING $helper"; exit 1; }
+done
+if [[ -f /sledge-payload/candidate-case && $(cat /sledge-payload/candidate-case) == matrix ]]; then
+ [[ -f /sledge-payload/set_fixture_class.py ]] || { echo FIXTURE_MISSING set_fixture_class.py; exit 1; }
+fi
+if [[ -f /sledge-payload/lock-case ]]; then
+ [[ -x /sledge-payload/lock-client ]] || { echo FIXTURE_MISSING lock-client; exit 1; }
+fi
 registration=$(cat /sledge-payload/candidate-registration-path)
 [[ $registration == /nix/store/*/registration.json && -f $registration && ! -L $registration ]]
 plugin=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["plugin_path"])' "$registration")
@@ -26,7 +35,7 @@ cleanup() {
   echo EVIDENCE_FILE /tmp/candidate-final-native-status
   timeout 2s hyprctl sledge:status || true
  fi
- for log in /tmp/candidate-daemon-events /tmp/candidate-consumer-events; do
+ for log in /tmp/candidate-daemon-events /tmp/candidate-consumer-events /tmp/candidate-lock-events; do
   if [[ -f $log ]]; then echo "EVIDENCE_FILE $log"; cat "$log"; fi
  done
  for pid in "$daemon_pid" "$consumer" "$child"; do [[ -z $pid ]] || kill "$pid" 2>/dev/null || true; done
@@ -75,6 +84,7 @@ if [[ -f /sledge-payload/negative-abi-case ]]; then
   load_result=$?
   set -e
   echo "NEGATIVE_ABI_LOAD name=$bad exit=$load_result"
+  sha256sum "/sledge-payload/$bad.so"
   cat "/tmp/$bad-load"
   grep -q 'isolated candidate scope/ELF/SDK mismatch' "/tmp/$bad-load"
   hyprctl plugin list > "/tmp/$bad-plugins"
@@ -85,6 +95,7 @@ if [[ -f /sledge-payload/negative-abi-case ]]; then
    python3 /sledge-payload/prehook_bytes.py "$child" > "/tmp/$bad-after-bytes"
    cmp "/tmp/$bad-before-bytes" "/tmp/$bad-after-bytes"
    echo "PREHOOK_BYTES_EQUAL name=$bad"
+   cat "/tmp/$bad-before-bytes"
    cat "/tmp/$bad-after-bytes"
   fi
   printf 'STEP replacement-a\n' >&3
@@ -213,16 +224,19 @@ if [[ $mode == matrix ]]; then
   echo REQUIRED_CASE different-map
   hyprctl -j devices > /tmp/different-map-devices-before
   python3 -c 'import json;k=json.load(open("/tmp/different-map-devices-before"))["keyboards"];assert sum(d["name"]=="qemu-virtio-keyboard-1" for d in k)==1;assert sum(d["name"]=="qemu-qemu-usb-keyboard" for d in k)==1'
-  phase map-held-alt candidate-mixed-hold
-  hyprctl keyword 'device[qemu-virtio-keyboard-1]:kb_layout' de
+  hyprctl keyword 'device[qemu-virtio-keyboard-1]:kb_layout' de > /tmp/map-keyword-reply
+  cat /tmp/map-keyword-reply
+  grep -qx ok /tmp/map-keyword-reply
+  hyprctl getoption 'device[qemu-virtio-keyboard-1]:kb_layout'
   hyprctl -j devices > /tmp/different-map-devices-after
   cat /tmp/different-map-devices-after
   python3 -c 'import json;k=json.load(open("/tmp/different-map-devices-after"))["keyboards"];assert next(d for d in k if d["name"]=="qemu-virtio-keyboard-1")["layout"]=="de";assert next(d for d in k if d["name"]=="qemu-qemu-usb-keyboard")["layout"]=="us"'
+  phase map-held-alt candidate-mixed-hold
   echo EVIDENCE_FILE /tmp/maps-different
   python3 /sledge-payload/collect_maps.py "$(command -v hyprctl)"
   phase map-held-original candidate-mixed-a
   phase map-held-layout-probe candidate-mixed-y
-  map_reset_before=$(grep -c 'control=Reset(8)' /tmp/candidate-daemon-events || true)
+  map_reset_before=$(python3 -c 'import re;print(re.sub(r"\x1b\[[0-9;]*m", "", open("/tmp/candidate-daemon-events").read()).count("control=Reset(8)"))')
   echo "MAP_RESET8_BEFORE_UP $map_reset_before"
   phase map-real-up candidate-mixed-up
   hyprctl keyword 'device[qemu-virtio-keyboard-1]:kb_layout' us
@@ -237,7 +251,7 @@ if [[ $mode == matrix ]]; then
    sleep 0.1
   done
   cat /tmp/map-released-status
-  map_reset_after=$(grep -c 'control=Reset(8)' /tmp/candidate-daemon-events || true)
+  map_reset_after=$(python3 -c 'import re;print(re.sub(r"\x1b\[[0-9;]*m", "", open("/tmp/candidate-daemon-events").read()).count("control=Reset(8)"))')
   echo "MAP_RESET8_BEFORE_B $map_reset_after"
   [[ $map_reset_after -gt $map_reset_before ]]
   echo EVIDENCE_FILE /tmp/maps-entered
@@ -319,6 +333,7 @@ if [[ $mode == matrix ]]; then
   phase layout-us replacement-a
  fi
  if [[ -f /sledge-payload/hotplug-case ]]; then
+  transition_offset=$(wc -c < /tmp/candidate-daemon-events)
   step capability-hotplug
   hyprctl -j devices
   for ((i=0;i<100;i++)); do
@@ -327,15 +342,19 @@ if [[ $mode == matrix ]]; then
    sleep 0.1
   done
   cat /tmp/candidate-hotplug-status.json
+  python3 /sledge-payload/admission_barrier.py "$(command -v hyprctl)" "$transition_offset"
   phase two-keyboards replacement-a
+  transition_offset=$(wc -c < /tmp/candidate-daemon-events)
   step capability-remove
   hyprctl -j devices
+  python3 /sledge-payload/admission_barrier.py "$(command -v hyprctl)" "$transition_offset"
   phase keyboard-removed replacement-a
  fi
  phase caps-on candidate-caps
  phase caps-replacement replacement-a
  phase caps-off candidate-caps
  if [[ -f /sledge-payload/lock-case ]]; then
+  [[ -f /sledge-payload/lock-client && -x /sledge-payload/lock-client ]]
   mkfifo /tmp/candidate-lock-control
   exec 4<>/tmp/candidate-lock-control
   /sledge-payload/lib/ld-linux-x86-64.so.2 --library-path /sledge-payload/lib /sledge-payload/lock-client <&4 > /tmp/candidate-lock-events 2>&1 &
@@ -384,11 +403,16 @@ if [[ $mode == matrix ]]; then
   sleep 0.2
   echo "PHASE_END x-$alias" >> /tmp/candidate-x-events
  done
+ transition_offset=$(wc -c < /tmp/candidate-daemon-events)
  kill "$xconsumer"
  wait "$xconsumer" || true
  sleep 0.2
  echo EVIDENCE_FILE /tmp/candidate-x-events
  cat /tmp/candidate-x-events
+ python3 /sledge-payload/admission_barrier.py "$(command -v hyprctl)" "$transition_offset"
+ hyprctl -j activewindow > /tmp/scope-native-focus.json
+ python3 -c 'import json,sys;s=json.load(open("/tmp/scope-native-focus.json"));assert s["class"]=="wev" and s["xwayland"] is False and s["pid"]==int(sys.argv[1])' "$consumer"
+ cat /tmp/scope-native-focus.json
  for alias in native_fixture wrong_fixture; do
   { cat /sledge-payload/daemon-global.toml; printf '\nwhen = { app_in = ["%s"] }\n' "$alias"; } > /tmp/sledge-daemon-runtime/new.toml
   mv /tmp/sledge-daemon-runtime/new.toml /tmp/sledge-daemon-runtime/config.toml

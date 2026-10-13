@@ -79,6 +79,11 @@ def validate_causal(text):
     require(len(records) == ring.get("attempted"), "native causal records missing")
     groups = {}
     for record in records:
+        if record.get('kind') == 'control':
+            require(type(record.get('opcode')) is int and type(record.get('control_value')) is int,
+                    'control discriminator incomplete')
+            continue
+        require(record.get('kind') == 'event', 'missing/unknown native causal kind')
         key = tuple(record[k] for k in KEYS)
         phases = groups.setdefault(key, {})
         require(record["phase"] not in phases, "duplicate native causal phase")

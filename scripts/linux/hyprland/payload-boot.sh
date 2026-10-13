@@ -61,12 +61,24 @@ TimeoutStartSec=120
 ExecStart=/bin/sh /sledge-payload/run.sh
 UNIT
 chmod -R a+rX /sledge-payload
+reader_pid=''
+if [[ -f /sledge-payload/prehook-case ]]; then
+ python3 /sledge-payload/prehook_bytes.py --serve > /tmp/prehook-root-reader.log 2>&1 &
+ reader_pid=$!
+ for ((i=0;i<50;i++)); do [[ ! -S /run/sledge-prehook-reader.sock ]] || break; sleep 0.1; done
+ [[ -S /run/sledge-prehook-reader.sock ]]
+fi
 chvt 7
 systemctl daemon-reload
 status=0
 systemctl start sledge-payload.service || status=$?
 echo SLEDGE_PAYLOAD_REPORT_BEGIN
 cat /tmp/sledge-payload-output
+if [[ -n $reader_pid ]]; then
+ kill "$reader_pid" 2>/dev/null || true
+ wait "$reader_pid" || true
+ cat /tmp/prehook-root-reader.log
+fi
 if [[ -f /tmp/compositor-output ]]; then cat /tmp/compositor-output; fi
 journalctl -b -u sledge-payload.service --no-pager
 for log in /tmp/hyprland-prerequisite/hypr/*/hyprland.log; do

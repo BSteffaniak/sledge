@@ -52,7 +52,7 @@ class HarnessTests(unittest.TestCase):
         self.assertNotIn("dispatch focuswindow", source)
         self.assertNotIn("step initial-reconcile", source)
         self.assertNotIn("step capability-hotplug", source.split('if [[ $mode == matrix ]]; then')[0])
-        self.assertIn('if [[ -f /sledge-payload/hotplug-case ]]; then\n  step capability-hotplug', source)
+        self.assertIn('if [[ -f /sledge-payload/hotplug-case ]]; then\n  transition_offset=$(wc -c < /tmp/candidate-daemon-events)\n  step capability-hotplug', source)
         self.assertLess(source.index('if [[ $mode == late-load ]]; then start_consumer; fi'),
                         source.index('hyprctl plugin load "$plugin"'))
         self.assertLess(source.index('hyprctl plugin load "$plugin"'),
@@ -99,6 +99,46 @@ native delivery outcome generation=2 epoch=7 sequence=7 nonce=123 key=30 state=1
             item = page(command); item['stored_map']['sha256'] = None
             return json.dumps(item)
         self.assertFalse(collect(missing)['complete'])
+
+    def test_admission_requires_new_scoped_reset_and_native_focus(self):
+        from admission_barrier import admitted
+        status = {'native_operational': True, 'waiting_for_focus': False,
+                  'connection_generation': 2, 'ownership_epoch': 3}
+        page = {'version': 1, 'live': True, 'nonce': 7, 'connection_generation': 2,
+                'ownership_epoch': 3, 'selected_generation': 4}
+        focus = {'class': 'wev', 'xwayland': False}
+        controls = 'Hyprland validated lifecycle control nonce=7 sequence=8 epoch=3 control=Reset(8)'
+        self.assertTrue(admitted(status, page, controls, focus))
+        self.assertFalse(admitted(status, page, '', focus))
+        self.assertFalse(admitted(status, page, controls.replace('epoch=3', 'epoch=2'), focus))
+        self.assertFalse(admitted(status, page, controls, {'class': 'wev', 'xwayland': True}))
+        self.assertFalse(admitted(status, dict(page, connection_generation=9), controls, focus))
+
+    def test_negative_validator_rejects_partial_and_changed_bytes(self):
+        from validate_negative import validate
+        target = {"kind": "prehook_bytes", "pid": 10, "starttime": "1",
+                  "elf_sha256": __import__('prehook_bytes').ELF_SHA,
+                  "entries": [{"symbol_value": i * 64, "address": 4096 + i * 64,
+                               "bytes": '00' * 32} for i in range(19)]}
+        lines = ['SLEDGE_NEGATIVE_ABI_COMPLETED_NOT_QUALIFIED']
+        for name in ['wrong-sdk', 'wrong-elf']:
+            lines += [f'NEGATIVE_ABI_LOAD name={name}', f'PREHOOK_BYTES_EQUAL name={name}',
+                      'isolated candidate scope/ELF/SDK mismatch; hooks not installed',
+                      json.dumps(target, separators=(',', ':')), json.dumps(target, separators=(',', ':')),
+                      f'PHASE_BEGIN {name}', 'key: 38; state: 1', 'key: 38; state: 0', f'PHASE_END {name}']
+        # Empty/partial evidence must never qualify, regardless of completion marker.
+        with self.assertRaises(ValueError):
+            validate('SLEDGE_NEGATIVE_ABI_COMPLETED_NOT_QUALIFIED')
+        changed = '\n'.join(lines).replace('"bytes":"' + '00' * 32, '"bytes":"' + '11' * 32, 1)
+        changed += '\n' + '\n'.join('a' * 64 + f'  /sledge-payload/{name}.so' for name in ['wrong-sdk', 'wrong-elf'])
+        with self.assertRaisesRegex(ValueError, 'identity/bytes differ'):
+            validate(changed, 'a' * 64, 'a' * 64)
+
+    def test_prehook_broker_requires_guest_root(self):
+        from prehook_bytes import serve
+        with patch('prehook_bytes.os.geteuid', return_value=1000):
+            with self.assertRaisesRegex(ValueError, 'guest root'):
+                serve()
 
     def test_prehook_reader_refuses_non_guest_scope(self):
         from prehook_bytes import OFFSETS, snapshot

@@ -121,14 +121,24 @@ void connection() {
         const auto parkDeadline=std::chrono::steady_clock::now()+std::chrono::seconds(1);
         while (!worker.idleParked() && std::chrono::steady_clock::now()<parkDeadline) std::this_thread::yield();
         assert(worker.idleParked());
-        std::array<unsigned,9> observed{};
+        std::array<unsigned,12> observed{};
         for (unsigned i=0;i<CausalTiming::capacity;++i) {
             CausalTiming::Record r;if (!timing.read(i,r)) continue;
-            assert(r.nonce==17 && r.generation==1 && r.connection==1 && r.ok);
+            assert(r.nonce==17 && r.connection==1 && r.ok);
+            assert(r.generation==(r.phase>=CausalTiming::Phase::ControlEnqueue ? 0 : 1));
             ++observed[static_cast<unsigned>(r.phase)];
         }
-        assert(observed[1]==3 && observed[2]==3 && observed[3]==3 && observed[5]==3 && observed[6]==3 && observed[7]==3 && observed[8]==3);
+        assert(observed[1]==3 && observed[2]==3 && observed[3]==3 && observed[5]==3 && observed[6]==3 && observed[7]==3 && observed[8]==3 && observed[9]==2 && observed[10]==2 && observed[11]==2);
         assert(!worker.notify(boundary));
+        bool rejectedControl=false;
+        for (unsigned i=0;i<CausalTiming::capacity;++i) {
+            CausalTiming::Record r;
+            if (timing.read(i,r) && r.phase==CausalTiming::Phase::ControlEnqueue && !r.ok) {
+                assert(r.opcode==7 && r.controlValue==8 && r.nonce==17);
+                rejectedControl=true;
+            }
+        }
+        assert(rejectedControl);
         worker.invalidate();
         assert(!worker.connected() && worker.reasonCount(StockWorker::Reason::RequestedClose)==1);
     }

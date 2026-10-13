@@ -8,10 +8,10 @@ namespace sledge::hyprland {
 // per slot; status readers can cause observable drops, never callback waiting.
 class CausalTiming {
 public:
-    enum class Phase : unsigned { EventEnqueue,EventSend,DecisionReceive,MailboxPublish,RouteComplete,OutcomeEnqueue,OutcomeSend,EventSendStart,OutcomeSendStart };
-    static constexpr std::array<const char*,9> names{"event_enqueue","event_send","decision_receive","mailbox_publish","route_complete","outcome_enqueue","outcome_send","event_send_start","outcome_send_start"};
+    enum class Phase : unsigned { EventEnqueue,EventSend,DecisionReceive,MailboxPublish,RouteComplete,OutcomeEnqueue,OutcomeSend,EventSendStart,OutcomeSendStart,ControlEnqueue,ControlSendStart,ControlSend };
+    static constexpr std::array<const char*,12> names{"event_enqueue","event_send","decision_receive","mailbox_publish","route_complete","outcome_enqueue","outcome_send","event_send_start","outcome_send_start","control_enqueue","control_send_start","control_send"};
     static constexpr unsigned capacity=2048;
-    struct Record { uint64_t id=0,at=0,nonce=0,epoch=0,sequence=0,generation=0,connection=0,deadline=0;Phase phase{};bool ok=false; };
+    struct Record { uint64_t id=0,at=0,nonce=0,epoch=0,sequence=0,generation=0,connection=0,deadline=0;Phase phase{};bool ok=false;uint64_t opcode=0,controlValue=0; };
 private:
     struct Slot { mutable std::atomic_flag busy=ATOMIC_FLAG_INIT;Record value{}; };
     std::array<Slot,capacity> slots{};
@@ -28,7 +28,8 @@ public:
             dropped.fetch_add(1,std::memory_order_relaxed);slot.busy.clear(std::memory_order_release);return;
         }
         slot.value={index+1,at,wire::get(packet,48,8),wire::get(packet,24,8),wire::get(packet,32,8),
-            wire::get(packet,16,8),connection,wire::get(packet,40,8),phase,ok};
+            wire::get(packet,16,8),connection,wire::get(packet,40,8),phase,ok,wire::get(packet,6,2),
+            phase>=Phase::ControlEnqueue ? wire::get(packet,64,4) : 0};
         slot.busy.clear(std::memory_order_release);
     }
     bool read(unsigned index,Record& result) const noexcept {
@@ -85,7 +86,9 @@ public:
                 "\",\"at_ns\":"+std::to_string(r.at)+",\"nonce\":"+std::to_string(r.nonce)+",\"epoch\":"+
                 std::to_string(r.epoch)+",\"sequence\":"+std::to_string(r.sequence)+",\"generation\":"+
                 std::to_string(r.generation)+",\"connection_generation\":"+std::to_string(r.connection)+
-                ",\"deadline_ns\":"+std::to_string(r.deadline)+",\"ok\":"+(r.ok ? "true" : "false")+"}";
+                ",\"deadline_ns\":"+std::to_string(r.deadline)+",\"ok\":"+(r.ok ? "true" : "false")+
+                ",\"kind\":\""+(r.phase>=Phase::ControlEnqueue ? "control" : "event")+"\",\"opcode\":"+
+                std::to_string(r.opcode)+",\"control_value\":"+std::to_string(r.controlValue)+"}";
         }
         return out+"],\"missing_ids\":"+missing+"],\"page_complete\":"+(missingComma ? "false" : "true")+"}";
     }

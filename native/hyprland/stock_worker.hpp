@@ -135,18 +135,20 @@ private:
             if (read!=writeIndex.load(std::memory_order_acquire)) {
                 const auto notification=notifications[read%notifications.size()];
                 const auto& packet=notification.packet;
+                const bool outcome=wire::get(packet,6,2)==5;
+                const auto sendPhase=outcome ? CausalTiming::Phase::OutcomeSend : CausalTiming::Phase::ControlSend;
                 if (notification.generation!=generation || wire::get(packet,48,8)!=wire::get(hello,48,8)) {
+                    observe(sendPhase,packet,notification.generation,false);
                     readIndex.store(read+1,std::memory_order_release);
                     continue;
                 }
                 const auto deadline=wire::get(packet,40,8);
                 if (!wait(fd,POLLOUT,deadline) ||
-                    !(wire::get(packet,6,2)==5 ? observedSend(fd,packet,generation,CausalTiming::Phase::OutcomeSendStart) :
-                      send(fd,packet.data(),packet.size(),MSG_NOSIGNAL)==512)) {
-                    if (wire::get(packet,6,2)==5) observe(CausalTiming::Phase::OutcomeSend,packet,generation,false);
+                    !observedSend(fd,packet,generation,outcome ? CausalTiming::Phase::OutcomeSendStart : CausalTiming::Phase::ControlSendStart)) {
+                    observe(sendPhase,packet,generation,false);
                     count(Reason::NotifyFailed);break;
                 }
-                if (wire::get(packet,6,2)==5) observe(CausalTiming::Phase::OutcomeSend,packet,generation);
+                observe(sendPhase,packet,generation);
                 trace(packet,"notify",generation);
                 readIndex.store(read+1,std::memory_order_release);
                 continue;
@@ -236,14 +238,14 @@ public:
     bool notify(const WirePacket& packet) noexcept {
         const auto generation=connectionGeneration.load(std::memory_order_acquire);
         const auto rejected=[&] {
-            if (wire::get(packet,6,2)==5) observe(CausalTiming::Phase::OutcomeEnqueue,packet,generation,false);
+            observe(wire::get(packet,6,2)==5 ? CausalTiming::Phase::OutcomeEnqueue : CausalTiming::Phase::ControlEnqueue,packet,generation,false);
             return false;
         };
         if (!connected() || parkRequested.load(std::memory_order_acquire)) return rejected();
         const auto write=writeIndex.load(std::memory_order_relaxed);
         if (write-readIndex.load(std::memory_order_acquire)==notifications.size()) return rejected();
         if (wire::get(packet,48,8)!=connectionNonce.load(std::memory_order_acquire)) return rejected();
-        if (wire::get(packet,6,2)==5) observe(CausalTiming::Phase::OutcomeEnqueue,packet,generation);
+        observe(wire::get(packet,6,2)==5 ? CausalTiming::Phase::OutcomeEnqueue : CausalTiming::Phase::ControlEnqueue,packet,generation);
         notifications[write%notifications.size()]={packet,generation};
         writeIndex.store(write+1,std::memory_order_release);
         return true;

@@ -5,6 +5,51 @@ import os
 from pathlib import Path
 import struct
 import sys
+import socket
+
+
+def request_snapshot(pid):
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(3)
+        client.connect('/run/sledge-prehook-reader.sock')
+        client.sendall(f'{pid}\n'.encode())
+        chunks = bytearray()
+        while chunk := client.recv(4096):
+            chunks.extend(chunk)
+            if len(chunks) > 16384:
+                raise ValueError('root snapshot response oversized')
+    result = json.loads(chunks)
+    if 'error' in result:
+        raise ValueError(result['error'])
+    return result
+
+
+def serve():
+    if os.geteuid() != 0 or not Path('/etc/sledge-qualification-candidate').is_file():
+        raise ValueError('isolated guest root required')
+    os.environ['XDG_RUNTIME_DIR'] = '/tmp/hyprland-prerequisite'
+    with socket.socket(socket.AF_UNIX) as server:
+        server.bind('/run/sledge-prehook-reader.sock')
+        os.chmod('/run/sledge-prehook-reader.sock', 0o666)
+        server.listen(1)
+        server.settimeout(100)
+        for _ in range(4):
+            connection, _ = server.accept()
+            with connection:
+                connection.settimeout(3)
+                try:
+                    raw = connection.recv(32)
+                    if not raw.endswith(b'\n') or not raw[:-1].isdigit():
+                        raise ValueError('invalid PID request')
+                    pid = int(raw)
+                    uid = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+                    import pwd
+                    if uid != pwd.getpwnam('probe').pw_uid or Path(f'/proc/{pid}').stat().st_uid != uid:
+                        raise ValueError('only probe-owned stock PID allowed')
+                    result = snapshot(pid)
+                except (ValueError, OSError) as error:
+                    result = {'error': str(error)}
+                connection.sendall(json.dumps(result, separators=(',', ':')).encode())
 
 ELF_SHA = "8dee6b387615f14e8ce6c1f7bbd0b58524c31d783061093423e6a3fc6f89b9ca"
 # Exact dynamic-symbol st_values verified with nm -D on ELF_SHA; native hook order.
@@ -61,4 +106,7 @@ def snapshot(pid):
 
 
 if __name__ == '__main__':
-    print(json.dumps(snapshot(int(sys.argv[1])), separators=(',', ':')))
+    if sys.argv[1] == '--serve':
+        serve()
+    else:
+        print(json.dumps(request_snapshot(int(sys.argv[1])), separators=(',', ':')))

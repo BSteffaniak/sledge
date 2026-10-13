@@ -55,6 +55,22 @@ int main() {
     for (unsigned i=0;i<12;++i) worst.record(CausalTiming::Phase::DecisionReceive,maximum,UINT64_MAX,false,UINT64_MAX);
     assert(worst.page({0,12,0,12}).size()<8192 && worst.metadata().size()<1024);
     assert(worst.query("sledge:causal-timing 0 12 0 12")==worst.page({0,12,0,12}));
+    CausalTiming controls;
+    for (const auto opcode : {7U,8U,9U}) {
+        WirePacket control=maximum;
+        wire::put(control,6,2,opcode);wire::put(control,64,4,UINT32_MAX);
+        controls.record(CausalTiming::Phase::ControlEnqueue,control,17,true,100);
+        controls.record(CausalTiming::Phase::ControlSendStart,control,17,true,200);
+        controls.record(CausalTiming::Phase::ControlSend,control,17,true,300);
+    }
+    assert(controls.json().find("\"kind\":\"control\"")!=std::string::npos);
+    assert(controls.json().find("\"control_value\":4294967295")!=std::string::npos);
+    CausalTiming::Record controlRecord;
+    assert(controls.read(3,controlRecord) && controlRecord.opcode==8 && controlRecord.connection==17);
+    assert(controls.page({0,9,0,12}).size()+500<8192);
+    WirePacket expired=maximum;wire::put(expired,6,2,7);wire::put(expired,64,4,8);
+    controls.record(CausalTiming::Phase::ControlSend,expired,16,false,UINT64_MAX);
+    assert(controls.read(9,controlRecord) && !controlRecord.ok && controlRecord.controlValue==8 && controlRecord.connection==16);
     assert(worst.page({0,13,0,12}).find("error")!=std::string::npos);
     assert(worst.query("sledge:causal-timing-extra").find("error")!=std::string::npos);
     // Worst-width identifiers and counters still fit: all fields contribute at
