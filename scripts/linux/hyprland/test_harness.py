@@ -25,8 +25,10 @@ class HarnessTests(unittest.TestCase):
         records = EXPECTED[name] + ([] if name == "tap-hold-down" else SENTINEL)
         result = ""
         for code, state in records:
+            if (code, state) == ("36", "1"):
+                result += "depressed: 00000004\nlatched: 00000000\nlocked: 00000000\n"
             result += f"key: {code}; state: {state}\n"
-            mask = "00000004" if (code, state) == ("37", "1") else "00000000"
+            mask = "00000004" if (code, state) == ("36", "1") else "00000000"
             result += f"depressed: {mask}\nlatched: 00000000\nlocked: 00000000\n"
         return result
 
@@ -37,14 +39,15 @@ class HarnessTests(unittest.TestCase):
         for broken in (
             sample.replace("key: 108; state: 0", "key: 108; state: 1", 1),
             sample + "key: 36; state: 1\n",
+            sample.replace("depressed: 00000004", "depressed: 00000000"),
+            sample.replace("depressed: 00000004", "depressed: 0000000c"),
             sample.replace("depressed: 00000004", "depressed: 00000008"),
             sample.replace("key: 56; state: 1", "depressed: 00000004\nlatched: 00000000\nlocked: 00000000\nkey: 56; state: 1"),
         ):
             with self.assertRaises(ValueError):
                 validate_phase(broken, "tap-positive")
         # Move action ahead of the final physical release, preserving all keys.
-        lines = sample.splitlines(keepends=True)
-        early = ''.join(lines[:20] + lines[24:40] + lines[20:24] + lines[40:])
+        early = sample.replace("key: 36; state: 1", "key: 108; state: 0", 1).replace("key: 108; state: 0", "key: 36; state: 1", 1)
         with self.assertRaises(ValueError):
             validate_phase(early, "tap-positive")
 
@@ -73,7 +76,9 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual([event[2] for event in recorder.events], ["display-a"] * 2 + ["display-b"] * 2 + ["display-a"] * 2)
             step(recorder, "tap-timeout")
             sleep.assert_called_with(0.8)
-            with self.assertRaises(ValueError): step(recorder, "tap-unknown")
+            step(recorder, "tap-unknown")
+            self.assertIn(("menu", True, None), recorder.events)
+            with self.assertRaises(ValueError): step(recorder, "tap-unrecognized")
 
     def test_tap_report_requires_every_phase_and_explicit_gate(self):
         from validate_tap import EXPECTED, validate
@@ -98,6 +103,15 @@ class HarnessTests(unittest.TestCase):
                              for index, state in enumerate([1, 0] * 3))
             gates += f"PHASE_END {name}\n"
         validate(report + gates, lifecycle=True)
+        from inspect_tap import inspect
+        from contextlib import redirect_stdout
+        from io import StringIO
+        output = StringIO()
+        with redirect_stdout(output):
+            summary = inspect(report + gates)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIsNone(json.loads(json.dumps(summary))["validator_error"])
+        self.assertEqual(summary["qualification"], "unaccepted")
         with self.assertRaises(ValueError):
             validate(report + gates.replace("code=100", "code=28", 1), lifecycle=True)
 

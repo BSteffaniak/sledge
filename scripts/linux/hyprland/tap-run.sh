@@ -32,7 +32,7 @@ run_tap_matrix() {
  tap_phase tap-positive tap-positive
  sleep 0.8
  tap_phase tap-positive tap-positive
- for case in chord timeout modifier device; do
+ for case in chord timeout modifier device unknown; do
   sleep 0.8
   tap_phase "tap-$case" "tap-$case"
  done
@@ -89,11 +89,33 @@ run_tap_matrix() {
  step tap-sentinel
  sleep 0.2
  echo 'PHASE_END tap-focus' >> "$events"
+ if [[ -f /sledge-payload/tap-ime-case ]]; then
+  [[ -x /sledge-payload/ime-grab-client ]]
+  sleep 0.8
+  mkfifo /tmp/tap-ime-control
+  exec 5<>/tmp/tap-ime-control
+  /sledge-payload/lib/ld-linux-x86-64.so.2 --library-path /sledge-payload/lib /sledge-payload/ime-grab-client <&5 >> /tmp/tap-ime-events 2>&1 &
+  tap_ime=$!
+  for ((i=0;i<100;i++)); do grep -q '^IME_GRAB_READY' /tmp/tap-ime-events && break; sleep 0.05; done
+  grep -q '^IME_GRAB_READY' /tmp/tap-ime-events
+  echo TAP_IME_AUTHORITY_ACTIVE
+  echo 'PHASE_BEGIN tap-ime' >> /tmp/tap-ime-events
+  echo 'PHASE_BEGIN tap-ime' >> "$events"
+  step tap-ime
+  sleep 0.2
+  echo 'PHASE_END tap-ime' >> "$events"
+  echo 'PHASE_END tap-ime' >> /tmp/tap-ime-events
+  printf 'release\n' >&5
+  wait "$tap_ime"
+  unset tap_ime
+  echo EVIDENCE_FILE /tmp/tap-ime-events
+  cat /tmp/tap-ime-events
+ fi
  if [[ -f /sledge-payload/tap-lock-case ]]; then
   [[ -x /sledge-payload/lock-client ]]
   mkfifo /tmp/tap-lock-control
   exec 4<>/tmp/tap-lock-control
-  /sledge-payload/lib/ld-linux-x86-64.so.2 --library-path /sledge-payload/lib /sledge-payload/lock-client <&4 > /tmp/tap-locked-events 2>&1 &
+  /sledge-payload/lib/ld-linux-x86-64.so.2 --library-path /sledge-payload/lib /sledge-payload/lock-client <&4 >> /tmp/tap-locked-events 2>&1 &
   tap_locker=$!
   for ((i=0;i<100;i++)); do grep -q '^LOCK_ACK' /tmp/tap-locked-events && break; sleep 0.1; done
   grep -q '^LOCK_ACK' /tmp/tap-locked-events

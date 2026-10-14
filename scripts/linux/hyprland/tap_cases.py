@@ -31,6 +31,12 @@ def tap_step(qmp, name):
         qmp.pair("e")
         qmp.key("alt_r", False)
         qmp.pair("alt_r")
+    elif name == "tap-unknown":
+        qmp.pair("alt_r")
+        qmp.key("alt_r", True)
+        qmp.pair("menu")
+        qmp.key("alt_r", False)
+        qmp.pair("alt_r")
     elif name == "tap-modifier":
         qmp.key("shift", True)
         for _ in range(3):

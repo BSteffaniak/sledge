@@ -93,7 +93,8 @@ is still required; evaluation-only checks do not establish release readiness.
 `contract`, immutable `evidence` and independent `acceptance` inputs. No supplied
 example is an accepted record. Contract fields:
 
-- `qualification_revision=1`, `feature_mask=1`, positive `approval_revision`;
+- `(qualification_revision, feature_mask) = (1, 1)` for fresh-Down hotkeys or
+  `(2, 3)` for hotkeys plus modifier-release taps; positive `approval_revision`;
 - SHA256 `compositor_sha256`, `plugin_sha256`, `descriptor_sha256`,
   `evidence_sha256`, `acceptance_sha256`, `source_hash`, `build_id`;
 - exact `compositor_path`, `sdk_drv`, `compiler_drv`, `sdk_api_hash`.
@@ -106,7 +107,12 @@ and evidence digests. The independent acceptance file uses the library's strict
 not cryptographic proof against a malicious builder. SDK `unknown_...` is only
 corroborating: no broad version/ABI compatibility is inferred from it.
 
-Feature1 is fresh-Down send_key only, not taps/source actions. Existing normal
+Feature1 is fresh-Down send_key only, not taps/source actions. Revision2/feature3
+adds modifier-release send_key taps: the original release must reach stock before
+the isolated balanced action. `within_ms` remains the maximum inter-release gap,
+matching core/macOS semantics. Source actions remain unsupported. Selecting this
+pair is not qualification: each exact artifact still needs fresh VM evidence and
+independent acceptance. Existing normal
 package remains catalogue-free. Qualified-mode binary is a distinct artifact:
 its final descriptor/evidence must be independently reviewed and tested, not
 copied from candidate results without accepting the mode-specific artifact.

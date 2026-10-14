@@ -3,6 +3,7 @@
 #include "decision_mailbox.hpp"
 #include "output_recovery.hpp"
 #include "replacement_emission.hpp"
+#include "replacement_modifiers.hpp"
 
 namespace sledge::hyprland {
 // Narrow stock seat reservation, compositor thread only. Binding is observed
@@ -106,12 +107,7 @@ public:
             reserved[count++]=keyboard;
         }
         if (!count) return reject(Reject::Empty);
-        constexpr std::array<uint32_t,8> sides{42,54,29,97,56,100,125,126};
-        // Reset the synthetic-only modifier state so Caps/latched history from
-        // earlier fixture requests cannot contaminate a later replacement.
-        xkb_state_update_mask(modifiers,0,0,0,0,0,route.forwarded.group());
-        for (unsigned i=0; i<8; ++i) xkb_state_update_key(modifiers,sides[i]+8,(requested&(1U<<i)) ? XKB_KEY_DOWN : XKB_KEY_UP);
-        const auto mask=xkb_state_serialize_mods(modifiers,XKB_STATE_MODS_DEPRESSED);
+        const auto mask=replacementModifierMask(modifiers,requested,route.forwarded.group());
         auto sendMods=[&](uint32_t depressed,uint32_t latched,uint32_t locked,uint32_t group) {
             for (unsigned i=0; i<count; ++i)
                 reinterpret_cast<void (*)(CWLKeyboardResource*,uint32_t,uint32_t,uint32_t,uint32_t)>(route.hooks.original(1))

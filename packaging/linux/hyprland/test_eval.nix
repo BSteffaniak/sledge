@@ -27,27 +27,32 @@ let
     ];
     specialArgs.pkgs = { };
   };
-  enabled = lib.evalModules {
-    modules = [
-      base
-      module
-      {
-        programs.sledgeHyprland = {
-          enable = true;
-          package = {
-            daemon = "/nix/store/test-daemon";
-            plugin = "/nix/store/test-plugin";
-            registration = "/nix/store/test-registration";
-            feature_mask = 1;
+  enabledFor =
+    featureMask:
+    lib.evalModules {
+      modules = [
+        base
+        module
+        {
+          programs.sledgeHyprland = {
+            enable = true;
+            package = {
+              daemon = "/nix/store/test-daemon";
+              plugin = "/nix/store/test-plugin";
+              registration = "/nix/store/test-registration";
+              feature_mask = featureMask;
+            };
           };
-        };
-      }
-    ];
-    specialArgs.pkgs = {
-      python3 = "/nix/store/test-python";
-      writeShellApplication = spec: spec.text;
+        }
+      ];
+      specialArgs.pkgs = {
+        python3 = "/nix/store/test-python";
+        writeShellApplication = spec: spec.text;
+      };
     };
-  };
+  enabled = enabledFor 1;
+  tapEnabled = enabledFor 3;
+  unknownFeatures = enabledFor 2;
   wrongRuntime = builtins.tryEval (
     import ./artifacts.nix {
       pkgs = {
@@ -79,6 +84,8 @@ assert disabled.config.environment.systemPackages == [ ];
 assert !(builtins.head missing.config.assertions).assertion;
 assert builtins.length enabled.config.environment.systemPackages == 2;
 assert (builtins.head enabled.config.assertions).assertion;
+assert (builtins.head tapEnabled.config.assertions).assertion;
+assert !(builtins.head unknownFeatures.config.assertions).assertion;
 assert !wrongRuntime.success;
 assert !rejected.success;
 true

@@ -6,7 +6,7 @@ import sys
 from validate_qualification import evidence_files, phases, require
 
 ALT = [("108", "1"), ("108", "0")]
-ACTION = [("37", "1"), ("36", "1"), ("36", "0"), ("37", "0")]
+ACTION = [("36", "1"), ("36", "0")]
 SENTINEL = [("56", "1"), ("56", "0")]
 EXPECTED = {
     "tap-baseline": ALT * 3,
@@ -15,6 +15,7 @@ EXPECTED = {
     "tap-hold-down": [("108", "1")],
     "tap-hold-up": [("108", "0")],
     "tap-timeout": ALT * 3,
+    "tap-unknown": ALT + [("108", "1"), ("147", "1"), ("147", "0"), ("108", "0")] + ALT,
     "tap-modifier": [("50", "1")] + ALT * 3 + [("50", "0")],
     "tap-device": ALT * 3,
     "tap-focus": ALT * 3,
@@ -38,12 +39,18 @@ def validate_phase(sample, name):
     # elsewhere in the trace. Under the explicit US fixture Ctrl is bit 2.
     if name == "tap-positive":
         release = list(re.finditer(r"key: 108; state: 0", sample))[-1]
-        ctrl_down = sample.index("key: 37; state: 1")
         enter_down = sample.index("key: 36; state: 1")
-        require(ctrl_down > release.end(), "action preceded final physical release")
-        before_enter = masks(sample[ctrl_down:enter_down])
+        enter_up = sample.index("key: 36; state: 0")
+        require(enter_down > release.end(), "action preceded final physical release")
+        before_enter = masks(sample[release.end():enter_down])
         require(before_enter and before_enter[-1] == ("00000004", "00000000", "00000000"),
                 "Ctrl+Enter lacks isolated Ctrl-only post-release projection")
+        require(all(mask == ("00000004", "00000000", "00000000")
+                    for mask in masks(sample[enter_down:enter_up])),
+                "modifier projection changed inside Enter pair")
+        active_up = masks(sample[:enter_up])
+        require(active_up and active_up[-1] == ("00000004", "00000000", "00000000"),
+                "Ctrl-only projection absent at Enter Up")
     if name == "tap-hold-down":
         return  # The held physical Alt is intentional; no action or sentinel.
     sentinel = sample.index("key: 56; state: 1")
