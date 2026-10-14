@@ -47,6 +47,8 @@ class Router {
     uint64_t epoch = 1, focus = 1, sequence = 0, lastGeneration = 0;
     bool locked = true, fatal = false;
     std::optional<Ticket> pending;
+    // A release action is committed only AFTER the original stock release.
+    std::optional<Ticket> released;
 
     Device* find(uint64_t id) {
         for (auto& device : devices)
@@ -120,13 +122,15 @@ public:
         constexpr std::array<const char*,12> names{"none","device","pending","sequence","locked","fatal","unmodeled","key","state","owned","budget","overflow"};
         return names[static_cast<unsigned>(reason)];
     }
-    std::optional<Ticket> begin(Event event, uint64_t now, uint64_t budgetNs) {
+    std::optional<Ticket> begin(Event event, uint64_t now, uint64_t budgetNs, bool releaseAction=false) {
         auto* device = find(event.device);
         lastBeginReject=!device ? BeginReject::Device : pending ? BeginReject::Pending :
             sequence==UINT64_MAX ? BeginReject::Sequence : locked ? BeginReject::Locked :
             fatal ? BeginReject::Fatal : !event.modeled ? BeginReject::Unmodeled :
-            event.key>=keyCount ? BeginReject::Key : event.state!=State::Down ? BeginReject::State :
-            device->owners[event.key]!=Owner::None ? BeginReject::Owned :
+            event.key>=keyCount ? BeginReject::Key :
+            !(event.state==State::Down || (releaseAction && event.state==State::Up && modifier(event.key) &&
+                device->owners[event.key]==Owner::Forwarded && !otherForwarded(event.device,event.key))) ? BeginReject::State :
+            (event.state==State::Down && device->owners[event.key]!=Owner::None) ? BeginReject::Owned :
             budgetNs>10'000'000 ? BeginReject::Budget : now>UINT64_MAX-budgetNs ? BeginReject::Overflow : BeginReject::None;
         if (lastBeginReject!=BeginReject::None) return std::nullopt;
         pending = Ticket{event.device, epoch, focus, ++sequence, now + budgetNs, event.key};
@@ -150,7 +154,14 @@ public:
         auto& owner = device->owners[event.key];
         if (owner != Owner::None) {
             const auto previous = owner;
-            if (event.state == State::Up) owner = Owner::None;
+            if (event.state == State::Up) {
+                owner = Owner::None;
+                released.reset();
+                if (previous==Owner::Forwarded && modifier(event.key) && !otherForwarded(event.device,event.key) &&
+                    pending && ticket && *pending==*ticket && ticket->device==event.device && ticket->key==event.key)
+                    released=*ticket;
+                pending.reset();
+            }
             if (previous == Owner::StockConsumed)
                 return {Outcome::StockConsumed,true,false,false}; // release bindings + repeat/longpress cleanup
             if (previous == Owner::LockerOwned)
@@ -194,6 +205,21 @@ public:
         const bool merged = owner == Owner::Forwarded && otherForwarded(event.device,event.key);
         if (merged && outcome == Outcome::Forwarded) outcome = Outcome::Merged;
         return {outcome,owner == Owner::Forwarded,owner == Owner::Forwarded && !merged,fatal};
+    }
+    // Release has already traversed stock. Never replay it or consume ownership
+    // for the synthetic action, including on preflight rejection/partial output.
+    Outcome finishRelease(const Ticket& ticket, const std::optional<Decision>& reply,
+                          bool deliveredOriginal, uint64_t now, Output& output, Outcome original=Outcome::Forwarded) {
+        const auto eligible=released && *released==ticket;
+        released.reset();
+        if (!reply || reply->verdict!=Verdict::Replace) return original;
+        if (!eligible || !deliveredOriginal || locked || fatal || now>=ticket.deadline ||
+            ticket.epoch!=epoch || ticket.focus!=focus || reply->ticket!=ticket ||
+            reply->key>=keyCount || reply->key==ticket.key || targetHeld(reply->key)) return Outcome::Rejected;
+        const auto delivered=output.replace(reply->key,reply->modifiers,forwardedModifiers());
+        if (delivered==Delivery::RejectedNoOutput) return Outcome::Rejected;
+        if (delivered==Delivery::PartialFatal) { fatal=true;return Outcome::PartialFatal; }
+        return Outcome::Replaced;
     }
     bool targetHeld(uint32_t key) const {
         if (key >= keyCount) return true;

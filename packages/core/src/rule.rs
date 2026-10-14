@@ -256,6 +256,16 @@ impl Matcher {
         self.refresh_delivery_active();
     }
 
+    /// Disqualify speculative tap recognition without retiring press ownership.
+    /// Backends use this for physical input that cannot be represented as a key.
+    pub fn disqualify_taps(&mut self) {
+        for fsms in self.tap_fsms.values_mut() {
+            for fsm in fsms {
+                fsm.on_other_key();
+            }
+        }
+    }
+
     /// Observe a backend-owned repeat/release without evaluating rules or
     /// producing actions. The backend must still reconcile its own output.
     /// Releases retire only the exact physical press; speculative tap state for

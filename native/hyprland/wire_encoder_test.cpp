@@ -7,6 +7,19 @@ using namespace sledge::hyprland;
 int main() {
  wire::Scope s{0,6,5,10000000,17};WirePacket p{};
  uint64_t generation=0,nonce=0,sequence=0,epoch=0;
+ WirePacket event{},reply{};
+ assert(wire::eventPacket(event,{1,1,1,100,1},100,0,1,32,1));
+ reply=event;wire::put(reply,6,2,4);wire::put(reply,8,4,16);
+ for (unsigned i=64;i<512;++i) reply[i]=0;
+ wire::put(reply,64,4,2);wire::put(reply,68,4,28);wire::put(reply,72,4,4);
+ assert(!wire::decision(event,reply,false));
+ assert(wire::decision(event,reply,true));
+ wire::put(reply,64,4,1);wire::put(reply,68,8,0);
+ assert(!wire::decision(event,reply,true)); // Up never swallows
+ wire::put(reply,64,4,2);wire::put(reply,68,4,28);wire::put(reply,72,4,4);
+ wire::put(event,68,4,2);assert(!wire::decision(event,reply,true));
+ wire::put(event,68,4,0);wire::put(event,64,4,30);assert(!wire::decision(event,reply,true));
+ wire::put(event,68,4,1);assert(wire::decision(event,reply,false));
  assert(bindConnection(1,17,generation,nonce,sequence,epoch));
  for (unsigned i=1;i<=4;++i) {
   assert(wire::control(p,i%2 ? wire::Opcode::Lock : wire::Opcode::Reset,

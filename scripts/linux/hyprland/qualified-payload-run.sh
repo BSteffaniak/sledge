@@ -20,6 +20,8 @@ CONF
 Hyprland --config /tmp/hyprland.conf > /tmp/compositor-output 2>&1 &
 child=$!
 cleanup() {
+ [[ -z ${tap_locker:-} ]] || kill "$tap_locker" 2>/dev/null || true
+ [[ -z ${tap_consumer:-} ]] || kill "$tap_consumer" 2>/dev/null || true
  for log in /tmp/qualified-startup /tmp/qualified-daemon-events /tmp/qualified-consumer-events; do
   if [[ -f $log ]]; then echo "EVIDENCE_FILE $log"; cat "$log"; fi
  done
@@ -64,6 +66,11 @@ for phase in candidate-a candidate-a; do
  sleep 0.2
  echo "PHASE_END $phase" >> /tmp/qualified-consumer-events
 done
+if [[ -f /sledge-payload/tap-case ]]; then
+ daemon_pid=$(python3 -c 'import json;print(json.load(open("/tmp/qualified-startup"))["daemon_pid"])')
+ source /sledge-payload/tap-run.sh
+ run_tap_matrix /tmp/qualified-consumer-events /tmp/qualified-daemon-events
+fi
 python3 /sledge-payload/drain-unload.py --hyprctl "$(command -v hyprctl)" \
  --instance "$HYPRLAND_INSTANCE_SIGNATURE" --plugin "$plugin"
 hyprctl plugin list > /tmp/qualified-after-unload

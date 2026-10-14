@@ -31,6 +31,7 @@ void framing() {
     wire::put(event,40,8,4); wire::put(event,48,8,17);
     decision=event; wire::put(decision,6,2,4); wire::put(decision,8,4,16);
     assert(wire::decision(event,decision));
+    wire::put(event,68,4,1); // actual fresh Down request, not zero-filled Up
     wire::put(decision,64,4,2); wire::put(decision,68,4,30); wire::put(decision,72,4,4);
     assert(wire::decision(event,decision));
     for (const unsigned offset : {12,16,24,32,40,48,56,76,80,511}) {

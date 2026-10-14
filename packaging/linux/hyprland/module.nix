@@ -35,8 +35,11 @@ in
           && cfg.package ? daemon
           && cfg.package ? registration
           && cfg.package ? plugin
-          && cfg.package.feature_mask == 1;
-        message = "sledgeHyprland requires an explicitly accepted feature1 qualified factory result";
+          && builtins.elem cfg.package.feature_mask [
+            1
+            3
+          ];
+        message = "sledgeHyprland requires an explicitly accepted feature1 or feature3 qualified factory result";
       }
     ];
     environment.systemPackages = [

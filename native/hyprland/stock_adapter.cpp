@@ -474,8 +474,12 @@ void inputKey(CInputManager* self, const IKeyboard::SKeyEvent& event, SP<IKeyboa
             if (!adapter->worker || !adapter->worker->connected()) ++adapter->eligibility[3];
             if (!research->consumerMapKnown()) ++adapter->eligibility[4];
             if (adapter->drain.mayPropose() && consumerAlreadySelected && adapter->replacementWire && adapter->worker && adapter->worker->connected() && adapter->initialReconciled && research->consumerMapKnown() && !research->phase.routeLocked()) {
-                ticket=modeled->state==State::Down ? research->router.begin(*modeled,monotonicNs(),ticketBudgetNs) :
+                ticket=(modeled->state==State::Down || (tapReleaseEnabled && modeled->state==State::Up)) ?
+                    research->router.begin(*modeled,monotonicNs(),ticketBudgetNs,tapReleaseEnabled) :
                     research->router.settlement(*modeled,monotonicNs(),ticketBudgetNs);
+                // Non-action releases still need causal ownership settlement.
+                if (!ticket && modeled->state!=State::Down)
+                    ticket=research->router.settlement(*modeled,monotonicNs(),ticketBudgetNs);
                 if (ticket) {
                     if (ticket->epoch!=adapter->wireEpoch) {
                         WirePacket epochAdvance{};
@@ -500,7 +504,7 @@ void inputKey(CInputManager* self, const IKeyboard::SKeyEvent& event, SP<IKeyboa
                             auto* owner=static_cast<Adapter*>(context);
                             owner->causalTiming.record(CausalTiming::Phase::EventEnqueue,queued,owner->readyGeneration);
                         },adapter.get()) && wire::decision(packet,answer))
-                        if (modeled->state==State::Down)
+                        if (modeled->state==State::Down || (tapReleaseEnabled && modeled->state==State::Up))
                             reply=Decision{*ticket,static_cast<Verdict>(wire::get(answer,64,4)),static_cast<uint32_t>(wire::get(answer,68,4)),static_cast<uint8_t>(wire::get(answer,72,4))};
                     adapter->mailboxTiming.record(waitStart,monotonicNs(),ticket->deadline-commitReserveNs);
                     if (reply) ++adapter->eligibility[7];
@@ -545,6 +549,10 @@ void inputKey(CInputManager* self, const IKeyboard::SKeyEvent& event, SP<IKeyboa
             if (research->knownAdmission)
                 research->router.originalOutcome(*modeled,research->proposal,research->admitted);
             (void)research->forwarded.synchronize(research->router,research->phase.routeLocked());
+            if (tapReleaseEnabled && modeled->state==State::Up && ticket)
+                research->proposal.outcome=research->router.finishRelease(*ticket,reply,
+                    research->proposal.deliverClient && research->knownAdmission && research->admitted &&
+                    research->consumerRouteInvoked,monotonicNs(),transaction,research->proposal.outcome);
             if (ticket) adapter->causalTiming.record(CausalTiming::Phase::RouteComplete,adapter->eventPacket,adapter->readyGeneration);
             if (ticket && adapter->worker) {
                 auto outcome=adapter->eventPacket;
@@ -552,7 +560,8 @@ void inputKey(CInputManager* self, const IKeyboard::SKeyEvent& event, SP<IKeyboa
                 wire::put(outcome,6,2,5); wire::put(outcome,8,4,24);
                 const auto result=research->proposal.outcome;
                 unsigned code=2; // uncertain, never infer actual original admission
-                if (result==Outcome::Replaced) code=0;
+                if (result==Outcome::PartialFatal) code=2;
+                else if (result==Outcome::Replaced) code=0;
                 else if (result==Outcome::Swallowed) code=4;
                 else if (result==Outcome::StockConsumed) code=5;
                 else if (result==Outcome::Merged) code=7;

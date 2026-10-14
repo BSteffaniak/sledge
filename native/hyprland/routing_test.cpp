@@ -4,11 +4,12 @@
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#include <source_location>
 
 using namespace sledge::hyprland;
 namespace {
-void check(bool condition) { if (!condition) throw std::runtime_error("routing assertion failed"); }
-void check(RouteResult result) { check(result.deliverClient); }
+void check(bool condition, std::source_location at=std::source_location::current()) { if (!condition) throw std::runtime_error("routing assertion failed at "+std::to_string(at.line())); }
+void check(RouteResult result, std::source_location at=std::source_location::current()) { check(result.deliverClient,at); }
 bool operator!(RouteResult result) { return !result.deliverClient; }
 bool operator==(RouteResult result, bool expected) { return result.deliverClient == expected; }
 struct RecordingOutput : Output {
@@ -260,8 +261,69 @@ void lifecycleSettlement() {
     check(router.recoverRetiredOutput(true));
     check(router.quiescent());
 }
+void modifierReleaseAction() {
+    struct OrderedOutput : RecordingOutput {
+        std::vector<unsigned> sequence;
+        Delivery replace(uint32_t key,uint8_t,uint8_t) override {
+            check(key==28 && sequence==std::vector<unsigned>{100});
+            check(emitReplacement([&] { sequence.push_back(4); },
+                [&](bool down) { sequence.push_back(down ? 28 : 128); },
+                [&] { sequence.push_back(0); },0));
+            return Delivery::Accepted;
+        }
+    } ordered;
+    Router orderedRouter;check(orderedRouter.add(1));orderedRouter.unlockConfirmed();
+    check(orderedRouter.route({1,100,State::Down},{},{},1,ordered));
+    auto releaseTicket=orderedRouter.begin({1,100,State::Up},2,100,true);
+    check(releaseTicket.has_value());
+    auto action=Decision{*releaseTicket,Verdict::Replace,28,4};
+    check(orderedRouter.route({1,100,State::Up},releaseTicket,action,3,ordered).deliverClient);
+    ordered.sequence.push_back(100); // original RightAlt Up traverses stock first
+    check(orderedRouter.finishRelease(*releaseTicket,action,true,4,ordered)==Outcome::Replaced);
+    check(ordered.sequence==std::vector<unsigned>({100,4,28,128,0}));
+    for (auto delivery : {Delivery::Accepted,Delivery::RejectedNoOutput,Delivery::PartialFatal}) {
+        Router router; RecordingOutput output; output.result=delivery;
+        check(router.add(1));check(router.add(2));router.unlockConfirmed();
+        check(router.route({1,100,State::Down},{},{},1,output));
+        check(router.route({2,42,State::Down},{},{},2,output));
+        const Event up{1,100,State::Up};
+        check(!router.begin(up,3,100)); // feature1 cannot authorize release actions
+        auto ticket=router.begin(up,3,100,true);check(ticket.has_value());
+        auto reply=Decision{*ticket,Verdict::Replace,28,4};
+        const auto original=router.route(up,ticket,reply,4,output);
+        check(original.processStock && original.deliverClient && output.replacements==0);
+        check(!router.targetHeld(100) && router.forwardedModifiers()==1);
+        // The caller's stock release is complete before finishRelease can emit.
+        const auto outcome=router.finishRelease(*ticket,reply,true,5,output);
+        check(outcome==(delivery==Delivery::Accepted ? Outcome::Replaced :
+            delivery==Delivery::RejectedNoOutput ? Outcome::Rejected : Outcome::PartialFatal));
+        check(output.replacements==1 && output.requested==4 && output.restored==1);
+        check(router.finishRelease(*ticket,reply,true,6,output)==Outcome::Rejected);
+        check(output.replacements==1); // duplicate settlement never replays
+        check(router.diagnostics().fatal==(delivery==Delivery::PartialFatal));
+    }
+    for (unsigned invalid=0;invalid<6;++invalid) {
+        Router router;RecordingOutput output;check(router.add(1));check(router.add(2));router.unlockConfirmed();
+        check(router.route({1,100,State::Down},{},{},1,output));
+        const Event up{1,100,State::Up};auto ticket=router.begin(up,2,100,true);check(ticket.has_value());
+        auto reply=Decision{*ticket,Verdict::Replace,28,4};
+        if (invalid==0) reply.verdict=Verdict::Swallow;
+        if (invalid==1) ++reply.ticket.sequence;
+        if (invalid==2) router.focusChanged();
+        if (invalid==3) check(router.route({2,28,State::Down},{},{},3,output));
+        check(router.route(up,ticket,reply,4,output).deliverClient);
+        (void)router.finishRelease(*ticket,reply,invalid!=4,invalid==5 ? 102 : 5,output);
+        check(output.replacements==0 && !router.targetHeld(100));
+    }
+    Router router;RecordingOutput output;check(router.add(1));check(router.add(2));router.unlockConfirmed();
+    check(router.route({1,100,State::Down},{},{},1,output));
+    check(router.route({2,100,State::Down},{},{},2,output).outcome==Outcome::Merged);
+    check(!router.begin({1,100,State::Up},3,100,true)); // another device owns modifier
+    check(!router.begin({1,100,State::Repeat},3,100,true));
+}
 } // namespace
 int main() {
+    modifierReleaseAction();
     emptyRetirement();
     lifecycleSettlement();
     ownership(); replies(); replacement(); lockAndRetirement(); reviewedOutcomes(); fiveReviewRegressions(); mergedStockOutcome(); outputSequence();

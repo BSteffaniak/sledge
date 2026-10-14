@@ -2,6 +2,8 @@
 { pkgs, contract }:
 let
   lib = pkgs.lib;
+  qualificationRevision = contract.qualification_revision or 1;
+  featureMask = contract.feature_mask or 1;
   source = ../../../native/hyprland;
   sourceHash = builtins.hashString "sha256" (
     toString (
@@ -16,8 +18,8 @@ let
       inherit sourceHash;
       compiler = pkgs.stdenv.cc.drvPath;
       sdk = pkgs.hyprland.drvPath;
-      qualification_revision = 1;
-      feature_mask = 1;
+      qualification_revision = qualificationRevision;
+      feature_mask = featureMask;
     }
   );
   header = pkgs.writeText "sledge-qualified-pins.hpp" ''
@@ -26,8 +28,8 @@ let
     #define SLEDGE_STOCK_BUILD_ID "${buildId}"
     #define SLEDGE_STOCK_ELF_SHA256 "${contract.compositor_sha256}"
     #define SLEDGE_STOCK_SDK_API_HASH "${contract.sdk_api_hash}"
-    #define SLEDGE_STOCK_QUALIFICATION_REVISION 1
-    #define SLEDGE_STOCK_FEATURE_MASK 1
+    #define SLEDGE_STOCK_QUALIFICATION_REVISION ${toString qualificationRevision}
+    #define SLEDGE_STOCK_FEATURE_MASK ${toString featureMask}
   '';
   plugin = pkgs.stdenv.mkDerivation {
     pname = "sledge-hyprland-exact-qualified";
@@ -56,7 +58,7 @@ let
         import hashlib,json,pathlib,sys
         out=pathlib.Path(sys.argv[1])
         plugin=pathlib.Path('${plugin}/lib/qualified.so')
-        descriptor=dict(wire_version=1,qualification_revision=1,build_id='sledge-stock-v1:${buildId}',
+        descriptor=dict(wire_version=1,qualification_revision=${toString qualificationRevision},build_id='sledge-stock-v1:${buildId}',
           compositor_path='${contract.compositor_path}',compositor_sha256='${contract.compositor_sha256}',
           sdk_api_hash='${contract.sdk_api_hash}',plugin_path=str(plugin),
           plugin_sha256=hashlib.sha256(plugin.read_bytes()).hexdigest(),capabilities=0)
@@ -68,6 +70,9 @@ let
         PYTHON
       '';
 in
+assert lib.assertMsg (
+  (qualificationRevision == 1 && featureMask == 1) || (qualificationRevision == 2 && featureMask == 3)
+) "unsupported qualification revision/features";
 assert lib.assertMsg (
   builtins.match "[0-9a-f]{64}" contract.compositor_sha256 != null
 ) "exact ELF SHA256 required";

@@ -12,7 +12,13 @@ let
   artifacts = import ./artifacts.nix {
     inherit pkgs;
     contract = {
-      inherit (contract) compositor_path compositor_sha256 sdk_api_hash;
+      inherit (contract)
+        compositor_path
+        compositor_sha256
+        sdk_api_hash
+        qualification_revision
+        feature_mask
+        ;
     };
   };
   inherit (artifacts) sourceHash buildId plugin;
@@ -30,7 +36,7 @@ let
         approval=pathlib.Path('${acceptance}').read_bytes()
         assert hashlib.sha256(evidence).hexdigest()==c['evidence_sha256']
         assert hashlib.sha256(approval).hexdigest()==c['acceptance_sha256']
-        descriptor=dict(wire_version=1,qualification_revision=1,build_id='sledge-stock-v1:${buildId}',
+        descriptor=dict(wire_version=1,qualification_revision=c['qualification_revision'],build_id='sledge-stock-v1:${buildId}',
           compositor_path=c['compositor_path'],compositor_sha256=c['compositor_sha256'],sdk_api_hash=c['sdk_api_hash'],
           plugin_path='${plugin}/lib/qualified.so',plugin_sha256=c['plugin_sha256'],capabilities=0)
         verify_final_plugin(pathlib.Path('${plugin}/lib/qualified.so'),c['plugin_sha256'])
@@ -38,7 +44,7 @@ let
         assert json.loads(raw)==descriptor, 'prospective descriptor differs from accepted binding' 
         assert hashlib.sha256(raw).hexdigest()==c['descriptor_sha256']
         binding=dict(descriptor_sha256=c['descriptor_sha256'],build_id=descriptor['build_id'],
-          evidence_sha256=c['evidence_sha256'],qualification_revision=1,feature_mask=1,approval_revision=c['approval_revision'])
+          evidence_sha256=c['evidence_sha256'],qualification_revision=c['qualification_revision'],feature_mask=c['feature_mask'],approval_revision=c['approval_revision'])
         accepted=json.loads(approval)
         assert accepted['acceptance_revision']==1 and accepted['entries'].count(binding)==1
         catalogue=json.dumps(dict(policy_revision=2,entries=[dict(binding,status='supported')]),sort_keys=True,separators=(',',':')).encode()
@@ -79,8 +85,12 @@ let
   };
 in
 assert lib.assertMsg (
-  contract.qualification_revision == 1 && contract.feature_mask == 1 && contract.approval_revision > 0
-) "only independently reviewed revision1 feature1 is supported";
+  (
+    (contract.qualification_revision == 1 && contract.feature_mask == 1)
+    || (contract.qualification_revision == 2 && contract.feature_mask == 3)
+  )
+  && contract.approval_revision > 0
+) "only reviewed revision1 feature1 or revision2 feature3 is supported";
 assert lib.assertMsg (builtins.all hash (
   map (k: contract.${k}) [
     "compositor_sha256"

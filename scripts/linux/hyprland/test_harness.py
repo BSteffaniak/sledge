@@ -19,6 +19,88 @@ from validate_qualification import require_ime_lock_exclusion, require_passive, 
 
 
 class HarnessTests(unittest.TestCase):
+    @staticmethod
+    def tap_sample(name):
+        from validate_tap import EXPECTED, SENTINEL
+        records = EXPECTED[name] + ([] if name == "tap-hold-down" else SENTINEL)
+        result = ""
+        for code, state in records:
+            result += f"key: {code}; state: {state}\n"
+            mask = "00000004" if (code, state) == ("37", "1") else "00000000"
+            result += f"depressed: {mask}\nlatched: 00000000\nlocked: 00000000\n"
+        return result
+
+    def test_tap_consumer_oracle_rejects_reordering_duplicates_and_stuck_modifiers(self):
+        from validate_tap import validate_phase
+        sample = self.tap_sample("tap-positive")
+        validate_phase(sample, "tap-positive")
+        for broken in (
+            sample.replace("key: 108; state: 0", "key: 108; state: 1", 1),
+            sample + "key: 36; state: 1\n",
+            sample.replace("depressed: 00000004", "depressed: 00000008"),
+            sample.replace("key: 56; state: 1", "depressed: 00000004\nlatched: 00000000\nlocked: 00000000\nkey: 56; state: 1"),
+        ):
+            with self.assertRaises(ValueError):
+                validate_phase(broken, "tap-positive")
+        # Move action ahead of the final physical release, preserving all keys.
+        lines = sample.splitlines(keepends=True)
+        early = ''.join(lines[:20] + lines[24:40] + lines[20:24] + lines[40:])
+        with self.assertRaises(ValueError):
+            validate_phase(early, "tap-positive")
+
+    def test_tap_negative_consumer_oracle_and_no_early_hold_action(self):
+        from validate_tap import EXPECTED, validate_phase
+        for name in EXPECTED:
+            validate_phase(self.tap_sample(name), name)
+            if name != "tap-positive":
+                with self.assertRaises(ValueError):
+                    validate_phase(self.tap_sample(name) + "key: 37; state: 1\n", name)
+
+    def test_tap_steps_are_deterministic_and_device_targeted(self):
+        class Recorder:
+            def __init__(self): self.events = []
+            def key(self, code, down, device=None): self.events.append((code, down, device))
+            def pair(self, code, device=None):
+                self.key(code, True, device)
+                self.key(code, False, device)
+            def targeted_keyboards(self): return ("display-a", "display-b")
+        with patch("tap_cases.time.sleep") as sleep:
+            recorder = Recorder()
+            step(recorder, "tap-positive")
+            self.assertEqual(recorder.events, [("alt_r", True, None), ("alt_r", False, None)] * 3)
+            recorder.events.clear()
+            step(recorder, "tap-device")
+            self.assertEqual([event[2] for event in recorder.events], ["display-a"] * 2 + ["display-b"] * 2 + ["display-a"] * 2)
+            step(recorder, "tap-timeout")
+            sleep.assert_called_with(0.8)
+            with self.assertRaises(ValueError): step(recorder, "tap-unknown")
+
+    def test_tap_report_requires_every_phase_and_explicit_gate(self):
+        from validate_tap import EXPECTED, validate
+        app = ''.join(f"PHASE_BEGIN {name}\n{self.tap_sample(name)}PHASE_END {name}\n"
+                      for name in EXPECTED for _ in range(2 if name == "tap-positive" else 1))
+        report = ("TAP_INTERFACE qualification_revision=2 feature_mask=3\n"
+                  "TAP_TRANSITION_WITHIN_WINDOW tap-reset elapsed_ns=100000000\n"
+                  "TAP_TRANSITION_WITHIN_WINDOW tap-focus elapsed_ns=100000000\n"
+                  "SLEDGE_TAP_CONSUMER_MATRIX_COMPLETED_VM_ONLY\n"
+                  "SLEDGE_PAYLOAD_REPORT_END status=0 qualified=false\n"
+                  "EVIDENCE_FILE /tmp/candidate-consumer-events\n" + app)
+        validate(report)
+        for broken in (report.replace("feature_mask=3", "feature_mask=1"),
+                       report.replace("PHASE_BEGIN tap-reset", "PHASE_BEGIN omitted")):
+            with self.assertRaises(ValueError): validate(broken)
+        with self.assertRaises(ValueError): validate(report, lifecycle=True)
+        gates = "TAP_LOCK_AUTHORITY_ACK\nTAP_IME_AUTHORITY_ACTIVE\n"
+        for name, prefix in (("tap-locked", "LOCK_KEY"), ("tap-ime", "IME_KEY")):
+            gates += f"EVIDENCE_FILE /tmp/{name}-events\nPHASE_BEGIN {name}\n"
+            ack = " ack=1" if prefix == "LOCK_KEY" else ""
+            gates += ''.join(f"{prefix} code=100 state={state} time={index}{ack}\n"
+                             for index, state in enumerate([1, 0] * 3))
+            gates += f"PHASE_END {name}\n"
+        validate(report + gates, lifecycle=True)
+        with self.assertRaises(ValueError):
+            validate(report + gates.replace("code=100", "code=28", 1), lifecycle=True)
+
     def test_qualified_startup_report_requires_real_replacement_and_passthrough(self):
         from validate_startup import validate
         report = '''SLEDGE_QUALIFIED_STARTUP_REPLACEMENT_DRAIN_COMPLETED_VM_ONLY

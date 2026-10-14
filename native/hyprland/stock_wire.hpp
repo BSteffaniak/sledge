@@ -1,5 +1,6 @@
 #pragma once
 #include "decision_mailbox.hpp"
+#include "qualification_metadata.hpp"
 #include <span>
 #include <string_view>
 
@@ -26,10 +27,13 @@ inline bool correlated(const WirePacket& request, const WirePacket& reply) noexc
     for (unsigned i = 16; i < 56; ++i) if (request[i] != reply[i]) return false;
     return true;
 }
-inline bool decision(const WirePacket& event, const WirePacket& reply) noexcept {
+inline bool decision(const WirePacket& event, const WirePacket& reply, bool releaseAction=tapReleaseEnabled) noexcept {
     if (!header(reply,4,16) || !correlated(event,reply) || !zero(reply,76,80)) return false;
     const auto verdict = get(reply,64,4);
     if (verdict > 2) return false;
+    const auto state=get(event,68,4), key=get(event,64,4);
+    const bool modifier=key==42 || key==54 || key==29 || key==97 || key==56 || key==100 || key==125 || key==126;
+    if (state>2 || (state!=1 && verdict!=0 && !(releaseAction && state==0 && modifier && verdict==2))) return false;
     if (verdict != 2) return zero(reply,68,76);
     return get(reply,68,4)<768 && get(reply,72,4)<256;
 }

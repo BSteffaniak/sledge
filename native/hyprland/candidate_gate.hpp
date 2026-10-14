@@ -50,8 +50,8 @@ inline constexpr bool sha256Pin(std::string_view pin) noexcept {
 inline void verifyQualified(std::string_view sdk) {
     static_assert(sha256Pin(SLEDGE_STOCK_ELF_SHA256));
     static_assert(sha256Pin(SLEDGE_STOCK_BUILD_ID));
-    static_assert(SLEDGE_STOCK_QUALIFICATION_REVISION==1);
-    static_assert(SLEDGE_STOCK_FEATURE_MASK==1);
+    static_assert((SLEDGE_STOCK_QUALIFICATION_REVISION==1 && SLEDGE_STOCK_FEATURE_MASK==1) ||
+                  (SLEDGE_STOCK_QUALIFICATION_REVISION==2 && SLEDGE_STOCK_FEATURE_MASK==3));
     if (sdk!=SLEDGE_STOCK_SDK_API_HASH || startupDigest("/proc/self/exe")!=SLEDGE_STOCK_ELF_SHA256)
         throw std::runtime_error("qualified ELF/SDK mismatch; hooks not installed");
 }

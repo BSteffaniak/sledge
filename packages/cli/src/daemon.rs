@@ -42,6 +42,8 @@ struct MatchingState {
     #[cfg(target_os = "linux")]
     hyprland_down_only: bool,
     #[cfg(target_os = "linux")]
+    hyprland_features: u64,
+    #[cfg(target_os = "linux")]
     hyprland_health: Option<sledge_linux::hyprland::session::SessionHealth>,
 }
 
@@ -54,6 +56,8 @@ impl MatchingState {
             hyprland: sledge_linux::hyprland::matcher::MatcherTransactions::default(),
             #[cfg(target_os = "linux")]
             hyprland_down_only: false,
+            #[cfg(target_os = "linux")]
+            hyprland_features: 1,
             #[cfg(target_os = "linux")]
             hyprland_health: None,
         }
@@ -295,7 +299,8 @@ fn reload_callback(
         let mut state = matcher.lock();
         #[cfg(target_os = "linux")]
         if state.hyprland_down_only {
-            hyprland_installed::validate_rules(&cfg).map_err(|e| e.to_string())?;
+            hyprland_installed::validate_rules(&cfg, state.hyprland_features)
+                .map_err(|e| e.to_string())?;
         }
         state.replace(&cfg);
         drop(state);

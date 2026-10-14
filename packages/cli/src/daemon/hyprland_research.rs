@@ -57,7 +57,11 @@ impl ResearchListener {
                 api_hash,
                 artifact,
             },
-            handler: Handler { matching, sources },
+            handler: Handler {
+                matching,
+                sources,
+                observation_gap: false,
+            },
         }))
     }
 
@@ -127,6 +131,7 @@ impl ResearchListener {
 pub(super) struct Handler {
     pub(super) matching: Arc<Mutex<MatchingState>>,
     pub(super) sources: Option<SourceQueue>,
+    pub(super) observation_gap: bool,
 }
 impl EventHandler for Handler {
     fn causal_trace(&mut self, t: sledge_linux::hyprland::causal::CausalTrace) {
@@ -141,8 +146,15 @@ impl EventHandler for Handler {
     fn propose(&mut self, scope: Scope, event: &Event) -> Decision {
         // Never block a native deadline behind config reload parsing/publication.
         let Some(mut state) = self.matching.try_lock() else {
+            self.observation_gap = true;
             return Decision::Pass;
         };
+        if std::mem::take(&mut self.observation_gap) {
+            let MatchingState {
+                matcher, hyprland, ..
+            } = &mut *state;
+            hyprland.invalidate_speculation(matcher);
+        }
         let focus = MatcherAdapter::focus(event);
         let identity = focus.as_ref().map(|focus| match focus.category {
             sledge_linux::desktop::FocusCategory::Wayland => {
@@ -195,7 +207,7 @@ impl EventHandler for Handler {
             ?report,
             "Hyprland native delivery outcome"
         );
-        if event.state == 1 {
+        if event.state == 1 || hyprland.modifier_tap_release() {
             hyprland.on_delivery(matcher, scope, &report);
         } else {
             hyprland.settle_device_event(matcher, scope, event, &report);
@@ -280,6 +292,7 @@ when = { app_in = ["editor"] }
         )
         .expect("valid fixture");
         Handler {
+            observation_gap: false,
             matching: Arc::new(Mutex::new(MatchingState::new(&config))),
             sources: None,
         }

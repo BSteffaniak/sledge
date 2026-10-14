@@ -15,13 +15,14 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-pub(super) fn validate_rules(config: &sledge_config::Config) -> Result<()> {
+pub(super) fn validate_rules(config: &sledge_config::Config, features: u64) -> Result<()> {
     anyhow::ensure!(
         config.rules.iter().all(
-            |rule| matches!(rule.trigger, sledge_core::Trigger::Hotkey(_))
+            |rule| (matches!(rule.trigger, sledge_core::Trigger::Hotkey(_))
+                || features == sledge_linux::hyprland::catalogue::TAP_FEATURES)
                 && matches!(rule.action, sledge_core::Action::SendKey { .. })
         ),
-        "Hyprland candidate supports only fresh-Down send_key hotkeys; taps and source actions are not admitted"
+        "Hyprland admission requires send_key actions; taps require revision2/mask3"
     );
     Ok(())
 }
@@ -64,7 +65,11 @@ impl InstalledListener {
             listener: Listener::bind(path)
                 .context("binding installed Hyprland private endpoint")?,
             metadata,
-            handler: Handler { matching, sources },
+            handler: Handler {
+                matching,
+                sources,
+                observation_gap: false,
+            },
         })
     }
     pub(super) fn run(mut self, stopped: &AtomicBool) -> Result<()> {
@@ -161,19 +166,26 @@ mod tests {
     fn candidate_rules_reject_unadmitted_features() {
         let hotkey = "{ key = \"KeyA\", mods = [] }";
         let send = "{ type = \"send_key\", key = \"KeyB\", mods = [] }";
-        assert!(validate_rules(&config(hotkey, send)).is_ok());
+        assert!(validate_rules(&config(hotkey, send), 1).is_ok());
         assert!(
-            validate_rules(&config(
-                hotkey,
-                "{ type = \"set_input_source\", id = \"fixture\" }"
-            ))
+            validate_rules(
+                &config(r#"{ tap = "RightAlt", count = 3, within_ms = 600 }"#, send),
+                3
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_rules(
+                &config(hotkey, "{ type = \"set_input_source\", id = \"fixture\" }"),
+                1
+            )
             .is_err()
         );
         assert!(
-            validate_rules(&config(
-                "{ tap = \"LeftAlt\", count = 2, within_ms = 300 }",
-                send
-            ))
+            validate_rules(
+                &config("{ tap = \"LeftAlt\", count = 2, within_ms = 300 }", send),
+                1
+            )
             .is_err()
         );
     }

@@ -44,7 +44,7 @@ cleanup() {
  for log in /tmp/candidate-daemon-events /tmp/candidate-consumer-events /tmp/candidate-lock-events; do
   if [[ -f $log ]]; then echo "EVIDENCE_FILE $log"; cat "$log"; fi
  done
- for pid in "$daemon_pid" "$consumer" "$child"; do [[ -z $pid ]] || kill "$pid" 2>/dev/null || true; done
+ for pid in "${tap_locker:-}" "${tap_consumer:-}" "$daemon_pid" "$consumer" "$child"; do [[ -z $pid ]] || kill "$pid" 2>/dev/null || true; done
 }
 trap cleanup EXIT
 for ((i=0;i<60;i++)); do
@@ -210,6 +210,10 @@ for ((i=0;i<2;i++)); do
  echo 'PHASE_END candidate-a' >> /tmp/candidate-consumer-events
 done
 hyprctl sledge:status
+if [[ -f /sledge-payload/tap-case ]]; then
+ source /sledge-payload/tap-run.sh
+ run_tap_matrix /tmp/candidate-consumer-events /tmp/candidate-daemon-events
+fi
 if [[ $mode == matrix ]]; then
  phase() {
   echo "PHASE_BEGIN $1" >> /tmp/candidate-consumer-events

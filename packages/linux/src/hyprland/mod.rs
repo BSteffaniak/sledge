@@ -62,6 +62,10 @@ impl DeliveryReport {
 /// native deadline and must not perform I/O or enqueue replacement injection.
 /// Physical output ownership and reconciliation remain native responsibilities.
 pub trait EventHandler {
+    /// Only the exact revision2/mask3 Session wrapper grants release proposals.
+    fn modifier_release_actions(&self) -> bool {
+        false
+    }
     fn propose(&mut self, scope: Scope, event: &Event) -> Decision;
     /// One bounded record after transaction settlement; no logging in deadline window.
     fn causal_trace(&mut self, _trace: causal::CausalTrace) {}
@@ -455,7 +459,10 @@ impl Bridge {
         trace: &mut causal::CausalTrace,
     ) -> io::Result<()> {
         // Capture remains unqualified. Do not dispatch to a stateful matcher.
-        let decision = if research && !self.locked && event.state == 1 {
+        let decision = if research
+            && !self.locked
+            && (event.state == 1 || (event.state == 0 && handler.modifier_release_actions()))
+        {
             handler.propose(packet.scope, event)
         } else {
             Decision::Pass

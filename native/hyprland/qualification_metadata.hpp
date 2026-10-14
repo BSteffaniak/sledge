@@ -14,4 +14,10 @@ inline constexpr bool validBuildId() noexcept {
     return true;
 }
 inline constexpr unsigned registrationVersion=1, wireVersion=1;
+inline constexpr bool tapReleaseEnabled =
+#if defined(SLEDGE_STOCK_QUALIFIED) && defined(SLEDGE_STOCK_QUALIFICATION_REVISION) && defined(SLEDGE_STOCK_FEATURE_MASK)
+    SLEDGE_STOCK_QUALIFICATION_REVISION==2 && SLEDGE_STOCK_FEATURE_MASK==3;
+#else
+    false;
+#endif
 }

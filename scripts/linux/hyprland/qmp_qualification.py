@@ -7,6 +7,8 @@ import subprocess
 import sys
 import time
 
+from tap_cases import tap_step
+
 
 class QMP:
     def __init__(self, connection):
@@ -93,6 +95,8 @@ class QMP:
 
 
 def step(qmp, name):
+    if tap_step(qmp, name):
+        return
     if name in {"baseline", "loaded", "unloaded", "recovered", "locked", "crashed", "ime", "passive", "rollback"}:
         qmp.pair("a")
         qmp.key("shift", True)

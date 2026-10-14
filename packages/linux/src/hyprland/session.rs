@@ -333,7 +333,10 @@ impl Session {
         admitted: super::catalogue::AdmittedMetadata,
         deadline: u64,
     ) -> io::Result<Self> {
-        if admitted.feature_mask != super::catalogue::FRESH_DOWN_SEND_KEY {
+        if !super::catalogue::valid_capabilities(
+            admitted.metadata.descriptor().qualification_revision,
+            admitted.feature_mask,
+        ) {
             return Err(denied("unsupported admitted features"));
         }
         super::catalogue::Catalogue::recheck(&admitted.metadata)?;
@@ -362,7 +365,11 @@ impl Session {
     #[must_use]
     pub const fn feature_mask(&self) -> u64 {
         if self.active {
-            super::catalogue::FRESH_DOWN_SEND_KEY
+            if self.metadata.descriptor.qualification_revision == 2 {
+                super::catalogue::TAP_FEATURES
+            } else {
+                super::catalogue::FRESH_DOWN_SEND_KEY
+            }
         } else {
             0
         }
@@ -432,7 +439,7 @@ impl Session {
             return Err(denied("matcher not bound to session nonce"));
         }
         if self.active && !self.bridge.awaiting_reconciliation && !self.bridge.locked {
-            let mut filtered = DownOnly(h);
+            let mut filtered = DownOnly(h, self.feature_mask() == super::catalogue::TAP_FEATURES);
             self.bridge.admitted_step_if_ready(&mut filtered, deadline)
         } else {
             self.bridge.passive_step_if_ready(h, deadline)
@@ -489,14 +496,22 @@ fn admission_deadline_after(
         .ok_or_else(super::wire::invalid)
 }
 // No research_fault forwarding, source-side-effect grant, release/tap proposal.
-struct DownOnly<'a, H>(&'a mut H);
+struct DownOnly<'a, H>(&'a mut H, bool);
 impl<H: EventHandler> EventHandler for DownOnly<'_, H> {
+    fn modifier_release_actions(&self) -> bool {
+        self.1
+    }
     fn propose(
         &mut self,
         scope: super::wire::Scope,
         event: &super::wire::Event,
     ) -> super::wire::Decision {
-        self.0.propose(scope, event)
+        let decision = self.0.propose(scope, event);
+        if event.state == 0 && decision == super::wire::Decision::Swallow {
+            super::wire::Decision::Pass
+        } else {
+            decision
+        }
     }
     fn delivery(
         &mut self,
@@ -523,6 +538,44 @@ impl<H: EventHandler> EventHandler for DownOnly<'_, H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn release_capability_wrapper_never_proposes_swallow_or_research_faults() {
+        struct Handler;
+        impl EventHandler for Handler {
+            fn propose(
+                &mut self,
+                _: super::super::wire::Scope,
+                _: &super::super::wire::Event,
+            ) -> super::super::wire::Decision {
+                super::super::wire::Decision::Swallow
+            }
+            fn delivery(
+                &mut self,
+                _: super::super::wire::Scope,
+                _: &super::super::wire::Event,
+                _: super::super::wire::Decision,
+                _: super::super::DeliveryReport,
+            ) {
+            }
+            fn reset(&mut self, _: super::super::wire::Scope, _: &super::super::wire::Body) {}
+            fn disconnected(&mut self) {}
+        }
+        let mut h = Handler;
+        let mut wrapper = DownOnly(&mut h, true);
+        assert!(wrapper.modifier_release_actions());
+        let mut event = super::super::tests::event();
+        event.state = 0;
+        assert_eq!(
+            wrapper.propose(super::super::tests::scope(), &event),
+            super::super::wire::Decision::Pass
+        );
+        assert!(matches!(
+            wrapper.research_fault(super::super::tests::scope(), &event),
+            super::super::ResearchFault::None
+        ));
+        let wrapper = DownOnly(&mut h, false);
+        assert!(!wrapper.modifier_release_actions());
+    }
     #[test]
     fn descriptor_rejects_forged_schema_and_mutable_inputs() {
         assert!(

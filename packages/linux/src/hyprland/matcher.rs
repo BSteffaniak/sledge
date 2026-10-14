@@ -8,7 +8,7 @@ use sledge_core::{
     Action, DeviceId, EventKind, KeyEvent, Matcher, Modifiers, ReplacementDelivery,
     ReplacementToken, Verdict,
 };
-use std::time::Instant;
+use std::{collections::HashSet, time::Instant};
 
 /// Recovery progress, without exposing tokens or discarding ownership.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,11 +124,43 @@ impl MatcherAdapter {
 #[derive(Default)]
 pub struct MatcherTransactions {
     pending: Option<Pending>,
+    modifier_tap_release: bool,
+    physical_downs: HashSet<(u64, u32)>,
+    observation: Option<(u64, u64, u64, u64)>,
     replacement_disabled: bool,
     recovery_nonce: Option<u64>,
     previous_recovery_nonce: Option<u64>,
 }
 impl MatcherTransactions {
+    /// Set only from exact compiled-catalogue revision2/mask3 admission.
+    /// A fresh transaction state is required before changing capabilities.
+    pub fn set_modifier_tap_release(&mut self, enabled: bool) {
+        self.modifier_tap_release = enabled;
+    }
+    #[must_use]
+    pub const fn modifier_tap_release(&self) -> bool {
+        self.modifier_tap_release
+    }
+
+    fn observe_physical(&mut self, matcher: &mut Matcher, scope: Scope, event: &Event) -> bool {
+        let identity = (
+            scope.nonce,
+            scope.lock_epoch,
+            event.focus_epoch,
+            scope.generation,
+        );
+        if self.observation != Some(identity) {
+            matcher.disqualify_taps();
+        }
+        self.observation = Some(identity);
+        let press = (scope.generation, event.key);
+        match event.state {
+            1 => self.physical_downs.insert(press),
+            0 => self.physical_downs.remove(&press),
+            _ => false,
+        }
+    }
+
     /// Propose synchronously using only the caller's category-aware alias result.
     /// Unknown keys bypass. Unsupported source selection/replacement modifiers
     /// fall back to Pass; no side effect or asynchronous injection is dispatched.
@@ -160,13 +192,17 @@ impl MatcherTransactions {
         if self.pending.is_some() || self.replacement_disabled {
             return Err(super::wire::invalid());
         }
-        if event.state != 1 {
+        if event.state > 1 || (event.state == 0 && !self.modifier_tap_release) {
+            return Ok(Decision::Pass);
+        }
+        if self.modifier_tap_release && !self.observe_physical(matcher, scope, event) {
             return Ok(Decision::Pass);
         }
         let Some(code) = u16::try_from(event.key)
             .ok()
             .and_then(crate::keymap::from_evdev)
         else {
+            matcher.disqualify_taps();
             return Ok(Decision::Pass);
         };
         let normalized = KeyEvent {
@@ -184,8 +220,19 @@ impl MatcherTransactions {
             focused_app,
             now,
         );
+        if self.modifier_tap_release
+            && code.is_modifier()
+            && event.state == 1
+            && self
+                .physical_downs
+                .iter()
+                .any(|press| *press != (scope.generation, event.key))
+        {
+            matcher.disqualify_taps();
+        }
         let decision = match verdict {
             Verdict::Pass => Decision::Pass,
+            Verdict::Swallow if event.state == 0 => Decision::Pass,
             Verdict::Swallow => Decision::Swallow,
             Verdict::Replace(Action::SendKey { key, mods }) => {
                 match (crate::keymap::to_evdev(key), requested_modifiers(mods)) {
@@ -374,6 +421,8 @@ impl MatcherTransactions {
             return false;
         }
         matcher.reset();
+        self.physical_downs.clear();
+        self.observation = None;
         self.pending = None;
         self.replacement_disabled = false;
         self.previous_recovery_nonce = self.recovery_nonce.take();
@@ -393,6 +442,7 @@ impl MatcherTransactions {
             self.pending = None;
             self.replacement_disabled = true;
         }
+        self.physical_downs.retain(|(id, _)| *id != generation);
         matcher.reset_device(DeviceId(generation));
     }
     /// Validated already-unlocked epoch synchronization is speculation-only.
@@ -400,6 +450,7 @@ impl MatcherTransactions {
     /// Uncertainty cannot be cured by an epoch synchronization packet.
     pub fn observe_unlocked_epoch(&mut self, matcher: &mut Matcher, nonce: u64) {
         if self.is_reconciled(nonce) && self.pending.is_none() {
+            self.observation = None;
             matcher.invalidate_speculation();
         } else {
             self.observe_lock_boundary(matcher, nonce);
@@ -411,6 +462,7 @@ impl MatcherTransactions {
     pub fn observe_lock_boundary(&mut self, matcher: &mut Matcher, nonce: u64) {
         if self.recovery_nonce == Some(nonce) && self.replacement_disabled && self.pending.is_none()
         {
+            self.observation = None;
             matcher.invalidate_speculation();
         } else {
             self.disconnected(matcher);
@@ -453,6 +505,7 @@ impl MatcherTransactions {
         if self.pending.take().is_some() {
             self.replacement_disabled = true;
         }
+        self.observation = None;
         matcher.invalidate_speculation();
     }
     /// Transport loss is uncertain even if no token is pending. No automatic
@@ -463,6 +516,9 @@ impl MatcherTransactions {
         self.replacement_disabled = true;
     }
 }
+#[cfg(test)]
+#[path = "tap_tests.rs"]
+mod tap_tests;
 #[cfg(test)]
 #[path = "matcher_tests.rs"]
 mod tests;

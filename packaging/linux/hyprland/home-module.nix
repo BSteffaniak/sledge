@@ -97,8 +97,14 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = pkgs.stdenv.isLinux && cfg.package != null && cfg.package.feature_mask == 1;
-        message = "Sledge Hyprland requires Linux and an accepted feature1 package.";
+        assertion =
+          pkgs.stdenv.isLinux
+          && cfg.package != null
+          && builtins.elem cfg.package.feature_mask [
+            1
+            3
+          ];
+        message = "Sledge Hyprland requires Linux and an accepted feature1/feature3 package.";
       }
       {
         assertion = cfg.firstApp != [ ] && lib.hasPrefix "/" (builtins.head cfg.firstApp);

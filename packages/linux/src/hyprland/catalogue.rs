@@ -7,6 +7,15 @@ use std::os::unix::fs::MetadataExt;
 use std::{fs, io, path::PathBuf};
 
 pub const FRESH_DOWN_SEND_KEY: u64 = 1;
+pub const MODIFIER_TAP_RELEASE: u64 = 2;
+pub const TAP_FEATURES: u64 = FRESH_DOWN_SEND_KEY | MODIFIER_TAP_RELEASE;
+#[must_use]
+pub const fn valid_capabilities(revision: u64, features: u64) -> bool {
+    matches!(
+        (revision, features),
+        (1, FRESH_DOWN_SEND_KEY) | (2, TAP_FEATURES)
+    )
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Policy {
@@ -20,6 +29,8 @@ struct Entry {
     build_id: String,
     evidence_sha256: String,
     feature_mask: u64,
+    #[serde(default = "legacy_revision")]
+    qualification_revision: u64,
     isolated_vm: bool,
     machine_id_sha256: String,
     boot_marker_path: PathBuf,
@@ -47,7 +58,16 @@ struct Acceptance {
     acceptance_revision: u64,
     entries: Vec<SupportedEntry>,
 }
+const fn legacy_revision() -> u64 {
+    1
+}
 impl Admission {
+    fn revision(&self) -> u64 {
+        match self {
+            Self::Candidate(e) => e.qualification_revision,
+            Self::Supported(e) => e.qualification_revision,
+        }
+    }
     fn identity(&self) -> (&str, &str) {
         match self {
             Self::Candidate(e) => (&e.descriptor_sha256, &e.build_id),
@@ -134,17 +154,15 @@ impl Catalogue {
     /// Rejects absent/bad pin, schema/revision/entry mismatch and wrong scope.
     pub fn qualify(metadata: VerifiedMetadata) -> io::Result<AdmittedMetadata> {
         let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/hyprland-catalogue.json"));
-        if metadata.descriptor().qualification_revision != 1 {
-            return Err(denied(
-                "candidate descriptor qualification revision must be 1",
-            ));
-        }
         let entry = select(
             bytes,
             env!("SLEDGE_EMBEDDED_CATALOGUE_SHA256"),
             &metadata.descriptor_digest,
             &metadata.descriptor().build_id,
         )?;
+        if metadata.descriptor().qualification_revision != entry.revision() {
+            return Err(denied("descriptor qualification revision mismatch"));
+        }
         entry.verify()?;
         Ok(AdmittedMetadata {
             metadata,
@@ -187,7 +205,7 @@ fn select(bytes: &[u8], pin: &str, descriptor: &str, build: &str) -> io::Result<
     match &entry {
         Admission::Candidate(e) => {
             if !e.isolated_vm
-                || e.feature_mask != FRESH_DOWN_SEND_KEY
+                || !valid_capabilities(e.qualification_revision, e.feature_mask)
                 || !hex(&e.descriptor_sha256)
                 || !hex(&e.evidence_sha256)
                 || !hex(&e.machine_id_sha256)
@@ -199,8 +217,7 @@ fn select(bytes: &[u8], pin: &str, descriptor: &str, build: &str) -> io::Result<
         }
         Admission::Supported(e) => {
             if policy.policy_revision != 2
-                || e.qualification_revision != 1
-                || e.feature_mask != FRESH_DOWN_SEND_KEY
+                || !valid_capabilities(e.qualification_revision, e.feature_mask)
                 || e.approval_revision == 0
                 || !hex(&e.descriptor_sha256)
                 || !hex(&e.evidence_sha256)
@@ -242,6 +259,17 @@ fn verify_scope(e: &Entry) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tap_capability_requires_exact_revision_and_mask() {
+        for revision in 0..=3 {
+            for features in 0..=7 {
+                assert_eq!(
+                    valid_capabilities(revision, features),
+                    matches!((revision, features), (1, 1) | (2, 3))
+                );
+            }
+        }
+    }
     #[test]
     fn supported_requires_separate_exact_pinned_acceptance() {
         let d = "a".repeat(64);
@@ -317,6 +345,19 @@ mod tests {
             bad["entries"][0][field] = replacement;
             let bytes = serde_json::to_vec(&bad).unwrap();
             assert!(select(&bytes, &digest(&bytes), &d, &b).is_err());
+        }
+        for (revision, features, accepted) in [
+            (1, 1, true),
+            (1, 3, false),
+            (2, 1, false),
+            (2, 3, true),
+            (3, 3, false),
+        ] {
+            let mut candidate = value.clone();
+            candidate["entries"][0]["qualification_revision"] = serde_json::json!(revision);
+            candidate["entries"][0]["feature_mask"] = serde_json::json!(features);
+            let bytes = serde_json::to_vec(&candidate).unwrap();
+            assert_eq!(select(&bytes, &digest(&bytes), &d, &b).is_ok(), accepted);
         }
         let mut bad = value;
         bad["policy_revision"] = serde_json::json!(3);

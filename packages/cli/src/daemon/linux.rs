@@ -23,12 +23,16 @@ pub(super) fn run_linux(
     // Metadata/catalogue verification is off the native callback and precedes
     // desktop workers or socket admission. Candidate never implies host support.
     let installed_metadata = super::hyprland_installed::prepare(args)?;
-    if installed_metadata.is_some() {
+    if let Some(metadata) = &installed_metadata {
         let config = sledge_config::load_from_file(&config_path)?;
-        super::hyprland_installed::validate_rules(&config)?;
+        super::hyprland_installed::validate_rules(&config, metadata.feature_mask())?;
         let mut state = matcher.lock();
         state.replace(&config);
         state.hyprland_down_only = true;
+        state.hyprland_features = metadata.feature_mask();
+        state.hyprland.set_modifier_tap_release(
+            metadata.feature_mask() == sledge_linux::hyprland::catalogue::TAP_FEATURES,
+        );
     }
     let desktop = super::desktop::start(args)?;
     let desktop_focus = desktop
