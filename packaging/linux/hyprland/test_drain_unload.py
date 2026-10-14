@@ -42,6 +42,18 @@ class DrainUnloadTests(unittest.TestCase):
                                  ["sledge:status"], ["sledge:status"],
                                  ["plugin", "unload", "/plugin.so"]])
 
+    def test_unload_exit_zero_error_is_not_acknowledgment(self):
+        for answer in ("", "error: plugin not found", "failed"):
+            calls = []
+            def command(hyprctl, instance, arguments, timeout):
+                calls.append(arguments)
+                if arguments == ["sledge:status"]:
+                    return status(True)
+                return answer if arguments[:2] == ["plugin", "unload"] else "ok"
+            with self.assertRaisesRegex(RuntimeError, "unload not acknowledged"):
+                controller.drain_unload(Path("/hyprctl"), "fixture", Path("/plugin.so"), 1, command)
+            self.assertEqual(calls.count(["plugin", "unload", "/plugin.so"]), 1)
+
     def test_timeout_leaves_plugin_loaded(self):
         calls = []
 

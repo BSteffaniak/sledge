@@ -1,4 +1,6 @@
 //! Conservative same-user IPC binding; never unlink an existing path.
+mod discovery;
+pub use discovery::client_socket_path;
 use nix::fcntl::{AtFlags, OFlag, open};
 use nix::sys::stat::{Mode, fstat, fstatat};
 use nix::unistd::{UnlinkatFlags, unlinkat};

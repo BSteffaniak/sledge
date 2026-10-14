@@ -1,5 +1,10 @@
 //! `sledge status`, `sledge reload`, `sledge validate`, `sledge check-permissions`.
 
+#[cfg(target_os = "linux")]
+mod readiness;
+#[cfg(target_os = "linux")]
+use readiness::describe as backend_readiness;
+
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -15,7 +20,8 @@ pub(crate) fn socket_path(cli: &Cli) -> Result<std::path::PathBuf> {
     }
     #[cfg(target_os = "linux")]
     {
-        sledge_linux::ipc::default_socket_path().context("resolving private Linux runtime socket")
+        sledge_linux::ipc::client_socket_path(None)
+            .context("selecting Sledge session; use --socket for an explicit endpoint")
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -51,6 +57,10 @@ pub fn print_status(cli: &Cli) -> Result<()> {
                 );
             }
             if let Some(capabilities) = &s.capabilities {
+                #[cfg(target_os = "linux")]
+                if let Some(readiness) = backend_readiness(capabilities) {
+                    println!("  backend        : {readiness}");
+                }
                 println!("  capabilities   : {capabilities}");
             }
             match s.last_reload_secs_ago {

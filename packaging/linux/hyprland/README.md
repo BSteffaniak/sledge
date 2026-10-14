@@ -1,5 +1,94 @@
 # Hyprland backend packaging
 
+## Normal login and one accepted bundle
+
+Use the trusted `mkQualifiedHyprland` factory result's `bundle`; its expert
+contract/evidence inputs remain packaging internals. Users configure one Sledge
+TOML file, not registration JSON, plugin paths or runtime hashes. Unknown builds
+still require independent exact-artifact review; this API grants no acceptance.
+
+The internal `session-package.nix` helper takes `pkgs`, `bundle`, `configFile`,
+`firstApp` (an absolute real application argv), `compositorConfig`, optional
+expert `configFile` override and `autostartCommands`. Normal config is the mutable
+`${XDG_CONFIG_HOME:-$HOME/.config}/sledge/config.toml`, shared with the CLI. Before
+plugin load or first-app startup the accepted daemon runs `sledge validate PATH`;
+invalid/missing config is reported without launching either. It returns a login package:
+
+```nix
+let
+  login = import ./session-package.nix {
+    inherit pkgs;
+    bundle = acceptedSledge.bundle;
+    firstApp = [ "${pkgs.foot}/bin/foot" ];
+    compositorConfig = builtins.readFile ./hyprland.conf;
+    autostartCommands = [ ];
+  };
+in {
+  services.displayManager.sessionPackages = [ login ];
+  services.displayManager.defaultSession = "hyprland-sledge";
+}
+```
+
+GDM shows **Hyprland (Sledge)**; ordinary **Hyprland** remains an explicit rollback
+choice. No manual session command, autonomous daemon unit or restart loop is
+needed. This only defines packages/configuration; it never switches a running
+desktop. The bundle's pinned compositor is used, not an unrelated host package.
+Home Manager accepts `programs.sledgeHyprland.bundle` and exposes read-only
+`sessionPackage` for NixOS integration; legacy `package` and session/drain helper
+names remain available as internal compatibility APIs.
+
+Startup is ordered compositor → plugin → real first-app enter and daemon proof →
+remaining apps. No parallel `exec-once` entries are allowed. If startup fails,
+errors describe retained components and withheld apps. There is no forced unload,
+stale socket deletion or automatic fallback once input may be owned. The lifetime
+guardian uses exact pidfds and stops the daemon only after abrupt compositor
+loss; it does not restart anything. Controlled SIGTERM/SIGINT/SIGHUP to the login
+wrapper first drains the exact instance, waits for irreversible detach and an
+explicit unload acknowledgment, then signals that exact compositor. Timeout or
+uncertain unload retains compositor and daemon; release held keys and retry.
+The compositor runs in a separate process group so ordinary wrapper signals do
+not bypass this barrier. Direct Hyprland exit, forced display-manager cgroup
+teardown, SIGKILL or compositor crash are abrupt loss, not an orderly-drain
+promise. Unique endpoint directories are retained for
+explicit diagnosis, never reused or recursively cleaned.
+
+### Internal CLI discovery contract
+
+The launcher exports `SLEDGE_SESSION_FILE` as an absolute path in its unique
+same-user private runtime directory. Only after Supported, qualified and
+operational proof does startup atomically publish mode0600 JSON:
+
+```json
+{"version":1,"backend":"hyprland","ipc_socket":"/run/user/UID/sledge.UNIQUE/health.sock","compositor_pid":123,"instance":"exact-instance"}
+```
+
+CLI consumers must validate private same-user parent/regular marker, known version
+and backend, and use only this explicit locator. Do not scan other sessions,
+read process environments or guess sockets to discover a session. A retained
+marker after logout is not liveness proof; normal authenticated IPC must still
+succeed. No marker is published on startup failure. The environment is a locator,
+not credentials or authority to admit an unknown backend.
+
+Checks: `python3 -B test_startup.py`, `python3 -B test_session.py`,
+`test_session_eval.nix` and existing drain/identity/evaluation tests; no desktop
+contact is required.
+
+## Packaged launch validation handoff (disposable session only)
+
+Build the returned login derivation and test its installed
+`bin/sledge-hyprland-session`, not a repository Python script. In the disposable
+qualified compositor environment, verify: nondefault `XDG_CONFIG_HOME` selects
+the same TOML as `sledge validate`; malformed config loads no plugin/first app;
+valid config publishes the private marker only after readiness; wrapper SIGTERM
+with a held key times out without terminating compositor/daemon; after release,
+retry drains/unloads before compositor exit; after detach the retained-pidfd
+guardian stops the exact daemon and acknowledges exit before plugin unload;
+abrupt compositor loss stops only
+the exact daemon through its pidfd. Record installed wrapper path/digest and
+accepted bundle identity. This remains a real packaged-login qualification gate;
+unit mocks and Nix evaluation are not that evidence. No host desktop loading is
+part of these checks.
+
 ## Home Manager login integration
 
 `homeManagerModules.sledgeHyprland` accepts an independently reviewed exact-build

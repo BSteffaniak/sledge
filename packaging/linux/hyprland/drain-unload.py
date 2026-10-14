@@ -37,7 +37,7 @@ def detached_status(text):
     return status["draining"] and status["detached"]
 
 
-def drain_unload(hyprctl, instance, plugin, timeout, command=checked_command):
+def drain_unload(hyprctl, instance, plugin, timeout, command=checked_command, after_detach=None):
     deadline = time.monotonic() + timeout
 
     def invoke(arguments):
@@ -46,7 +46,10 @@ def drain_unload(hyprctl, instance, plugin, timeout, command=checked_command):
             raise TimeoutError("native adapter did not detach; plugin left loaded")
         return command(hyprctl, instance, arguments, min(remaining, 2.0))
 
-    invoke(["dispatch", "sledge:drain"])
+    drain_ack = invoke(["dispatch", "sledge:drain"])
+    if drain_ack.strip().lower() != "ok":
+        raise RuntimeError("drain request not acknowledged; plugin retained")
+    print(json.dumps({"event": "drain_acknowledged", "instance": instance}), flush=True)
     while not detached_status(invoke(["sledge:status"])):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -54,7 +57,13 @@ def drain_unload(hyprctl, instance, plugin, timeout, command=checked_command):
         time.sleep(min(remaining, 0.05))
     # Detached is irreversible: subsequent physical input follows stock paths.
     # A plain quiescent=true snapshot is deliberately insufficient.
-    invoke(["plugin", "unload", str(plugin)])
+    print(json.dumps({"event": "adapter_detached", "instance": instance}), flush=True)
+    if after_detach is not None:
+        after_detach()
+    acknowledgment = invoke(["plugin", "unload", str(plugin)])
+    if acknowledgment.strip().lower() != "ok":
+        raise RuntimeError("plugin unload not acknowledged; adapter is detached but unload is unconfirmed; no forced cleanup")
+    print(json.dumps({"event": "plugin_unload_acknowledged", "instance": instance, "plugin": str(plugin)}), flush=True)
 
 
 def main():

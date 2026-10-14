@@ -7,20 +7,27 @@
 }:
 let
   cfg = config.programs.sledgeHyprland;
+  selected = if cfg.bundle != null then cfg.bundle else cfg.package;
+  bundle = if selected != null && selected ? bundle then selected.bundle else selected;
   startup = pkgs.writeShellApplication {
     name = "sledge-hyprland-startup";
     runtimeInputs = [ pkgs.python3 ];
-    text = ''exec python3 ${./startup.py} --daemon ${cfg.package.daemon}/bin/sledge --registration ${cfg.package.registration}/registration.json --plugin ${cfg.package.plugin}/lib/qualified.so "$@"'';
+    text = ''exec python3 ${./startup.py} --daemon ${bundle.daemon}/bin/sledge --registration ${bundle.registration}/registration.json --plugin ${bundle.plugin}/lib/qualified.so "$@"'';
   };
   drain = pkgs.writeShellApplication {
     name = "sledge-hyprland-drain-unload";
     runtimeInputs = [ pkgs.python3 ];
-    text = ''exec python3 ${./drain-unload.py} --plugin ${cfg.package.plugin}/lib/qualified.so "$@"'';
+    text = ''exec python3 ${./drain-unload.py} --plugin ${bundle.plugin}/lib/qualified.so "$@"'';
   };
 in
 {
   options.programs.sledgeHyprland = {
     enable = lib.mkEnableOption "explicit exact-build Hyprland startup/drain tools";
+    bundle = lib.mkOption {
+      type = lib.types.nullOr lib.types.attrs;
+      default = null;
+      description = "Accepted bundle returned by qualified.nix; runtime hashes are internal.";
+    };
     package = lib.mkOption {
       type = lib.types.nullOr lib.types.attrs;
       default = null;
@@ -31,11 +38,11 @@ in
     assertions = [
       {
         assertion =
-          cfg.package != null
-          && cfg.package ? daemon
-          && cfg.package ? registration
-          && cfg.package ? plugin
-          && builtins.elem cfg.package.feature_mask [
+          bundle != null
+          && bundle ? daemon
+          && bundle ? registration
+          && bundle ? plugin
+          && builtins.elem bundle.feature_mask [
             1
             3
           ];

@@ -11,8 +11,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
-    /// Override the health socket path (Linux requires a private same-user
-    /// parent; default is $XDG_RUNTIME_DIR/sledge.sock with no /tmp fallback).
+    /// Override the health socket path. Linux clients otherwise discover the
+    /// current private compositor session, then use $XDG_RUNTIME_DIR/sledge.sock.
+    /// An ambiguous or stale compositor selection fails without fallback.
     #[arg(long, global = true)]
     pub socket: Option<PathBuf>,
 

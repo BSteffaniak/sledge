@@ -124,4 +124,12 @@ assert lib.assertMsg (
     sourceHash
     ;
   inherit (contract) feature_mask;
+  accepted = true;
+  compositor = pkgs.hyprland;
+  bundle = {
+    inherit plugin registration daemon;
+    inherit (contract) feature_mask;
+    accepted = true;
+    compositor = pkgs.hyprland;
+  };
 }

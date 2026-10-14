@@ -145,7 +145,11 @@ pub(super) fn run_linux(
         .enable_all()
         .worker_threads(2)
         .build()?;
-    let path = crate::status::socket_path(cli)?;
+    // Server binding must not require an already-existing discoverable socket.
+    let path = cli
+        .socket
+        .clone()
+        .map_or_else(sledge_linux::ipc::default_socket_path, Ok)?;
     let (listener, _socket_guard) = sledge_linux::ipc::SocketGuard::bind(&path).context(
         "binding private same-user IPC socket (existing paths require explicit recovery)",
     )?;
