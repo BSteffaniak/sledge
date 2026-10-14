@@ -19,6 +19,63 @@ from validate_qualification import require_ime_lock_exclusion, require_passive, 
 
 
 class HarnessTests(unittest.TestCase):
+    def test_qualified_startup_report_requires_real_replacement_and_passthrough(self):
+        from validate_startup import validate
+        report = '''SLEDGE_QUALIFIED_STARTUP_REPLACEMENT_DRAIN_COMPLETED_VM_ONLY
+SLEDGE_PAYLOAD_REPORT_END status=0 qualified=false
+EVIDENCE_FILE /tmp/qualified-startup
+{"daemon_pid":123,"operational":true}
+EVIDENCE_FILE /tmp/qualified-daemon-events
+independently accepted installed Hyprland registration; awaiting native proof feature_mask=1
+native reconciliation epoch=5 sequence=2 nonce=7 accepted=true
+native delivery outcome generation=1 epoch=5 sequence=3 nonce=7 key=30 state=1 focus_kind=1 report=Acknowledged(Outcome { result: Replaced,
+native delivery outcome generation=1 epoch=5 sequence=4 nonce=7 key=30 state=1 focus_kind=1 report=Acknowledged(Outcome { result: Replaced,
+EVIDENCE_FILE /tmp/qualified-consumer-events
+PHASE_BEGIN candidate-a
+key: 56; state: 1
+key: 56; state: 0
+PHASE_END candidate-a
+PHASE_BEGIN candidate-a
+key: 56; state: 1
+key: 56; state: 0
+PHASE_END candidate-a
+PHASE_BEGIN detached
+key: 38; state: 1
+key: 38; state: 0
+PHASE_END detached
+'''
+        validate(report)
+        for invalid in (report.replace('"operational":true', '"operational":false'),
+                        report.replace('accepted=true', 'accepted=false'),
+                        report.replace('key: 56', 'key: 38'),
+                        report.replace('key: 38; state: 0', 'key: 56; state: 0')):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate(invalid)
+
+    def test_released_reset_requires_one_ordered_consumer_stream(self):
+        from validate_candidate import require_released_reset
+        valid = ('MAP_RESET8_BEFORE_UP 2\nPHASE_BEGIN map-real-up\n'
+                 'MAP_RESET8_BEFORE_B 5\nPHASE_BEGIN map-released-replacement\n')
+        require_released_reset(valid)
+        for invalid in ('', valid.replace('BEFORE_B 5', 'BEFORE_B 2'),
+                        valid.replace('PHASE_BEGIN map-real-up', 'PHASE_END map-real-up'),
+                        valid.replace('MAP_RESET8_BEFORE_B 5\n', '') + 'MAP_RESET8_BEFORE_B 5\n'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                require_released_reset(invalid)
+        source = Path(__file__).with_name('candidate-payload-run.sh').read_text()
+        self.assertIn('echo "MAP_RESET8_BEFORE_UP $map_reset_before" | tee -a /tmp/candidate-consumer-events', source)
+        self.assertIn('echo "MAP_RESET8_BEFORE_B $map_reset_after" | tee -a /tmp/candidate-consumer-events', source)
+
+    def test_packaged_runner_preserves_helpers_and_guest_prerequisites(self):
+        root = Path(__file__).resolve().parents[3]
+        self.assertIn('SLEDGE_VM_RUNNER=${./scripts/linux/hyprland}/vm-run.sh',
+                      (root / 'flake.nix').read_text())
+        vm = Path(__file__).with_name('vm.nix').read_text()
+        for required in ('pkgs.python3', 'pkgs.wev', '"dialout"', 'qemu-xhci,id=qualification-usb'):
+            self.assertIn(required, vm)
+        self.assertNotIn('qemu-xhci,id=qualification-usb',
+                         (root / 'native/hyprland/stock-hook-investigation.nix').read_text())
+
     def test_candidate_payload_requires_exact_scope_and_store_path(self):
         with tempfile.TemporaryDirectory(dir="/hdd") as directory:
             root = Path(directory)

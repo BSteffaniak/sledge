@@ -18,6 +18,7 @@
       rust-overlay,
     }:
     {
+      homeManagerModules.sledgeHyprland = import ./packaging/linux/hyprland/home-module.nix;
       nixosModules.sledgeHyprland = import ./packaging/linux/hyprland/module.nix;
       lib.mkQualifiedHyprland = import ./packaging/linux/hyprland/qualified.nix;
       lib.prepareQualifiedHyprlandArtifacts = import ./packaging/linux/hyprland/artifacts.nix;
@@ -145,7 +146,8 @@
               export SLEDGE_VM_QMP=${./scripts/linux/hyprland/qmp_ready.py}
               export SLEDGE_VM_MESA=${hyprlandPkgs.mesa}
               export SLEDGE_VM_GATE=${./scripts/linux/hyprland/vm-gpu-prerequisite.sh}
-              export SLEDGE_VM_RUNNER=${./scripts/linux/hyprland/vm-run.sh}
+              # Preserve sibling helpers and Python imports in one immutable tree.
+              export SLEDGE_VM_RUNNER=${./scripts/linux/hyprland}/vm-run.sh
               exec bash ${./scripts/linux/hyprland/vm-prepare.sh} "$@"
             '';
           };

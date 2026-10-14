@@ -1,22 +1,34 @@
 """Installed isolated candidate baseline checks; never host qualification."""
 from pathlib import Path
+import json
 import re
 import sys
 from validate_qualification import evidence_files, phases, require
 from validate_replacement import native_keys
 
 
-def validate(text):
+def require_released_reset(consumer):
+    before = re.search(r'MAP_RESET8_BEFORE_UP (\d+)', consumer)
+    after = re.search(r'MAP_RESET8_BEFORE_B (\d+)', consumer)
+    require(before and after and int(after[1]) > int(before[1]) and
+            before.start() < consumer.find('PHASE_BEGIN map-real-up') < after.start() <
+            consumer.find('PHASE_BEGIN map-released-replacement'),
+            'released Reset8 proof before replacement missing')
+
+
+def validate(text, *, qualified_test=False):
     text = re.sub(r"\x1b\[[0-9;]*m", "", text)
     require("SLEDGE_CANDIDATE_SCOPE_PRESERVED" in text, "scope not preserved")
     require("SLEDGE_CANDIDATE_STORE_TRANSFER_VERIFIED" in text, "store transfer not verified")
-    require("SLEDGE_INSTALLED_CANDIDATE_COMPLETED_QUALIFIED_FALSE" in text,
-            "candidate fixture incomplete")
+    completed = ('SLEDGE_INSTALLED_QUALIFIED_MATRIX_COMPLETED_VM_ONLY' if qualified_test else
+                 'SLEDGE_INSTALLED_CANDIDATE_COMPLETED_QUALIFIED_FALSE')
+    require(completed in text, 'installed fixture incomplete')
     require("SLEDGE_PAYLOAD_REPORT_END status=0 qualified=false" in text,
             "guest report unsuccessful")
-    require('"hyprland_candidate_configured":true' in text and
-            '"hyprland_capture_qualified":false' in text and
-            '"hyprland_research_configured":false' in text, "incorrect candidate health labels")
+    if not qualified_test:
+        require('"hyprland_candidate_configured":true' in text and
+                '"hyprland_capture_qualified":false' in text and
+                '"hyprland_research_configured":false' in text, "incorrect candidate health labels")
     if "REQUIRED_CASE identity" in text:
         for probe in ("wrong-pid", "plugin_sha256", "build_id", "sdk_api_hash", "plugin_path"):
             require(f"IDENTITY_REJECT probe={probe} exit=1" in text,
@@ -28,11 +40,7 @@ def validate(text):
         from collect_maps import collect
         collections = [json.loads(line) for line in text.splitlines() if line.startswith('{"kind":"map_collection"')]
         require(len(collections) == 3, "different/restored/entered map observations missing")
-        reset_before = re.search(r'MAP_RESET8_BEFORE_UP (\d+)', text)
-        reset_after = re.search(r'MAP_RESET8_BEFORE_B (\d+)', text)
-        require(reset_before and reset_after and int(reset_after[1]) > int(reset_before[1]) and
-                text.index(reset_before[0]) < text.index('PHASE_BEGIN map-real-up') < text.index(reset_after[0]) < text.index('PHASE_BEGIN map-released-replacement'),
-                'released Reset8 proof before replacement missing')
+        require_released_reset(evidence_files(text).get('/tmp/candidate-consumer-events', ''))
         hashes = []
         for collection in collections:
             pages = iter(collection.get('pages', []))
@@ -50,7 +58,9 @@ def validate(text):
                 'serialized maps must differ then restore compatible bytes')
     files = evidence_files(text)
     peer = files.get("/tmp/candidate-daemon-events", "")
-    require("qualification=Candidate feature_mask=1" in peer, "candidate admission absent")
+    admission = ('independently accepted installed Hyprland registration; awaiting native proof feature_mask=1'
+                 if qualified_test else 'qualification=Candidate feature_mask=1')
+    require(admission in peer, "installed admission absent")
     reconciled = re.findall(r"native reconciliation epoch=(\d+) sequence=(\d+) nonce=(\d+) accepted=true", peer)
     replaced = re.findall(r"native delivery outcome generation=\d+ epoch=(\d+) sequence=(\d+) nonce=(\d+) key=30 state=1 focus_kind=1 report=Acknowledged\(Outcome \{ result: Replaced,", peer)
     require(len(replaced) >= 2, "two acknowledged replaced A-down outcomes required")
@@ -138,7 +148,8 @@ def validate(text):
                 require(len(sample) == 1 and native_keys(sample[0]) == keys and
                         re.findall(r"locked: ([0-9a-f]{8})", sample[0]) == masks,
                         f"{name} genuine Caps state not restored")
-    print("PASS_INSTALLED_ISOLATED_CANDIDATE_BASELINE_NOT_HOST_QUALIFIED")
+    print('PASS_QUALIFIED_MATRIX_VM_ONLY_NOT_RELEASE_APPROVAL' if qualified_test else
+          'PASS_INSTALLED_ISOLATED_CANDIDATE_BASELINE_NOT_HOST_QUALIFIED')
 
 
 if __name__ == "__main__":

@@ -1,5 +1,21 @@
 # Hyprland backend packaging
 
+## Home Manager login integration
+
+`homeManagerModules.sledgeHyprland` accepts an independently reviewed exact-build
+package, a hotkey config, a real `firstApp`, compositor configuration without
+parallel `exec-once` entries, and ordered `autostartCommands`. It installs
+`sledge-hyprland-session` and `sledge-hyprland-drain`; it does not activate or
+restart the current desktop. Launch the session from a fresh local login, not
+inside an existing compositor. A unique private runtime directory supplies the
+endpoint environment before Hyprland starts. Application startup is released
+only after Supported, qualified and operational daemon status.
+
+The ordinary Hyprland session remains a rollback path. Personal exact-build
+acceptance is not general release certification: VM evidence and physical-host
+login evidence must be distinguished. Taps/input-source actions remain outside
+feature1. Never reuse candidate admission records for this integration.
+
 `candidate.nix` builds an **isolated qualification candidate**, not an installable
 supported desktop backend. Do not load its plugin into your active session.
 The normal daemon embeds no admission catalogue; runtime configuration cannot

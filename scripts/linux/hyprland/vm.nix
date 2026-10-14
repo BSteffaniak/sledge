@@ -15,6 +15,7 @@
     qemu.networkingOptions = pkgs.lib.mkForce [ "-nic none" ];
     qemu.options = [
       "-device virtio-gpu-gl-pci"
+      "-device qemu-xhci,id=qualification-usb"
       "-serial stdio"
       "-monitor none"
     ];
@@ -34,12 +35,18 @@
     pkgs.pkg-config
     pkgs.wayland-utils
     pkgs.weston
+    # Installed candidate fixtures use these guest-only consumers/helpers.
+    pkgs.python3
+    pkgs.wev
+    pkgs.xorg.xev
+    pkgs.xorg.xprop
   ];
   users.users.probe = {
     isNormalUser = true;
     extraGroups = [
       "video"
       "render"
+      "dialout"
     ];
   };
   systemd.services.hyprland-prerequisite = {

@@ -94,7 +94,6 @@ let
       configuration = { lib, ... }: {
         imports = [ ../../scripts/linux/hyprland/vm.nix ];
         virtualisation.qemu.package = pkgs.qemu;
-        virtualisation.qemu.options = [ "-device qemu-xhci,id=qualification-usb" ];
         users.users.probe.extraGroups = lib.mkAfter [ "dialout" ];
         environment.systemPackages = [
           pkgs.xorg.xev

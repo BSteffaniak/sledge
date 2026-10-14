@@ -18,8 +18,14 @@ if [[ -f /sledge-payload/lock-case ]]; then
 fi
 registration=$(cat /sledge-payload/candidate-registration-path)
 [[ $registration == /nix/store/*/registration.json && -f $registration && ! -L $registration ]]
+qualified_test=false
+if [[ -f /sledge-payload/qualified-case ]]; then qualified_test=true; fi
 plugin=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["plugin_path"])' "$registration")
-[[ $plugin == /nix/store/*/lib/candidate.so && -f $plugin && ! -L $plugin ]]
+if [[ $qualified_test == true ]]; then
+ [[ $plugin == /nix/store/*/lib/qualified.so && -f $plugin && ! -L $plugin ]]
+else
+ [[ $plugin == /nix/store/*/lib/candidate.so && -f $plugin && ! -L $plugin ]]
+fi
 cat > /tmp/hyprland.conf <<'CONF'
 monitor = ,preferred,auto,1
 misc:disable_hyprland_logo = true
@@ -237,7 +243,7 @@ if [[ $mode == matrix ]]; then
   phase map-held-original candidate-mixed-a
   phase map-held-layout-probe candidate-mixed-y
   map_reset_before=$(python3 -c 'import re;print(re.sub(r"\x1b\[[0-9;]*m", "", open("/tmp/candidate-daemon-events").read()).count("control=Reset(8)"))')
-  echo "MAP_RESET8_BEFORE_UP $map_reset_before"
+  echo "MAP_RESET8_BEFORE_UP $map_reset_before" | tee -a /tmp/candidate-consumer-events
   phase map-real-up candidate-mixed-up
   hyprctl keyword 'device[qemu-virtio-keyboard-1]:kb_layout' us
   echo EVIDENCE_FILE /tmp/maps-restored
@@ -252,7 +258,7 @@ if [[ $mode == matrix ]]; then
   done
   cat /tmp/map-released-status
   map_reset_after=$(python3 -c 'import re;print(re.sub(r"\x1b\[[0-9;]*m", "", open("/tmp/candidate-daemon-events").read()).count("control=Reset(8)"))')
-  echo "MAP_RESET8_BEFORE_B $map_reset_after"
+  echo "MAP_RESET8_BEFORE_B $map_reset_after" | tee -a /tmp/candidate-consumer-events
   [[ $map_reset_after -gt $map_reset_before ]]
   echo EVIDENCE_FILE /tmp/maps-entered
   python3 /sledge-payload/collect_maps.py "$(command -v hyprctl)"
@@ -268,6 +274,19 @@ if [[ $mode == matrix ]]; then
  if [[ -f /sledge-payload/pipelined-case ]]; then
   echo REQUIRED_CASE pipelined
   phase pipelined-100 candidate-pipelined
+  if [[ -f /sledge-payload/pipelined-only-case ]]; then
+   # Keep this bounded timing run separate from reload/lifecycle qualification.
+   python3 /sledge-payload/drain-unload.py --hyprctl "$(command -v hyprctl)" --instance "$HYPRLAND_INSTANCE_SIGNATURE" --plugin "$plugin"
+   printf 'DONE\n' >&3
+   read -r reply <&3
+   [[ $reply == OK ]]
+   if [[ $qualified_test == true ]]; then
+    echo SLEDGE_INSTALLED_QUALIFIED_MATRIX_COMPLETED_VM_ONLY
+   else
+    echo SLEDGE_INSTALLED_CANDIDATE_COMPLETED_QUALIFIED_FALSE
+   fi
+   exit 0
+  fi
  fi
  if [[ -f /sledge-payload/deadline-case ]]; then
   echo REQUIRED_CASE deadline
@@ -320,7 +339,11 @@ if [[ $mode == matrix ]]; then
   printf 'DONE\n' >&3
   read -r reply <&3
   [[ $reply == OK ]]
-  echo SLEDGE_INSTALLED_CANDIDATE_COMPLETED_QUALIFIED_FALSE
+  if [[ $qualified_test == true ]]; then
+   echo SLEDGE_INSTALLED_QUALIFIED_MATRIX_COMPLETED_VM_ONLY
+  else
+   echo SLEDGE_INSTALLED_CANDIDATE_COMPLETED_QUALIFIED_FALSE
+  fi
   exit 0
  fi
  if [[ -f /sledge-payload/extended-case ]]; then
@@ -493,4 +516,8 @@ cat /tmp/compositor-output
 printf 'DONE\n' >&3
 read -r reply <&3
 [[ $reply == OK ]]
-echo SLEDGE_INSTALLED_CANDIDATE_COMPLETED_QUALIFIED_FALSE
+if [[ $qualified_test == true ]]; then
+ echo SLEDGE_INSTALLED_QUALIFIED_MATRIX_COMPLETED_VM_ONLY
+else
+ echo SLEDGE_INSTALLED_CANDIDATE_COMPLETED_QUALIFIED_FALSE
+fi

@@ -195,7 +195,9 @@ def connect(path, child):
         if child.poll() is not None:
             raise RuntimeError("VM exited before control sockets")
         connection = socket.socket(socket.AF_UNIX)
-        connection.settimeout(30)
+        connection.settimeout(120)
+        # Startup/reconciliation can take longer than a key step under load.
+        # The runner's outer 180s budget remains authoritative.
         try:
             connection.connect(path)
             return connection
