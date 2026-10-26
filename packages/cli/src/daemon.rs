@@ -24,6 +24,7 @@ use crate::logging;
 mod desktop;
 #[cfg(target_os = "linux")]
 mod hyprland_installed;
+#[cfg(target_os = "linux")]
 mod hyprland_research;
 #[cfg(target_os = "linux")]
 mod linux;
