@@ -28,6 +28,8 @@ mod hyprland_installed;
 mod hyprland_research;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests;
 #[cfg(target_os = "linux")]
 mod source_queue;
 #[cfg(target_os = "linux")]
@@ -234,37 +236,43 @@ fn run_macos(
         .build()?;
     // `UnixListener::bind` registers the FD with the current Tokio
     // reactor; enter the runtime briefly so it has one to register with.
-    let listener = {
-        let _guard = rt.enter();
-        ipc::bind(&socket_path).context("binding IPC socket")?
+    let (listener, _socket_guard) = {
+        let (listener, guard) = ipc::macos::SocketGuard::bind(&socket_path)
+            .context("binding restart-safe IPC socket")?;
+        listener.set_nonblocking(true)?;
+        let _runtime = rt.enter();
+        (tokio::net::UnixListener::from_std(listener)?, guard)
     };
     let ipc_state_clone = ipc_state.clone();
     rt.spawn(async move { ipc::serve(listener, ipc_state_clone).await });
 
-    install_signal_handler(reload_fn.clone());
+    let shutdown = run_backend.shutdown_flag();
+    install_signal_handler(reload_fn.clone(), shutdown)?;
 
     // Spawn the config-file watcher. Held for the lifetime of the daemon;
     // drop stops the watcher thread.
     let _config_watcher = crate::config_watcher::spawn((*config_path).clone(), reload_fn);
 
-    run_backend.run(sink).map_err(anyhow::Error::from)?;
-    Ok(())
+    let result = run_backend.run(sink).map_err(anyhow::Error::from);
+    // Stop accepting IPC before releasing endpoint ownership and the lock.
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
+    drop(_socket_guard);
+    result
 }
 
 #[cfg(target_os = "macos")]
-fn install_signal_handler(reload_fn: Arc<dyn Fn() -> Result<(), String> + Send + Sync>) {
+fn install_signal_handler(
+    reload_fn: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    use signal_hook::consts::{SIGHUP, SIGTERM};
+    use signal_hook::iterator::Signals;
+    // Register synchronously: an immediate restart must not race a worker
+    // thread that has not installed the SIGTERM handler yet.
+    let mut signals = Signals::new([SIGHUP, SIGTERM]).context("installing signal handlers")?;
     std::thread::Builder::new()
         .name("sledge-signals".into())
         .spawn(move || {
-            use signal_hook::consts::{SIGHUP, SIGTERM};
-            use signal_hook::iterator::Signals;
-            let mut signals = match Signals::new([SIGHUP, SIGTERM]) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(error = %e, "failed to install signal handler");
-                    return;
-                }
-            };
             for sig in signals.forever() {
                 match sig {
                     SIGHUP => match (reload_fn)() {
@@ -272,14 +280,16 @@ fn install_signal_handler(reload_fn: Arc<dyn Fn() -> Result<(), String> + Send +
                         Err(e) => warn!(error = %e, "SIGHUP reload failed"),
                     },
                     SIGTERM => {
-                        info!("SIGTERM received; exiting");
-                        std::process::exit(0);
+                        info!("SIGTERM received; shutting down");
+                        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
                     }
                     _ => {}
                 }
             }
         })
-        .expect("spawn signal thread");
+        .context("spawning signal thread")?;
+    Ok(())
 }
 
 type ReloadFn = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;

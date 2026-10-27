@@ -27,6 +27,23 @@ launchctl print "gui/$(id -u)/com.braden.sledge"
 
 The installer writes `~/Library/LaunchAgents/com.braden.sledge.plist`, creates the log directory, and loads/starts the agent. `KeepAlive` supervises it. Do not simultaneously run another instance with the same socket.
 
+## Restart-safe IPC
+
+On macOS, each daemon holds an exclusive lock on `<socket>.lock` for its
+socket lifetime. SIGTERM requests orderly backend shutdown, including while
+waiting for permission grants, then stops IPC and removes the owned socket.
+After a crash or forced termination, startup recovers only a same-user socket
+whose connection probe returns `ECONNREFUSED`. A live listener (including an
+older daemon), symlink, unrelated file, unsafe lock file, or unexpected probe
+failure is rejected rather than overwritten. The probe is time-bounded.
+
+The persistent lock file is intentional; do not delete it to force another
+instance to start. Socket parents must be same-user directories not writable
+by other users, or root-owned sticky directories such as `/tmp`. This also
+allows the first upgraded daemon to recover an abandoned legacy
+`/tmp/sledge-<uid>.sock` automatically. Linux retains its separate conservative
+socket admission policy.
+
 ## Secure Input
 
 Password-entry and other Secure Input contexts can prevent user-space keyboard taps from receiving events. Do not rely on remappings there. The daemon does not disable Secure Input.

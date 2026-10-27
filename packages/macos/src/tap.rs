@@ -28,7 +28,8 @@ use std::time::Duration;
 
 use core_foundation::base::{CFRelease, TCFType};
 use core_foundation::runloop::{
-    CFRunLoop, CFRunLoopRef, CFRunLoopSourceRef, kCFRunLoopCommonModes,
+    CFRunLoop, CFRunLoopRef, CFRunLoopRunResult, CFRunLoopSourceRef, kCFRunLoopCommonModes,
+    kCFRunLoopDefaultMode,
 };
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventType, EventField};
 use foreign_types::ForeignType;
@@ -58,6 +59,7 @@ pub struct MacOsBackend {
     sink: Arc<Mutex<Option<Box<dyn EventSink>>>>,
     // Watchdog control.
     watchdog_running: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Default for MacOsBackend {
@@ -75,7 +77,14 @@ impl MacOsBackend {
             _poller: None,
             sink: Arc::new(Mutex::new(None)),
             watchdog_running: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Request orderly shutdown, including while waiting for TCC grants.
+    #[must_use]
+    pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        self.shutdown.clone()
     }
 
     /// A cheap `Arc` clone of the focus tracker. The caller can read the
@@ -91,6 +100,9 @@ impl MacOsBackend {
 
 impl InputBackend for MacOsBackend {
     fn run(&mut self, sink: Box<dyn EventSink>) -> Result<(), BackendError> {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let initial = check_permissions();
         if !initial.accessibility || !initial.input_monitoring {
             warn!(
@@ -131,6 +143,9 @@ impl InputBackend for MacOsBackend {
             // waiting rather than silently stalled.
             let mut tick: u64 = 0;
             loop {
+                if self.shutdown.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 tick = tick.saturating_add(1);
                 let p = check_permissions();
@@ -153,6 +168,9 @@ impl InputBackend for MacOsBackend {
             }
         }
 
+        if self.shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         *self.sink.lock() = Some(sink);
         self._poller = Some(spawn_poller(self.focus.clone()));
 
@@ -222,22 +240,42 @@ impl InputBackend for MacOsBackend {
         self.watchdog_running.store(true, Ordering::Relaxed);
         let wd_flag = self.watchdog_running.clone();
         let port_raw = PortRef(port as usize);
-        thread::Builder::new()
+        let watchdog_thread = match thread::Builder::new()
             .name("sledge-tap-watchdog".into())
             .spawn(move || watchdog(port_raw, wd_flag))
-            .map_err(|e| BackendError::Other(format!("watchdog spawn failed: {e}")))?;
+        {
+            Ok(thread) => thread,
+            Err(error) => {
+                self.watchdog_running.store(false, Ordering::Relaxed);
+                // SAFETY: no watchdog was started, and the run loop has not run.
+                unsafe {
+                    destroy_tap(port, ctx_ptr);
+                }
+                return Err(BackendError::Other(format!(
+                    "watchdog spawn failed: {error}"
+                )));
+            }
+        };
 
-        // Run forever on the calling thread (expected to be the daemon's
-        // main thread, which owns the CFRunLoop).
-        CFRunLoop::run_current();
+        // Run on the calling thread (the daemon's main CFRunLoop thread).
+        // Short mode runs allow cancellation without cross-thread CF pointers.
+        while !self.shutdown.load(Ordering::Relaxed) {
+            // Bound shutdown latency without doing work in the tap callback.
+            // SAFETY: the default mode is a process-lifetime CF string.
+            let mode = unsafe { kCFRunLoopDefaultMode };
+            match CFRunLoop::run_in_mode(mode, Duration::from_millis(100), false) {
+                CFRunLoopRunResult::Finished | CFRunLoopRunResult::Stopped => break,
+                CFRunLoopRunResult::TimedOut | CFRunLoopRunResult::HandledSource => {}
+            }
+        }
 
         // If we ever return, shut down the watchdog and release our refs.
         self.watchdog_running.store(false, Ordering::Relaxed);
-        // SAFETY: `port` and `ctx_ptr` have remained valid while the run
-        // loop was active. After `run_current` returns, we own them.
+        let _ = watchdog_thread.join();
+        // The loop no longer dispatches callbacks and the watchdog has joined.
+        // SAFETY: both pointers are owned by this invocation of run().
         unsafe {
-            CFRelease(port.cast());
-            drop(Box::from_raw(ctx_ptr));
+            destroy_tap(port, ctx_ptr);
         }
         Ok(())
     }
@@ -247,6 +285,19 @@ impl InputBackend for MacOsBackend {
             Action::SendKey { key, mods } => send_key(*key, *mods),
             Action::SetInputSource { id } => self.input_source_worker.enqueue(id),
         }
+    }
+}
+
+// SAFETY: caller owns both allocations and has stopped all callback/watchdog
+// access. Invalidate before freeing the callback, even if the loop retains a source.
+unsafe fn destroy_tap(port: *mut core::ffi::c_void, context: *mut CallbackCtx) {
+    unsafe extern "C" {
+        fn CFMachPortInvalidate(port: *mut core::ffi::c_void);
+    }
+    unsafe {
+        CFMachPortInvalidate(port);
+        CFRelease(port.cast());
+        drop(Box::from_raw(context));
     }
 }
 
@@ -526,6 +577,22 @@ fn flags_to_mods(flags: CGEventFlags) -> Modifiers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoEvents;
+    impl EventSink for NoEvents {
+        fn on_event(&mut self, _: KeyEvent, _: Option<&str>) -> BackendVerdict {
+            panic!("cancelled backend must not dispatch input");
+        }
+    }
+
+    #[test]
+    fn shutdown_before_run_returns_without_installing_tap() {
+        let mut backend = MacOsBackend::new();
+        backend.shutdown_flag().store(true, Ordering::Relaxed);
+        backend.run(Box::new(NoEvents)).unwrap();
+        assert!(!backend.watchdog_running.load(Ordering::Relaxed));
+        assert!(backend._poller.is_none());
+    }
 
     // Raw flag patterns below were captured from live `CGEventFlags.bits()`
     // values on Apple Silicon (macOS 14) for single-modifier keypresses.

@@ -1166,6 +1166,7 @@ dependencies = [
  "sledge_core",
  "sledge_linux",
  "sledge_macos",
+ "socket2",
  "tokio",
  "tracing",
  "tracing-appender",
